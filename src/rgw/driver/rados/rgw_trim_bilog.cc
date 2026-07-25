@@ -1,5 +1,5 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab ft=cpp
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab ft=cpp
 
 /*
  * Ceph - scalable distributed file system
@@ -367,7 +367,7 @@ class BucketTrimShardCollectCR : public RGWShardCollectCR {
   size_t i{0}; //< index of current shard marker
 
   int handle_result(int r) override {
-    if (r == -ENOENT) { // ENOENT is not a fatal error
+    if (r == -ENODATA) { // ENODATA is not a fatal error
       return 0;
     }
     if (r < 0) {
@@ -448,6 +448,168 @@ class BucketCleanIndexCollectCR : public RGWShardCollectCR {
   }
 };
 
+struct StatusShards {
+  uint64_t generation = 0;
+  std::vector<rgw_bucket_shard_sync_info> shards;
+};
+
+class RGWReadRemoteStatusShardsCR : public RGWCoroutine {
+  const DoutPrefixProvider *dpp;
+  rgw::sal::RadosStore* const store;
+  CephContext *cct;
+  RGWHTTPManager *http;
+  std::string bucket_instance;
+  const rgw_zone_id zid;
+  const std::string& zone_id;
+  StatusShards *p;
+
+public:
+  RGWReadRemoteStatusShardsCR(const DoutPrefixProvider *dpp,
+				    rgw::sal::RadosStore* const store,
+            CephContext *cct,
+            RGWHTTPManager *http,
+				    std::string bucket_instance,
+            const rgw_zone_id zid,
+            const std::string& zone_id,
+            StatusShards *p)
+    : RGWCoroutine(cct), dpp(dpp), store(store),
+      cct(cct), http(http), bucket_instance(bucket_instance),
+      zid(zid), zone_id(zone_id), p(p) {}
+
+  int operate(const DoutPrefixProvider *dpp) override {
+    reenter(this) {
+      yield {
+        auto& zone_conn_map = store->svc()->zone->get_zone_conn_map();
+        auto ziter = zone_conn_map.find(zid);
+        if (ziter == zone_conn_map.end()) {
+          ldpp_dout(dpp, 0) << "WARNING: no connection to zone " << zid << ", can't trim bucket: " << bucket_instance << dendl;
+          return set_cr_error(-ECANCELED);
+        }
+
+        // query data sync status from each sync peer
+        rgw_http_param_pair params[] = {
+          { "type", "bucket-index" },
+          { "status", nullptr },
+          { "options", "merge" },
+          { "bucket", bucket_instance.c_str() }, /* equal to source-bucket when `options==merge` and source-bucket
+                                                    param is not provided */
+          { "source-zone", zone_id.c_str() },
+          { "version", "2" },
+          { nullptr, nullptr }
+        };
+
+        call(new RGWReadRESTResourceCR<StatusShards>(cct, ziter->second, http, "/admin/log/", params, p));
+      }
+
+      if (retcode < 0 && retcode != -ENOENT) {
+        return set_cr_error(retcode);
+      } else if (retcode == -ENOENT) {
+        // the peer has no bucket-index sync status for this bucket which does
+        // not by itself mean it is deleted there (an uninitialized sync status,
+        // e.g. no data written yet, looks the same). UINT64_MAX just excludes
+        // this peer from the minimum trim generation; we will confirm real
+        // deletion via the bucket entrypoint before removing anything.
+        p->generation = UINT64_MAX;
+        ldpp_dout(dpp, 10) << "bucket=" << bucket_instance
+          << ": peer zone=" << zid.id << " has no sync status (-ENOENT); "
+          << "excluding it from the trim generation" << dendl;
+      }
+
+      return set_cr_done();
+    }
+    return 0;
+  }
+};
+
+
+/// result of a metadata GET for a bucket ENTRYPOINT, unwrapping the
+/// {"key":..., "ver":..., "mtime":..., "data":{...}} envelope returned by
+/// /admin/metadata/bucket/<key>
+struct RGWBucketEntrypointMetadataResult {
+  RGWBucketEntryPoint data;
+
+  void decode_json(JSONObj *obj) {
+    JSONDecoder::decode_json("data", data, obj);
+  }
+};
+
+/// Resolve a bucket's entrypoint to the instance id it currently points at.
+///
+/// The entrypoint is a reliable deletion signal: its removal is a real metadata
+/// op (unlike the no-op instance removal), so its absence means a deletion has synced.
+/// But a zone's *local* entrypoint copy is not authoritative during creation: the
+/// instance syncs to peers before the entrypoint does (put_linked_bucket_info() in
+/// rgw_rados.cc writes the instance, then the entrypoint), so a peer can hold the
+/// instance without yet holding the entrypoint: i.e., indistinguishable locally from
+/// a real deletion.
+/// The metadata master is authoritative and has the entrypoint immediately on
+/// creation, so consult it, unless this zone is the master, whose local copy
+/// is itself authoritative.
+///
+/// On success sets *bucket_id to the resolved instance id, or empty if the
+/// entrypoint no longer exists. Returns an error only if the authoritative copy
+/// could not be read (the caller should then skip and retry on a later cycle).
+class RGWReadMasterBucketEntrypointCR : public RGWCoroutine {
+  rgw::sal::RadosStore* const store;
+  RGWHTTPManager *http;
+  const rgw_bucket bucket;
+  std::string *bucket_id;
+  std::shared_ptr<rgw_get_bucket_info_result> local_result;
+  RGWBucketEntrypointMetadataResult master_result;
+
+public:
+  RGWReadMasterBucketEntrypointCR(rgw::sal::RadosStore* store,
+                                  RGWHTTPManager *http,
+                                  const rgw_bucket& bucket,
+                                  std::string *bucket_id)
+    : RGWCoroutine(store->ctx()), store(store), http(http),
+      bucket(bucket), bucket_id(bucket_id),
+      local_result(make_shared<rgw_get_bucket_info_result>()) {}
+
+  int operate(const DoutPrefixProvider *dpp) override {
+    reenter(this) {
+      if (store->svc()->zone->is_meta_master()) {
+        yield call(new RGWGetBucketInfoCR(store->svc()->async_processor, store,
+                                          {bucket.tenant, bucket.name},
+                                          local_result, dpp));
+        if (retcode == -ENOENT) {
+          bucket_id->clear();
+          return set_cr_done();
+        }
+        if (retcode < 0) {
+          return set_cr_error(retcode);
+        }
+        *bucket_id = local_result->bucket ? local_result->bucket->get_bucket_id()
+                                          : std::string();
+        return set_cr_done();
+      }
+
+      yield {
+        auto *master_conn = store->svc()->zone->get_master_conn();
+        if (!master_conn) {
+          ldpp_dout(dpp, 0) << "WARNING: no connection to metadata master zone, "
+            "can't resolve entrypoint for bucket=" << bucket << dendl;
+          return set_cr_error(-ECANCELED);
+        }
+        std::string key = rgw_bucket(bucket.tenant, bucket.name).get_key();
+        rgw_http_param_pair params[] = { { "key", key.c_str() }, { nullptr, nullptr } };
+        call(new RGWReadRESTResourceCR<RGWBucketEntrypointMetadataResult>(
+          cct, master_conn, http, "/admin/metadata/bucket", params, &master_result));
+      }
+      if (retcode == -ENOENT) {
+        bucket_id->clear();
+        return set_cr_done();
+      }
+      if (retcode < 0) {
+        return set_cr_error(retcode);
+      }
+      *bucket_id = master_result.data.bucket.bucket_id;
+      return set_cr_done();
+    }
+    return 0;
+  }
+};
+
 
 /// trim the bilog of all of the given bucket instance's shards
 class BucketTrimInstanceCR : public RGWCoroutine {
@@ -458,18 +620,13 @@ class BucketTrimInstanceCR : public RGWCoroutine {
   std::string bucket_instance;
   rgw_bucket_get_sync_policy_params get_policy_params;
   std::shared_ptr<rgw_bucket_get_sync_policy_result> source_policy;
+  std::string cur_entrypoint_bucket_id;
   rgw_bucket bucket;
   const std::string& zone_id; //< my zone id
   RGWBucketInfo _bucket_info;
   const RGWBucketInfo *pbucket_info; //< pointer to bucket instance info to locate bucket indices
   int child_ret = 0;
   const DoutPrefixProvider *dpp;
-public:
-  struct StatusShards {
-    uint64_t generation = 0;
-    std::vector<rgw_bucket_shard_sync_info> shards;
-  };
-private:
   std::vector<StatusShards> peer_status; //< sync status for each peer
   std::vector<std::string> min_markers; //< min marker per shard
 
@@ -497,6 +654,14 @@ private:
       min_generation = m->generation;
     }
 
+    if (min_generation == UINT64_MAX) {
+      // no peer is syncing this bucket (all returned -ENOENT); this alone does
+      // not confirm deletion: we will check the entrypoint before cleanup.
+      totrim.gen = UINT64_MAX;
+      return 0;
+    }
+
+    ldpp_dout(dpp, 10) << "min_generation is " << min_generation << dendl;
     auto& logs = pbucket_info->layout.logs;
     auto log = std::find_if(logs.begin(), logs.end(),
 			    rgw::matches_gen(min_generation));
@@ -511,28 +676,54 @@ private:
     return 0;
   }
 
+  // every peer returned -ENOENT for this bucket's sync status (no peer is
+  // syncing it). NOTE: this alone does not confirm deletion. A live bucket
+  // whose sync status is not yet initialized looks the same; the entrypoint
+  // check in operate() disambiguates.
+  bool all_peers_report_bucket_gone() const {
+    return totrim.gen == UINT64_MAX;
+  }
+
+  // the local layout already carries the Deleted flag, i.e. metadata sync has
+  // delivered the deletion to this zone. That is authoritative on its own, so
+  // the normal Deleted-driven cleanup applies and we can skip the entrypoint
+  // round-trip to the metadata master.
+  bool locally_confirmed_deleted() const {
+    return pbucket_info->layout.logs.back().layout.type == rgw::BucketLogType::Deleted;
+  }
+
   /// If there is a generation below the minimum, prepare to clean it up.
   int maybe_remove_generation() {
     if (clean_info)
       return 0;
 
-
-    if (pbucket_info->layout.logs.front().gen < totrim.gen) {
+    bool deleted_type = locally_confirmed_deleted();
+    if (pbucket_info->layout.logs.front().gen < totrim.gen ||
+      (pbucket_info->layout.logs.front().gen <= totrim.gen && deleted_type)) {
       clean_info = {*pbucket_info, {}};
       auto log = clean_info->first.layout.logs.cbegin();
       clean_info->second = *log;
 
-      if (clean_info->first.layout.logs.size() == 1) {
-	ldpp_dout(dpp, -1)
-	  << "Critical error! Attempt to remove only log generation! "
-	  << "log.gen=" << log->gen << ", totrim.gen=" << totrim.gen
-	  << dendl;
-	return -EIO;
+      // the local zone still sees this bucket as a normal live bucket
+      // with one generation and no Deleted flag.
+      if (clean_info->first.layout.logs.size() == 1 && !deleted_type) {
+	if (!all_peers_report_bucket_gone()) { // unexpected: a peer reported a real generation but local has only one
+	  ldpp_dout(dpp, -1)
+	    << "Critical error! Attempt to remove only log generation! "
+	    << "log.gen=" << log->gen << ", totrim.gen=" << totrim.gen
+	    << dendl;
+	  return -EIO;
+	}
+	ldpp_dout(dpp, 10) << "bucket=" << bucket_instance
+	  << " all peers gone, deferring instance removal" << dendl;
+	clean_info = std::nullopt;
+	return 0;
       }
       clean_info->first.layout.logs.erase(log);
     }
     return 0;
   }
+
 
  public:
   BucketTrimInstanceCR(rgw::sal::RadosStore* store, RGWHTTPManager *http,
@@ -556,15 +747,18 @@ namespace {
 int take_min_status(
   CephContext *cct,
   const uint64_t min_generation,
-  std::vector<BucketTrimInstanceCR::StatusShards>::const_iterator first,
-  std::vector<BucketTrimInstanceCR::StatusShards>::const_iterator last,
-  std::vector<std::string> *status) {
+  std::vector<StatusShards>::const_iterator first,
+  std::vector<StatusShards>::const_iterator last,
+  std::vector<std::string> *status, const DoutPrefixProvider *dpp) {
   for (auto peer = first; peer != last; ++peer) {
     // Peers on later generations don't get a say in the matter
     if (peer->generation > min_generation) {
       continue;
     }
     if (peer->shards.size() != status->size()) {
+    ldpp_dout(dpp, 5) << __PRETTY_FUNCTION__ << ":"
+    << "ERROR: shards don't match. peer shard:" << peer->shards.size() << " my shards:" << status->size()
+    << "for generation:" << peer->generation << dendl;
       // all peers must agree on the number of shards
       return -EINVAL;
     }
@@ -583,8 +777,8 @@ int take_min_status(
 }
 
 template<>
-inline int parse_decode_json<BucketTrimInstanceCR::StatusShards>(
-  BucketTrimInstanceCR::StatusShards& s, bufferlist& bl)
+inline int parse_decode_json<StatusShards>(
+  StatusShards& s, bufferlist& bl)
 {
   JSONParser p;
   if (!p.parse(bl.c_str(), bl.length())) {
@@ -612,7 +806,7 @@ inline int parse_decode_json<BucketTrimInstanceCR::StatusShards>(
 int BucketTrimInstanceCR::operate(const DoutPrefixProvider *dpp)
 {
   reenter(this) {
-    ldpp_dout(dpp, 4) << "starting trim on bucket=" << bucket_instance << dendl;
+    ldpp_dout(dpp, 1) << "starting trim on bucket=" << bucket_instance << dendl;
 
     get_policy_params.zone = zone_id;
     get_policy_params.bucket = bucket;
@@ -659,31 +853,9 @@ int BucketTrimInstanceCR::operate(const DoutPrefixProvider *dpp)
 
       peer_status.resize(zids.size());
 
-      auto& zone_conn_map = store->svc()->zone->get_zone_conn_map();
-
       auto p = peer_status.begin();
       for (auto& zid : zids) {
-        // query data sync status from each sync peer
-        rgw_http_param_pair params[] = {
-          { "type", "bucket-index" },
-          { "status", nullptr },
-          { "options", "merge" },
-          { "bucket", bucket_instance.c_str() }, /* equal to source-bucket when `options==merge` and source-bucket
-                                                    param is not provided */
-          { "source-zone", zone_id.c_str() },
-          { "version", "2" },
-          { nullptr, nullptr }
-        };
-
-        auto ziter = zone_conn_map.find(zid);
-        if (ziter == zone_conn_map.end()) {
-          ldpp_dout(dpp, 0) << "WARNING: no connection to zone " << zid << ", can't trim bucket: " << bucket << dendl;
-          return set_cr_error(-ECANCELED);
-        }
-
-	using StatusCR = RGWReadRESTResourceCR<StatusShards>;
-        spawn(new StatusCR(cct, ziter->second, http, "/admin/log/", params, &*p),
-              false);
+        spawn(new RGWReadRemoteStatusShardsCR(dpp, store, cct, http, bucket_instance, zid, zone_id, &*p), false);
         ++p;
       }
     }
@@ -703,11 +875,62 @@ int BucketTrimInstanceCR::operate(const DoutPrefixProvider *dpp)
       ldpp_dout(dpp, 4) << "failed to find minimum generation" << dendl;
       return set_cr_error(retcode);
     }
+
+    // When all peers report -ENOENT the bucket may be deleted, or it may be a
+    // live bucket whose sync status is not yet initialized (both look the same).
+    // But, if the local layout already carries the Deleted flag, metadata sync has
+    // delivered the deletion and that is authoritative on its own; i.e., go through
+    // to the normal Deleted-driven cleanup below. Otherwise, confirm real deletion
+    // by resolving the authoritative entrypoint before touching the instance
+    // metadata; only an absent (or repointed) entrypoint means this instance is
+    // truly gone.
+    if (all_peers_report_bucket_gone() && !locally_confirmed_deleted()) {
+      yield call(new RGWReadMasterBucketEntrypointCR(store, http, bucket,
+                                                     &cur_entrypoint_bucket_id));
+      if (retcode < 0) {
+        ldpp_dout(dpp, 4) << "bucket=" << bucket_instance
+          << " could not confirm deletion via entrypoint: " << cpp_strerror(retcode)
+          << ", skipping to avoid removing a live bucket" << dendl;
+        return set_cr_done();
+      }
+      if (cur_entrypoint_bucket_id == pbucket_info->bucket.bucket_id) {
+        // entrypoint still resolves to this instance: the bucket is live and its
+        // sync status must be uninitialized, not deleted. Leave it alone.
+        ldpp_dout(dpp, 10) << "bucket=" << bucket_instance
+          << " still has a live entrypoint, skipping (not deleted)" << dendl;
+        return set_cr_done();
+      }
+      ldpp_dout(dpp, 10) << "bucket=" << bucket_instance
+        << " entrypoint absent or repointed, treating as deleted" << dendl;
+    }
+
     retcode = maybe_remove_generation();
     if (retcode < 0) {
       ldpp_dout(dpp, 4) << "error removing old generation from log: "
 			<< cpp_strerror(retcode) << dendl;
       return set_cr_error(retcode);
+    }
+
+    // The no-Deleted-flag orphan path (#70858): all peers are gone, the
+    // entrypoint check above confirmed the bucket is deleted, and there's no
+    // generation cleanup pending. This is only reachable when the Deleted flag
+    // never arrived. What remains is a single InIndex generation, so remove the
+    // orphaned instance metadata directly.
+    if (all_peers_report_bucket_gone() && !clean_info) {
+      ldpp_dout(dpp, 1) << "all peers report bucket gone, removing "
+			 << "orphaned bucket instance metadata" << dendl;
+      _bucket_info = *pbucket_info;
+      yield call(new RGWRemoveBucketInstanceInfoCR(
+	store->svc()->async_processor,
+	store, _bucket_info.bucket,
+	_bucket_info, nullptr, dpp));
+      if (retcode < 0 && retcode != -ENOENT) {
+	ldpp_dout(dpp, 0) << "failed to remove instance bucket info: "
+			  << cpp_strerror(retcode) << dendl;
+	return set_cr_error(retcode);
+      }
+      observer->on_bucket_trimmed(std::move(bucket_instance));
+      return set_cr_done();
     }
 
     if (clean_info) {
@@ -758,14 +981,28 @@ int BucketTrimInstanceCR::operate(const DoutPrefixProvider *dpp)
 			    << cpp_strerror(retcode) << dendl;
 	  return set_cr_error(retcode);
 	}
+
+  //remove bucket instance metadata
+  if (clean_info->first.layout.logs.front().layout.type == rgw::BucketLogType::Deleted) {
+    yield call(new RGWRemoveBucketInstanceInfoCR(
+      store->svc()->async_processor,
+      store, clean_info->first.bucket,
+      clean_info->first, nullptr, dpp));
+    if (retcode < 0) {
+      ldpp_dout(dpp, 0) << "failed to remove instance bucket info: "
+                        << cpp_strerror(retcode) << dendl;
+      return set_cr_error(retcode);
+    }
+  }
+
 	clean_info = std::nullopt;
       }
     } else {
       if (totrim.layout.type != rgw::BucketLogType::InIndex) {
-	ldpp_dout(dpp, 0) << "Unable to convert log of unknown type "
-			  << totrim.layout.type
-			  << " to rgw::bucket_index_layout_generation " << dendl;
-	return set_cr_error(-EINVAL);
+       ldpp_dout(dpp, 0) << "Unable to convert log of unknown type "
+                         << totrim.layout.type
+                         << " to rgw::bucket_index_layout_generation " << dendl;
+       return set_cr_error(-EINVAL);
       }
       // To avoid hammering the OSD too hard, either trim old
       // generations OR trim the current one.
@@ -777,9 +1014,8 @@ int BucketTrimInstanceCR::operate(const DoutPrefixProvider *dpp)
       min_markers.assign(std::max(1u, rgw::num_shards(totrim.layout.in_index)),
 			 RGWSyncLogTrimCR::max_marker);
 
-
       retcode = take_min_status(cct, totrim.gen, peer_status.cbegin(),
-				peer_status.cend(), &min_markers);
+				peer_status.cend(), &min_markers, dpp);
       if (retcode < 0) {
 	ldpp_dout(dpp, 4) << "failed to correlate bucket sync status from peers" << dendl;
 	return set_cr_error(retcode);
@@ -791,9 +1027,11 @@ int BucketTrimInstanceCR::operate(const DoutPrefixProvider *dpp)
       set_status("trimming bilog shards");
       yield call(new BucketTrimShardCollectCR(dpp, store, *pbucket_info, totrim.layout.in_index,
 					      min_markers));
-      // ENODATA just means there were no keys to trim
-      if (retcode == -ENODATA) {
-	retcode = 0;
+      if (retcode == -ENOENT) {
+        // this is not a fatal error to retry, as the shard seems to not exist
+        // anymore. This can happen if the shard was removed unexpectedly.
+        // should be already logged by the BucketTrimShardCollectCR().
+        retcode = 0;
       }
       if (retcode < 0) {
 	ldpp_dout(dpp, 4) << "failed to trim bilog shards: "
@@ -1144,7 +1382,7 @@ int BucketTrimCR::operate(const DoutPrefixProvider *dpp)
 
     // trim bucket instances with limited concurrency
     set_status("trimming buckets");
-    ldpp_dout(dpp, 4) << "collected " << buckets.size() << " buckets for trim" << dendl;
+    ldpp_dout(dpp, 1) << "collected " << buckets.size() << " buckets for trim" << dendl;
     yield call(new BucketTrimInstanceCollectCR(store, http, observer, buckets,
                                                config.concurrent_buckets, dpp));
     // ignore errors from individual buckets
@@ -1179,7 +1417,7 @@ int BucketTrimCR::operate(const DoutPrefixProvider *dpp)
       return set_cr_error(retcode);
     }
 
-    ldpp_dout(dpp, 4) << "bucket index log processing completed in "
+    ldpp_dout(dpp, 1) << "bucket index log processing completed in "
         << ceph::mono_clock::now() - start_time << dendl;
     return set_cr_done();
   }
@@ -1421,7 +1659,8 @@ std::ostream& BucketTrimManager::gen_prefix(std::ostream& out) const
 
 } // namespace rgw
 
-int bilog_trim(const DoutPrefixProvider* p, rgw::sal::RadosStore* store,
+int bilog_trim(const DoutPrefixProvider* p, optional_yield y,
+	       rgw::sal::RadosStore* store,
 	       RGWBucketInfo& bucket_info, uint64_t gen, int shard_id,
 	       std::string_view start_marker, std::string_view end_marker)
 {
@@ -1435,7 +1674,7 @@ int bilog_trim(const DoutPrefixProvider* p, rgw::sal::RadosStore* store,
 
   auto log_layout = *log;
 
-  auto r = store->svc()->bilog_rados->log_trim(p, bucket_info, log_layout, shard_id, start_marker, end_marker);
+  auto r = store->svc()->bilog_rados->log_trim(p, y, bucket_info, log_layout, shard_id, start_marker, end_marker);
   if (r < 0) {
     ldpp_dout(p, 5) << __PRETTY_FUNCTION__ << ":" << __LINE__
 		    << "ERROR: bilog_rados->log_trim returned r=" << r << dendl;

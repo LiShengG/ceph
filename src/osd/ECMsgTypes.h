@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph - scalable distributed file system
  *
@@ -80,14 +81,20 @@ struct ECSubWrite {
     backfill_or_async_recovery = other.backfill_or_async_recovery;
   }
   void encode(ceph::buffer::list &bl) const;
+  void encode(ceph::buffer::list &p_bl,
+	      ceph::buffer::list &d_bll,
+	      uint64_t features=0) const;
   void decode(ceph::buffer::list::const_iterator &bl);
+  void decode(ceph::buffer::list::const_iterator &p_bl,
+	      ceph::buffer::list::const_iterator &d_bl);
   void dump(ceph::Formatter *f) const;
-  static void generate_test_instances(std::list<ECSubWrite*>& o);
+  static std::list<ECSubWrite> generate_test_instances();
 private:
   // no outside copying -- slow
   ECSubWrite(ECSubWrite& other);
   const ECSubWrite& operator=(const ECSubWrite& other);
 };
+
 WRITE_CLASS_ENCODER(ECSubWrite)
 
 struct ECSubWriteReply {
@@ -100,7 +107,7 @@ struct ECSubWriteReply {
   void encode(ceph::buffer::list &bl) const;
   void decode(ceph::buffer::list::const_iterator &bl);
   void dump(ceph::Formatter *f) const;
-  static void generate_test_instances(std::list<ECSubWriteReply*>& o);
+  static std::list<ECSubWriteReply> generate_test_instances();
 };
 WRITE_CLASS_ENCODER(ECSubWriteReply)
 
@@ -110,10 +117,20 @@ struct ECSubRead {
   std::map<hobject_t, std::list<boost::tuple<uint64_t, uint64_t, uint32_t> >> to_read;
   std::set<hobject_t> attrs_to_read;
   std::map<hobject_t, std::vector<std::pair<int, int>>> subchunks;
+  std::set<hobject_t> omap_headers_to_read;
+  std::map<hobject_t, std::pair<std::string, uint64_t>> omap_read_from;
+  /**
+    * Calculate the cost of the SubOp read operation for mClock scheduler.
+    *
+    * @param *cct: *CephContext
+    * @param pair<int, int>&: subchunk_count and subchunk_size
+    * @return uint64_t - Cost of EC SubOpRead (size in Bytes)
+    */
+  uint64_t cost(CephContext *cct, std::pair<int, int>& subchunk_info);
   void encode(ceph::buffer::list &bl, uint64_t features) const;
   void decode(ceph::buffer::list::const_iterator &bl);
   void dump(ceph::Formatter *f) const;
-  static void generate_test_instances(std::list<ECSubRead*>& o);
+  static std::list<ECSubRead> generate_test_instances();
 };
 WRITE_CLASS_ENCODER_FEATURES(ECSubRead)
 
@@ -123,10 +140,18 @@ struct ECSubReadReply {
   std::map<hobject_t, std::list<std::pair<uint64_t, ceph::buffer::list> >> buffers_read;
   std::map<hobject_t, std::map<std::string, ceph::buffer::list, std::less<>>> attrs_read;
   std::map<hobject_t, int> errors;
+  std::map<hobject_t, ceph::buffer::list> omap_headers_read;
+  std::map<hobject_t, std::map<std::string, ceph::buffer::list>> omap_entries_read;
+  std::map<hobject_t, bool> omaps_complete;
   void encode(ceph::buffer::list &bl) const;
+  void encode(ceph::buffer::list &p_bl,
+	      ceph::buffer::list &d_pl,
+	      uint64_t features=0) const;
   void decode(ceph::buffer::list::const_iterator &bl);
+  void decode(ceph::buffer::list::const_iterator &p_bl,
+	      ceph::buffer::list::const_iterator &d_pl);
   void dump(ceph::Formatter *f) const;
-  static void generate_test_instances(std::list<ECSubReadReply*>& o);
+  static std::list<ECSubReadReply> generate_test_instances();
 };
 WRITE_CLASS_ENCODER(ECSubReadReply)
 

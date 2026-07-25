@@ -1,5 +1,5 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
 
 #pragma once
 
@@ -200,7 +200,6 @@ public:
    * io behavior accordingly.
    */
   enum class io_state_t : uint8_t {
-    none,    // no IO is possible as the connection is not available to the user yet.
     delay,   // IO is delayed until open.
     open,    // Dispatch In and Out concurrently.
     drop,    // Drop IO as the connection is closed.
@@ -327,12 +326,15 @@ public:
         // do not dispatch out
         return false;
       default:
-        crimson::get_logger(ceph_subsys_ms).error(
-          "{} try_enter_out_dispatching() got wrong io_state {}",
-          conn, io_state);
-        ceph_abort("impossible");
+        abort_wrong_io_state(conn);
       }
     }
+
+    // defined out of line: logging io_state_t here, inside IOHandler, would
+    // instantiate fmt::formatter<io_state_t> before it is declared (it can
+    // only be declared after IOHandler). only this impossible-state path
+    // formats it, so keep the hot switch inline and move the abort out.
+    [[noreturn]] void abort_wrong_io_state(SocketConnection &conn);
 
     void notify_out_dispatching_stopped(
         const char *what, SocketConnection &conn);
@@ -448,6 +450,14 @@ public:
 #else
   ceph::bufferlist
 #endif
+  /**
+   * Encode and drain pending outgoing messages into a single bufferlist
+   * for a batched socket write. Stops early when the accumulated number
+   * of buffer fragments reaches crimson_osd_max_send_buffers to prevent
+   * overflowing seastar's uint16_t packet fragment
+   * counter. Un-swept messages remain in the queue and are picked up
+   * by the next do_out_dispatch() iteration.
+   */
   sweep_out_pending_msgs_to_sent(
       bool require_keepalive,
       std::optional<utime_t> maybe_keepalive_ack,
@@ -562,9 +572,6 @@ struct fmt::formatter<crimson::net::IOHandler::io_state_t>
     using enum crimson::net::IOHandler::io_state_t;
     std::string_view name;
     switch (state) {
-    case none:
-      name = "none";
-      break;
     case delay:
       name = "delay";
       break;

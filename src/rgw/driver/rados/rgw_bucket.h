@@ -1,5 +1,5 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab ft=cpp
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab ft=cpp
 
 #pragma once
 
@@ -31,7 +31,9 @@
 // define as static when RGWBucket implementation completes
 extern void rgw_get_buckets_obj(const rgw_user& user_id, std::string& buckets_obj_id);
 
+#ifdef WITH_RADOSGW_RADOS
 class RGWBucketMetadataHandler;
+#endif
 class RGWBucketInstanceMetadataHandler;
 class RGWUserCtl;
 class RGWBucketCtl;
@@ -44,7 +46,8 @@ extern bool rgw_bucket_object_check_filter(const std::string& oid);
 
 void init_default_bucket_layout(CephContext *cct, rgw::BucketLayout& layout,
 				const RGWZone& zone,
-				std::optional<rgw::BucketIndexType> type);
+				std::optional<rgw::BucketIndexType> type,
+				std::optional<uint32_t> shards);
 
 struct RGWBucketCompleteInfo {
   RGWBucketInfo info;
@@ -179,7 +182,8 @@ auto create_bucket_metadata_handler(librados::Rados& rados,
 auto create_bucket_instance_metadata_handler(rgw::sal::Driver* driver,
                                              RGWSI_Zone* svc_zone,
                                              RGWSI_Bucket* svc_bucket,
-                                             RGWSI_BucketIndex* svc_bi)
+                                             RGWSI_BucketIndex* svc_bi,
+                                             RGWDataChangesLog *svc_datalog)
     -> std::unique_ptr<RGWMetadataHandler>;
 
 // archive bucket entrypoint metadata handler factory
@@ -192,11 +196,17 @@ auto create_archive_bucket_metadata_handler(librados::Rados& rados,
 auto create_archive_bucket_instance_metadata_handler(rgw::sal::Driver* driver,
                                                      RGWSI_Zone* svc_zone,
                                                      RGWSI_Bucket* svc_bucket,
-                                                     RGWSI_BucketIndex* svc_bi)
+                                                     RGWSI_BucketIndex* svc_bi,
+                                                     RGWDataChangesLog *svc_datalog)
     -> std::unique_ptr<RGWMetadataHandler>;
 
 
-extern int rgw_remove_object(const DoutPrefixProvider *dpp, rgw::sal::Driver* driver, rgw::sal::Bucket* bucket, rgw_obj_key& key, optional_yield y);
+extern int rgw_remove_object(const DoutPrefixProvider* dpp,
+			     rgw::sal::Driver* driver,
+			     rgw::sal::Bucket* bucket,
+			     rgw_obj_key& key,
+			     optional_yield y,
+			     const bool force = false);
 
 extern int rgw_object_get_attr(rgw::sal::Driver* driver, rgw::sal::Object* obj,
 			       const char* attr_name, bufferlist& out_bl,
@@ -204,6 +214,7 @@ extern int rgw_object_get_attr(rgw::sal::Driver* driver, rgw::sal::Object* obj,
 
 void check_bad_owner_bucket_mapping(rgw::sal::Driver* driver,
                                     const rgw_owner& owner,
+                                    const std::string& owner_name,
                                     const std::string& tenant,
                                     bool fix, optional_yield y,
                                     const DoutPrefixProvider *dpp);
@@ -217,6 +228,7 @@ struct RGWBucketAdminOpState {
   std::string object_name;
   std::string new_bucket_name;
   std::string marker;
+  uint32_t max_entries;
 
   bool list_buckets;
   bool stat_buckets;
@@ -227,6 +239,7 @@ struct RGWBucketAdminOpState {
   bool sync_bucket;
   bool dump_keys;
   bool hide_progress;
+  bool restore_stats;
   int max_aio = 0;
   ceph::timespan min_age = std::chrono::hours::zero();
 
@@ -236,6 +249,7 @@ struct RGWBucketAdminOpState {
   RGWRateLimitInfo ratelimit_info;
 
   void set_fetch_stats(bool value) { stat_buckets = value; }
+  void set_restore_stats(bool value) { restore_stats = value; }
   void set_check_objects(bool value) { check_objects = value; }
   void set_fix_index(bool value) { fix_index = value; }
   void set_delete_children(bool value) { delete_child_objects = value; }
@@ -344,7 +358,7 @@ public:
   int check_index_unlinked(rgw::sal::RadosStore* rados_store, const DoutPrefixProvider *dpp, RGWBucketAdminOpState& op_state,
                            RGWFormatterFlusher& flusher);
 
-  int check_index(const DoutPrefixProvider *dpp,
+  int check_index(const DoutPrefixProvider *dpp, optional_yield y,
           RGWBucketAdminOpState& op_state,
           std::map<RGWObjCategory, RGWStorageStats>& existing_stats,
           std::map<RGWObjCategory, RGWStorageStats>& calculated_stats,
@@ -384,10 +398,10 @@ public:
   static int check_index_unlinked(rgw::sal::RadosStore* driver, RGWBucketAdminOpState& op_state,
                                   RGWFormatterFlusher& flusher, const DoutPrefixProvider *dpp);
 
-  static int remove_bucket(rgw::sal::Driver* driver, RGWBucketAdminOpState& op_state, optional_yield y,
-			   const DoutPrefixProvider *dpp, bool bypass_gc = false, bool keep_index_consistent = true);
+  static int remove_bucket(rgw::sal::Driver* driver, const rgw::SiteConfig& site, RGWBucketAdminOpState& op_state, optional_yield y,
+			   const DoutPrefixProvider *dpp, bool bypass_gc = false, bool keep_index_consistent = true, bool forwarded_request = false);
   static int remove_object(rgw::sal::Driver* driver, RGWBucketAdminOpState& op_state, const DoutPrefixProvider *dpp, optional_yield y);
-  static int info(rgw::sal::Driver* driver, RGWBucketAdminOpState& op_state, RGWFormatterFlusher& flusher, optional_yield y, const DoutPrefixProvider *dpp);
+  static int info(rgw::sal::Driver* driver, const rgw::SiteConfig& site, RGWBucketAdminOpState& op_state, RGWFormatterFlusher& flusher, optional_yield y, const DoutPrefixProvider *dpp);
   static int limit_check(rgw::sal::Driver* driver, RGWBucketAdminOpState& op_state,
 			 const std::list<std::string>& user_ids,
 			 RGWFormatterFlusher& flusher, optional_yield y,
@@ -425,6 +439,7 @@ class RGWBucketCtl {
     RGWSI_Bucket_Sync *bucket_sync{nullptr};
     RGWSI_BucketIndex *bi{nullptr};
     RGWSI_User* user = nullptr;
+    RGWDataChangesLog *datalog_rados{nullptr};
   } svc;
 
   struct Ctl {
@@ -436,7 +451,8 @@ public:
                RGWSI_Bucket *bucket_svc,
                RGWSI_Bucket_Sync *bucket_sync_svc,
                RGWSI_BucketIndex *bi_svc,
-               RGWSI_User* user_svc);
+               RGWSI_User* user_svc,
+               RGWDataChangesLog *datalog_svc);
 
   void init(RGWUserCtl *user_ctl,
             RGWDataChangesLog *datalog,

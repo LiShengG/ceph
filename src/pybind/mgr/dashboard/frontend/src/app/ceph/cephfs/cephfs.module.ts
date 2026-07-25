@@ -9,7 +9,7 @@ import {
   NgbTooltipModule,
   NgbTypeaheadModule
 } from '@ng-bootstrap/ng-bootstrap';
-import { NgChartsModule } from 'ng2-charts';
+import { provideCharts, withDefaultRegisterables, BaseChartDirective } from 'ng2-charts';
 
 import { AppRoutingModule } from '~/app/app-routing.module';
 import { SharedModule } from '~/app/shared/shared.module';
@@ -31,6 +31,8 @@ import { CephfsSubvolumeSnapshotsFormComponent } from './cephfs-subvolume-snapsh
 import { CephfsSnapshotscheduleFormComponent } from './cephfs-snapshotschedule-form/cephfs-snapshotschedule-form.component';
 import { CephfsMountDetailsComponent } from './cephfs-mount-details/cephfs-mount-details.component';
 import { CephfsAuthModalComponent } from './cephfs-auth-modal/cephfs-auth-modal.component';
+import { CephfsMirroringListComponent } from './cephfs-mirroring-list/cephfs-mirroring-list.component';
+import { CephfsMirroringErrorComponent } from './cephfs-mirroring-error/cephfs-mirroring-error.component';
 import {
   ButtonModule,
   CheckboxModule,
@@ -40,26 +42,37 @@ import {
   GridModule,
   IconModule,
   IconService,
+  InlineLoadingModule,
   InputModule,
   LayoutModule,
+  LoadingModule,
   ModalModule,
   NumberModule,
   PlaceholderModule,
+  RadioModule,
   SelectModule,
+  TagModule,
   TimePickerModule,
-  TreeviewModule
+  TilesModule,
+  TreeviewModule,
+  TabsModule,
+  NotificationModule
 } from 'carbon-components-angular';
 
 import AddIcon from '@carbon/icons/es/add/32';
+import LaunchIcon from '@carbon/icons/es/launch/32';
 import Close from '@carbon/icons/es/close/32';
 import Trash from '@carbon/icons/es/trash-can/32';
+import Renew16 from '@carbon/icons/es/renew/16';
+import { CephfsMirroringWizardComponent } from './cephfs-mirroring-wizard/cephfs-mirroring-wizard.component';
+import { CephfsFilesystemSelectorComponent } from './cephfs-filesystem-selector/cephfs-filesystem-selector.component';
+import { CephfsMirroringEntityComponent } from './cephfs-mirroring-entity/cephfs-mirroring-entity.component';
 
 @NgModule({
   imports: [
     CommonModule,
     SharedModule,
     AppRoutingModule,
-    NgChartsModule,
     TreeviewModule,
     NgbNavModule,
     FormsModule,
@@ -83,7 +96,16 @@ import Trash from '@carbon/icons/es/trash-can/32';
     NumberModule,
     LayoutModule,
     ComboBoxModule,
-    IconModule
+    IconModule,
+    InlineLoadingModule,
+    LoadingModule,
+    RadioModule,
+    BaseChartDirective,
+    TabsModule,
+    RadioModule,
+    TilesModule,
+    TagModule,
+    NotificationModule
   ],
   declarations: [
     CephfsDetailComponent,
@@ -103,11 +125,17 @@ import Trash from '@carbon/icons/es/trash-can/32';
     CephfsSnapshotscheduleFormComponent,
     CephfsSubvolumeSnapshotsFormComponent,
     CephfsMountDetailsComponent,
-    CephfsAuthModalComponent
-  ]
+    CephfsAuthModalComponent,
+    CephfsMirroringListComponent,
+    CephfsMirroringWizardComponent,
+    CephfsFilesystemSelectorComponent,
+    CephfsMirroringErrorComponent,
+    CephfsMirroringEntityComponent
+  ],
+  providers: [provideCharts(withDefaultRegisterables())]
 })
 export class CephfsModule {
   constructor(private iconService: IconService) {
-    this.iconService.registerAll([AddIcon, Close, Trash]);
+    this.iconService.registerAll([AddIcon, LaunchIcon, Close, Trash, Renew16]);
   }
 }

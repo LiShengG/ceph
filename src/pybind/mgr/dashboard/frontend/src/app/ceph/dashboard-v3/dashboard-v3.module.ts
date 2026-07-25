@@ -3,8 +3,8 @@ import { NgModule } from '@angular/core';
 import { FormsModule, ReactiveFormsModule } from '@angular/forms';
 import { RouterModule } from '@angular/router';
 
-import { NgbNavModule, NgbPopoverModule, NgbTooltipModule } from '@ng-bootstrap/ng-bootstrap';
-import { NgChartsModule } from 'ng2-charts';
+import { NgbNavModule, NgbTooltipModule } from '@ng-bootstrap/ng-bootstrap';
+import { provideCharts, withDefaultRegisterables, BaseChartDirective } from 'ng2-charts';
 import { SimplebarAngularModule } from 'simplebar-angular';
 
 import { SharedModule } from '~/app/shared/shared.module';
@@ -12,8 +12,8 @@ import { CephSharedModule } from '../shared/ceph-shared.module';
 import { DashboardAreaChartComponent } from './dashboard-area-chart/dashboard-area-chart.component';
 import { DashboardPieComponent } from './dashboard-pie/dashboard-pie.component';
 import { DashboardTimeSelectorComponent } from './dashboard-time-selector/dashboard-time-selector.component';
-import { DashboardV3Component } from './dashboard/dashboard-v3.component';
-import { PgSummaryPipe } from './pg-summary.pipe';
+import { InlineLoadingModule, ToggletipModule, TagModule } from 'carbon-components-angular';
+import { ProductiveCardComponent } from '~/app/shared/components/productive-card/productive-card.component';
 
 @NgModule({
   imports: [
@@ -21,28 +21,23 @@ import { PgSummaryPipe } from './pg-summary.pipe';
     CommonModule,
     NgbNavModule,
     SharedModule,
-    NgChartsModule,
     RouterModule,
-    NgbPopoverModule,
     NgbTooltipModule,
     FormsModule,
     ReactiveFormsModule,
-    SimplebarAngularModule
+    SimplebarAngularModule,
+    BaseChartDirective,
+    ToggletipModule,
+    InlineLoadingModule,
+    TagModule,
+    ProductiveCardComponent
   ],
-
   declarations: [
-    DashboardV3Component,
     DashboardPieComponent,
-    PgSummaryPipe,
     DashboardAreaChartComponent,
     DashboardTimeSelectorComponent
   ],
-
-  exports: [
-    DashboardV3Component,
-    DashboardAreaChartComponent,
-    DashboardTimeSelectorComponent,
-    DashboardPieComponent
-  ]
+  exports: [DashboardAreaChartComponent, DashboardTimeSelectorComponent, DashboardPieComponent],
+  providers: [provideCharts(withDefaultRegisterables())]
 })
 export class DashboardV3Module {}

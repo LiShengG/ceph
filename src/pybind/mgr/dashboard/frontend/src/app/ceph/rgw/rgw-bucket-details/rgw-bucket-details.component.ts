@@ -1,38 +1,40 @@
-import { Component, Input, OnChanges } from '@angular/core';
+import { ChangeDetectorRef, Component, Input, OnChanges } from '@angular/core';
 
 import { RgwBucketService } from '~/app/shared/api/rgw-bucket.service';
 
 import * as xml2js from 'xml2js';
+import { RgwRateLimitConfig } from '../models/rgw-rate-limit';
+import { RgwBucketReplication } from '../models/rgw-bucket-replication';
 
 @Component({
   selector: 'cd-rgw-bucket-details',
   templateUrl: './rgw-bucket-details.component.html',
-  styleUrls: ['./rgw-bucket-details.component.scss']
+  styleUrls: ['./rgw-bucket-details.component.scss'],
+  standalone: false
 })
 export class RgwBucketDetailsComponent implements OnChanges {
   @Input()
   selection: any;
-
+  lifecycleProgress: { bucket: string; status: string; started: string };
+  lifecycleProgressMap = new Map<string, { description: string; color: string }>([
+    ['UNINITIAL', { description: $localize`The process has not run yet`, color: 'cool-gray' }],
+    ['PROCESSING', { description: $localize`The process is currently running`, color: 'cyan' }],
+    ['COMPLETE', { description: $localize`The process has completed`, color: 'green' }]
+  ]);
   lifecycleFormat: 'json' | 'xml' = 'json';
   aclPermissions: Record<string, string[]> = {};
   replicationStatus = $localize`Disabled`;
+  hasSyncPolicyOnly = false;
+  replicationData: RgwBucketReplication;
+  bucketRateLimit: RgwRateLimitConfig;
 
-  constructor(private rgwBucketService: RgwBucketService) {}
+  constructor(
+    private rgwBucketService: RgwBucketService,
+    private cd: ChangeDetectorRef
+  ) {}
 
   ngOnChanges() {
-    if (this.selection) {
-      this.rgwBucketService.get(this.selection.bid).subscribe((bucket: object) => {
-        bucket['lock_retention_period_days'] = this.rgwBucketService.getLockDays(bucket);
-        this.selection = bucket;
-        if (this.lifecycleFormat === 'json' && !this.selection.lifecycle) {
-          this.selection.lifecycle = {};
-        }
-        this.aclPermissions = this.parseXmlAcl(this.selection.acl, this.selection.owner);
-        if (this.selection.replication?.['Rule']?.['Status']) {
-          this.replicationStatus = this.selection.replication?.['Rule']?.['Status'];
-        }
-      });
-    }
+    this.updateBucketDetails(this.extraxtDetailsfromResponse.bind(this));
   }
 
   parseXmlAcl(xml: any, bucketOwner: string): Record<string, string[]> {
@@ -68,5 +70,66 @@ export class RgwBucketDetailsComponent implements OnChanges {
       }
     });
     return data;
+  }
+
+  updateBucketDetails(cbFn: Function) {
+    if (this.selection) {
+      this.rgwBucketService.get(this.selection.bid).subscribe((bucket: object) => {
+        bucket['lock_retention_period_days'] = this.rgwBucketService.getLockDays(bucket);
+        this.selection = bucket;
+        cbFn();
+      });
+    }
+  }
+
+  extraxtDetailsfromResponse() {
+    this.aclPermissions = this.parseXmlAcl(this.selection.acl, this.selection.owner);
+
+    this.replicationData = {
+      sync_policy_active: this.selection.replication?.sync_policy_active === true,
+      replication_rules_configured:
+        this.selection.replication?.replication_rules_configured === true,
+      policy: this.selection.replication?.policy || {}
+    };
+
+    this.hasSyncPolicyOnly =
+      this.replicationData.sync_policy_active && !this.replicationData.replication_rules_configured;
+
+    if (this.replicationData.sync_policy_active) {
+      this.replicationStatus = $localize`Enabled`;
+    } else if (
+      this.replicationData.replication_rules_configured &&
+      this.replicationData.policy['Rule']?.['Status']
+    ) {
+      this.replicationStatus = this.replicationData.policy['Rule']['Status'];
+    } else {
+      this.replicationStatus = $localize`Disabled`;
+    }
+    this.rgwBucketService.getBucketRateLimit(this.selection.bid).subscribe((resp: any) => {
+      if (resp && resp.bucket_ratelimit !== undefined) {
+        this.bucketRateLimit = resp.bucket_ratelimit;
+      }
+    });
+    this.extractLifecycleDetails();
+  }
+
+  extractLifecycleDetails() {
+    if (this.lifecycleFormat === 'json' && !this.selection.lifecycle) {
+      this.selection.lifecycle = {};
+    }
+    if (this.selection.lifecycle_progress?.length > 0) {
+      this.selection.lifecycle_progress.forEach(
+        (progress: { bucket: string; status: string; started: string }) => {
+          if (progress.bucket.includes(this.selection.bucket)) {
+            this.lifecycleProgress = progress;
+          }
+        }
+      );
+    }
+  }
+
+  updateLifecycleFormatTo(format: 'json' | 'xml'): void {
+    this.lifecycleFormat = format;
+    this.cd.detectChanges();
   }
 }

@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
+
 #include "include/int_types.h"
 
 #include <errno.h>
@@ -8,6 +9,7 @@
 #include "include/types.h"
 #include "include/uuid.h"
 #include "common/ceph_context.h"
+#include "common/Cond.h"
 #include "common/dout.h"
 #include "common/errno.h"
 #include "common/Throttle.h"
@@ -38,8 +40,8 @@
 #include "librbd/api/Image.h"
 #include "librbd/api/Io.h"
 #include "librbd/cache/Utils.h"
-#include "librbd/exclusive_lock/AutomaticPolicy.h"
 #include "librbd/exclusive_lock/StandardPolicy.h"
+#include "librbd/exclusive_lock/TransientPolicy.h"
 #include "librbd/deep_copy/MetadataCopyRequest.h"
 #include "librbd/image/CloneRequest.h"
 #include "librbd/image/CreateRequest.h"
@@ -59,8 +61,10 @@
 #include "journal/Journaler.h"
 
 #include <boost/scope_exit.hpp>
-#include <boost/variant.hpp>
 #include "include/ceph_assert.h"
+
+#include <shared_mutex> // for std::shared_lock
+#include <variant>
 
 #define dout_subsys ceph_subsys_rbd
 #undef dout_prefix
@@ -273,7 +277,7 @@ int validate_pool(IoCtx &io_ctx, CephContext *cct) {
     return io_ctx.tmap_update(RBD_DIRECTORY, cmdbl);
   }
 
-  typedef boost::variant<std::string,uint64_t> image_option_value_t;
+  typedef std::variant<std::string, uint64_t> image_option_value_t;
   typedef std::map<int,image_option_value_t> image_options_t;
   typedef std::shared_ptr<image_options_t> image_options_ref;
 
@@ -431,7 +435,7 @@ int validate_pool(IoCtx &io_ctx, CephContext *cct) {
       return -ENOENT;
     }
 
-    *optval = boost::get<std::string>(j->second);
+    *optval = std::get<std::string>(j->second);
     return 0;
   }
 
@@ -452,7 +456,7 @@ int validate_pool(IoCtx &io_ctx, CephContext *cct) {
       return -ENOENT;
     }
 
-    *optval = boost::get<uint64_t>(j->second);
+    *optval = std::get<uint64_t>(j->second);
     return 0;
   }
 
@@ -945,10 +949,6 @@ int validate_pool(IoCtx &io_ctx, CephContext *cct) {
     ldout(cct, 20) << __func__ << ": ictx=" << ictx << ", "
                    << "lock_mode=" << lock_mode << dendl;
 
-    if (lock_mode != RBD_LOCK_MODE_EXCLUSIVE) {
-      return -EOPNOTSUPP;
-    }
-
     C_SaferCond lock_ctx;
     {
       std::unique_lock l{ictx->owner_lock};
@@ -958,9 +958,14 @@ int validate_pool(IoCtx &io_ctx, CephContext *cct) {
 	return -EINVAL;
       }
 
-      if (ictx->get_exclusive_lock_policy()->may_auto_request_lock()) {
+      if (lock_mode == RBD_LOCK_MODE_EXCLUSIVE) {
 	ictx->set_exclusive_lock_policy(
 	  new exclusive_lock::StandardPolicy(ictx));
+      } else if (lock_mode == RBD_LOCK_MODE_EXCLUSIVE_TRANSIENT) {
+        ictx->set_exclusive_lock_policy(
+          new exclusive_lock::TransientPolicy(ictx));
+      } else {
+        return -EOPNOTSUPP;
       }
 
       if (ictx->exclusive_lock->is_lock_owner()) {
@@ -972,7 +977,7 @@ int validate_pool(IoCtx &io_ctx, CephContext *cct) {
 
     int r = lock_ctx.wait();
     if (r < 0) {
-      lderr(cct) << "failed to request exclusive lock: " << cpp_strerror(r)
+      lderr(cct) << "failed to acquire exclusive lock: " << cpp_strerror(r)
 		 << dendl;
       return r;
     }
@@ -981,7 +986,6 @@ int validate_pool(IoCtx &io_ctx, CephContext *cct) {
     if (ictx->exclusive_lock == nullptr) {
       return -EINVAL;
     } else if (!ictx->exclusive_lock->is_lock_owner()) {
-      lderr(cct) << "failed to acquire exclusive lock" << dendl;
       return ictx->exclusive_lock->get_unlocked_op_error();
     }
 

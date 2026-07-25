@@ -18,49 +18,61 @@ set -xe
 
 . /etc/os-release
 base=${1:-/tmp/release}
-releasedir=$base/$NAME/WORKDIR
+releasedir=$base/$ID/WORKDIR
 rm -fr $(dirname $releasedir)
-mkdir -p $releasedir
-#
-# remove all files not under git so they are not
-# included in the distribution.
-#
-git clean -dxf
-#
+
 # git describe provides a version that is
 # a) human readable
 # b) is unique for each commit
 # c) compares higher than any previous commit
 # d) contains the short hash of the commit
 #
-vers=$(git describe --match "v*" | sed s/^v//)
-./make-dist $vers
+# CI builds compute the version at an earlier stage, via the same method. Since
+# git metadata is not part of the source distribution, we take the version as
+# an argument to this script.
 #
-# rename the tarbal to match debian conventions and extract it
+if [ -z "${2}" ]; then
+    vers=$(git describe --match "v*" | sed s/^v//)
+    dvers=${vers}-1
+else
+    vers=${2}
+    dvers=${vers}-1${VERSION_CODENAME}
+fi
+
+test -f "ceph-$vers.tar.bz2" || ./make-dist $vers
 #
+# rename the tarball to match debian conventions and extract it
+#
+mkdir -p $releasedir
 mv ceph-$vers.tar.bz2 $releasedir/ceph_$vers.orig.tar.bz2
-tar -C $releasedir -jxf $releasedir/ceph_$vers.orig.tar.bz2
+tar -C $releasedir --no-same-owner -jxf $releasedir/ceph_$vers.orig.tar.bz2
+
 #
-# copy the debian directory over and remove -dbg packages
+# Optionally disable -dbg package builds
 # because they are large and take time to build
 #
 cp -a debian $releasedir/ceph-$vers/debian
 cd $releasedir
-perl -ni -e 'print if(!(/^Package: .*-dbg$/../^$/))' ceph-$vers/debian/control
-perl -pi -e 's/--dbg-package.*//' ceph-$vers/debian/rules
-#
-# always set the debian version to 1 which is ok because the debian
-# directory is included in the sources and the upstream version will
-# change each time it is modified.
-#
-dvers="$vers-1"
+if [[ -n "$SKIP_DEBUG_PACKAGES" ]]; then
+    perl -ni -e 'print if(!(/^Package: .*-dbg$/../^$/))' ceph-$vers/debian/control
+    perl -pi -e 's/--dbg-package.*//' ceph-$vers/debian/rules
+fi
+
+# For cache hit consistency, allow CI builds to use a build directory whose name
+# does not contain version information
+if [ "${CEPH_BUILD_NORMALIZE_PATHS}" = 'true' ]; then
+    mv ceph-$vers ceph
+    cd ceph
+else
+    cd ceph-$vers
+fi
+
 #
 # update the changelog to match the desired version
 #
-cd ceph-$vers
 chvers=$(head -1 debian/changelog | perl -ne 's/.*\(//; s/\).*//; print')
 if [ "$chvers" != "$dvers" ]; then
-   DEBEMAIL="contact@ceph.com" dch -D $VERSION_CODENAME --force-distribution -b -v "$dvers" "new version"
+    DEBEMAIL="contact@ceph.com" dch -D $VERSION_CODENAME --force-distribution -b -v "$dvers" "new version"
 fi
 #
 # create the packages
@@ -68,14 +80,64 @@ fi
 # b) do not sign the packages
 # c) use half of the available processors
 #
-: ${NPROC:=$(($(nproc) / 2))}
-if test $NPROC -gt 1 ; then
-    j=-j${NPROC}
+: ${NPROC:=$(nproc)}
+RAM_MB=$(vmstat --stats --unit m | grep 'total memory' | awk '{print $1}')
+if test "$NPROC" -gt 50; then
+    MAX_JOBS=$((${RAM_MB} / 4000))
+else
+    MAX_JOBS=$((${RAM_MB} / 3000))
 fi
-PATH=/usr/lib/ccache:$PATH dpkg-buildpackage $j -uc -us
+if test "$NPROC" -gt "$MAX_JOBS"; then
+    JOBS_FLAG="-j${MAX_JOBS}"
+else
+    JOBS_FLAG="-j${NPROC}"
+fi
+if [ "$SCCACHE" != "true" ]; then
+    PATH=/usr/lib/ccache:$PATH
+fi
+# Crimson/seastar needs GCC >= 13 (C++20 coroutines).
+# WITH_CRIMSON: off forces disable; on/unset enable when the distro is new enough
+# (Ubuntu 24.04 (noble)+ or Debian 13 (trixie)+). Distro is a hard floor: setting
+# WITH_CRIMSON=on on an older distro is ignored (with a warning).
+distro_supports_crimson=no
+case "$ID" in
+ubuntu)
+    ubuntu_major=${VERSION_ID%%.*}
+    ubuntu_minor=${VERSION_ID#*.}
+    if [ "$ubuntu_major" -gt 24 ] ||
+        { [ "$ubuntu_major" -eq 24 ] && [ "$ubuntu_minor" -ge 4 ]; }; then
+        distro_supports_crimson=yes
+    fi
+    ;;
+debian)
+    if [ -z "$VERSION_ID" ] || [ "$VERSION_ID" -ge 13 ] 2>/dev/null; then
+        distro_supports_crimson=yes
+    fi
+    ;;
+esac
+
+enable_crimson=no
+case "${WITH_CRIMSON:-auto}" in
+OFF | off | 0 | false) ;;
+ON | on | 1 | true)
+    if [ "$distro_supports_crimson" = yes ]; then
+        enable_crimson=yes
+    else
+        echo "WITH_CRIMSON=$WITH_CRIMSON ignored: $ID $VERSION_ID lacks GCC >= 13" >&2
+    fi
+    ;;
+auto | "")
+    [ "$distro_supports_crimson" = yes ] && enable_crimson=yes
+    ;;
+esac
+
+if [ "$enable_crimson" = yes ]; then
+    export DEB_BUILD_PROFILES="${DEB_BUILD_PROFILES:+$DEB_BUILD_PROFILES }pkg.ceph.crimson"
+fi
+PATH=$PATH dpkg-buildpackage $JOBS_FLAG -uc -us
 cd ../..
 mkdir -p $VERSION_CODENAME/conf
-cat > $VERSION_CODENAME/conf/distributions <<EOF
+cat >$VERSION_CODENAME/conf/distributions <<EOF
 Codename: $VERSION_CODENAME
 Suite: stable
 Components: main
@@ -88,4 +150,4 @@ reprepro --basedir $(pwd) include $VERSION_CODENAME WORKDIR/*.changes
 #
 # teuthology needs the version in the version file
 #
-echo $dvers > $VERSION_CODENAME/version
+echo $dvers >$VERSION_CODENAME/version

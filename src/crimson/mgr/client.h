@@ -1,14 +1,17 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
 
 #pragma once
 
 #include <seastar/core/timer.hh>
+#include <seastar/core/shared_mutex.hh>
 
 #include "crimson/common/gated.h"
 #include "crimson/net/Dispatcher.h"
 #include "crimson/net/Fwd.h"
+#include "mgr/DaemonHealthMetric.h"
 #include "mon/MgrMap.h"
+#include "mgr/MetricTypes.h"
 
 template<typename Message> using Ref = boost::intrusive_ptr<Message>;
 namespace crimson::net {
@@ -29,12 +32,21 @@ public:
 };
 
 class Client : public crimson::net::Dispatcher {
+  using get_perf_report_cb_t = std::function<seastar::future<MetricPayload> ()>;
+  using set_perf_queries_cb_t =
+    std::function<seastar::future<> (const ConfigPayload &)>;
+  using stats_warning_cb_t = std::function<void(uint32_t skips)>;
 public:
   Client(crimson::net::Messenger& msgr,
-	 WithStats& with_stats);
+	 WithStats& with_stats,
+	 set_perf_queries_cb_t cb_set,
+	 get_perf_report_cb_t cb_get,
+	 stats_warning_cb_t stats_warning_cb);
   seastar::future<> start();
   seastar::future<> stop();
+  seastar::future<> send(MessageURef msg);
   void report();
+  void update_daemon_health(std::vector<DaemonHealthMetric>&& metrics);
 
 private:
   std::optional<seastar::future<>> ms_dispatch(
@@ -46,6 +58,7 @@ private:
   seastar::future<> handle_mgr_conf(crimson::net::ConnectionRef conn,
 				    Ref<MMgrConfigure> m);
   seastar::future<> reconnect();
+  seastar::future<> retry_interval();
 
   void print(std::ostream&) const;
   friend std::ostream& operator<<(std::ostream& out, const Client& client);
@@ -54,10 +67,23 @@ private:
   crimson::net::Messenger& msgr;
   WithStats& with_stats;
   crimson::net::ConnectionRef conn;
+  seastar::shared_mutex conn_lock;
   seastar::timer<seastar::lowres_clock> report_timer;
   crimson::common::gate_per_shard gates;
   uint64_t last_config_bl_version = 0;
   std::string service_name, daemon_name;
+  set_perf_queries_cb_t set_perf_queries_cb;
+  get_perf_report_cb_t get_perf_report_cb;
+
+  std::vector<DaemonHealthMetric> daemon_health_metrics;
+
+  bool stats_in_flight = false;
+  uint32_t stats_skip_count = 0;
+  // emit a cluster-log warning every this many skipped reports (~60s)
+  static constexpr uint32_t STATS_WARN_INTERVAL = 12;
+  // abandon a stuck in-flight stats send after this many skips (~5min)
+  static constexpr uint32_t STATS_ABANDON_THRESHOLD = 5 * STATS_WARN_INTERVAL;
+  stats_warning_cb_t stats_warning_cb;
 
   void _send_report();
 };

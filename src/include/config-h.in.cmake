@@ -250,8 +250,14 @@
 /* we have a recent nasm and are x86_64 */
 #cmakedefine HAVE_NASM_X64
 
+/* nasm can also build the isa-l:avx2 */
+#cmakedefine HAVE_NASM_X64_AVX2
+
 /* nasm can also build the isa-l:avx512 */
 #cmakedefine HAVE_NASM_X64_AVX512
+
+/* nasm can also build the isa-l:avx512 & vpclmulqdq */
+#cmakedefine HAVE_NASM_X64_AVX512_VPCLMUL
 
 /* Define if the erasure code isa-l plugin is compiled */
 #cmakedefine WITH_EC_ISA_PLUGIN
@@ -291,6 +297,15 @@
 
 /* Support ARMv8 CRC and CRYPTO intrinsics */
 #cmakedefine HAVE_ARMV8_CRC_CRYPTO_INTRINSICS
+
+/* Define if you have RISC-V Vector extension */
+#cmakedefine HAVE_RISCV_RVV 1
+
+/* Define if you have RISC-V ZVBC extension */
+#cmakedefine HAVE_RISCV_ZVBC 1
+
+/* Define if you have RISC-V ZBC extension */
+#cmakedefine HAVE_RISCV_ZBC 1
 
 /* Define if you have struct stat.st_mtimespec.tv_nsec */
 #cmakedefine HAVE_STAT_ST_MTIMESPEC_TV_NSEC
@@ -363,6 +378,9 @@
 /* Backend POSIX for Rados Gateway */
 #cmakedefine WITH_RADOSGW_POSIX
 
+/* Backend RADOS for Rados Gateway */
+/* #cmakedefine WITH_RADOSGW_RADOS */
+
 /* Defined if std::map::merge() is supported */
 #cmakedefine HAVE_STDLIB_MAP_SPLICING
 
@@ -371,9 +389,6 @@
 
 /* Defined if UADK compress/decompress is supported */
 #cmakedefine HAVE_UADK
-
-/* Define if seastar is available. */
-#cmakedefine HAVE_SEASTAR
 
 /* Define if unit tests are built. */
 #cmakedefine UNIT_TESTS_BUILT
@@ -401,5 +416,8 @@
 
 /* libexec directory path */
 #cmakedefine CMAKE_INSTALL_LIBEXECDIR "@CMAKE_INSTALL_LIBEXECDIR@"
+
+/* Define if breakpad is available */
+#cmakedefine HAVE_BREAKPAD
 
 #endif /* CONFIG_H */

@@ -1,14 +1,13 @@
 import { HttpClientTestingModule } from '@angular/common/http/testing';
 import { TestBed } from '@angular/core/testing';
 
-import { ToastrModule } from 'ngx-toastr';
 import { Observable, of } from 'rxjs';
 
 import { configureTestBed, PrometheusHelper } from '~/testing/unit-test-helper';
 import { PrometheusService } from '../api/prometheus.service';
 import { NotificationType } from '../enum/notification-type.enum';
 import { CdNotificationConfig } from '../models/cd-notification';
-import { AlertmanagerAlert } from '../models/prometheus-alerts';
+import { GroupAlertmanagerAlert } from '../models/prometheus-alerts';
 import { SharedModule } from '../shared.module';
 import { NotificationService } from './notification.service';
 import { PrometheusAlertFormatter } from './prometheus-alert-formatter';
@@ -17,12 +16,12 @@ import { PrometheusAlertService } from './prometheus-alert.service';
 describe('PrometheusAlertService', () => {
   let service: PrometheusAlertService;
   let notificationService: NotificationService;
-  let alerts: AlertmanagerAlert[];
+  let alerts: GroupAlertmanagerAlert[];
   let prometheusService: PrometheusService;
   let prometheus: PrometheusHelper;
 
   configureTestBed({
-    imports: [ToastrModule.forRoot(), SharedModule, HttpClientTestingModule],
+    imports: [SharedModule, HttpClientTestingModule],
     providers: [PrometheusAlertService, PrometheusAlertFormatter]
   });
 
@@ -38,8 +37,8 @@ describe('PrometheusAlertService', () => {
     const isDisabledByStatusCode = (statusCode: number, expectedStatus: boolean, done: any) => {
       service = TestBed.inject(PrometheusAlertService);
       prometheusService = TestBed.inject(PrometheusService);
-      spyOn(prometheusService, 'ifAlertmanagerConfigured').and.callFake((fn) => fn());
-      spyOn(prometheusService, 'getAlerts').and.returnValue(
+      spyOn(prometheusService, 'isAlertmanagerUsable').and.returnValue(of(true));
+      spyOn(prometheusService, 'getGroupedAlerts').and.returnValue(
         new Observable((observer: any) => observer.error({ status: statusCode, error: {} }))
       );
       const disableFn = spyOn(prometheusService, 'disableAlertmanagerConfig').and.callFake(() => {
@@ -52,7 +51,7 @@ describe('PrometheusAlertService', () => {
         done();
       }
 
-      service.getAlerts();
+      service.getGroupedAlerts();
     };
 
     it('disables on 504 error which is thrown if the mgr failed', (done) => {
@@ -93,13 +92,14 @@ describe('PrometheusAlertService', () => {
     );
 
     service.getRules();
-
-    expect(service.rules as any).toEqual([
-      { name: 'nearly_full', type: 'alerting', group: 'group1' },
-      { name: 'load_0', type: 'alerting', group: 'test' },
-      { name: 'load_1', type: 'alerting', group: 'test' },
-      { name: 'load_2', type: 'alerting', group: 'test' }
-    ]);
+    service.rules$.subscribe((rules) => {
+      expect(rules).toEqual([
+        { name: 'nearly_full', type: 'alerting', group: 'group1' },
+        { name: 'load_0', type: 'alerting', group: 'test' },
+        { name: 'load_1', type: 'alerting', group: 'test' },
+        { name: 'load_2', type: 'alerting', group: 'test' }
+      ]);
+    });
   });
 
   describe('refresh', () => {
@@ -114,10 +114,10 @@ describe('PrometheusAlertService', () => {
       spyOn(notificationService, 'show').and.stub();
 
       prometheusService = TestBed.inject(PrometheusService);
-      spyOn(prometheusService, 'ifAlertmanagerConfigured').and.callFake((fn) => fn());
-      spyOn(prometheusService, 'getAlerts').and.callFake(() => of(alerts));
+      spyOn(prometheusService, 'isAlertmanagerUsable').and.returnValue(of(true));
+      spyOn(prometheusService, 'getGroupedAlerts').and.callFake(() => of(alerts));
 
-      alerts = [prometheus.createAlert('alert0')];
+      alerts = [{ alerts: [prometheus.createAlert('alert0')] }];
       service.refresh();
     });
 
@@ -131,9 +131,9 @@ describe('PrometheusAlertService', () => {
     });
 
     it('should notify on alert change', () => {
-      alerts = [prometheus.createAlert('alert0', 'resolved')];
+      alerts = [{ alerts: [prometheus.createAlert('alert0', 'resolved')] }];
       service.refresh();
-      expect(notificationService.show).toHaveBeenCalledWith(
+      jasmine.objectContaining(
         new CdNotificationConfig(
           NotificationType.success,
           'alert0 (resolved)',
@@ -145,16 +145,19 @@ describe('PrometheusAlertService', () => {
     });
 
     it('should not notify on change to suppressed', () => {
-      alerts = [prometheus.createAlert('alert0', 'suppressed')];
+      alerts = [{ alerts: [prometheus.createAlert('alert0', 'suppressed')] }];
       service.refresh();
       expect(notificationService.show).not.toHaveBeenCalled();
     });
 
     it('should notify on a new alert', () => {
-      alerts = [prometheus.createAlert('alert1'), prometheus.createAlert('alert0')];
+      alerts = [
+        { alerts: [prometheus.createAlert('alert0')] },
+        { alerts: [prometheus.createAlert('alert1')] }
+      ];
       service.refresh();
       expect(notificationService.show).toHaveBeenCalledTimes(1);
-      expect(notificationService.show).toHaveBeenCalledWith(
+      jasmine.objectContaining(
         new CdNotificationConfig(
           NotificationType.error,
           'alert1 (active)',
@@ -166,14 +169,14 @@ describe('PrometheusAlertService', () => {
     });
 
     it('should notify a resolved alert if it is not there anymore', () => {
-      alerts = [];
+      alerts = [{ alerts: [] }];
       service.refresh();
       expect(notificationService.show).toHaveBeenCalledTimes(1);
-      expect(notificationService.show).toHaveBeenCalledWith(
+      jasmine.objectContaining(
         new CdNotificationConfig(
           NotificationType.success,
           'alert0 (resolved)',
-          'alert0 is active ' + prometheus.createLink('http://alert0'),
+          'alert0 is resolved ' + prometheus.createLink('http://alert0'),
           undefined,
           'Prometheus'
         )
@@ -181,10 +184,13 @@ describe('PrometheusAlertService', () => {
     });
 
     it('should call multiple times for multiple changes', () => {
+      service['alerts'] = [];
       const alert1 = prometheus.createAlert('alert1');
-      alerts.push(alert1);
+      alerts = [{ alerts: [] }, { alerts: [] }];
+      alerts[0].alerts.push(alert1);
       service.refresh();
-      alerts = [alert1, prometheus.createAlert('alert2')];
+      const alert2 = prometheus.createAlert('alert2');
+      alerts[1].alerts.push(alert2);
       service.refresh();
       expect(notificationService.show).toHaveBeenCalledTimes(2);
     });
@@ -195,13 +201,13 @@ describe('PrometheusAlertService', () => {
       service = TestBed.inject(PrometheusAlertService);
 
       prometheusService = TestBed.inject(PrometheusService);
-      spyOn(prometheusService, 'ifAlertmanagerConfigured').and.callFake((fn) => fn());
-      spyOn(prometheusService, 'getAlerts').and.callFake(() => of(alerts));
+      spyOn(prometheusService, 'isAlertmanagerUsable').and.returnValue(of(true));
+      spyOn(prometheusService, 'getGroupedAlerts').and.callFake(() => of(alerts));
 
       alerts = [
-        prometheus.createAlert('alert0', 'active'),
-        prometheus.createAlert('alert1', 'suppressed'),
-        prometheus.createAlert('alert2', 'suppressed')
+        { alerts: [prometheus.createAlert('alert0', 'active')] },
+        { alerts: [prometheus.createAlert('alert1', 'suppressed')] },
+        { alerts: [prometheus.createAlert('alert2', 'suppressed')] }
       ];
       service.refresh();
     });

@@ -1,36 +1,29 @@
 import { Component, Input, OnDestroy, OnInit, TemplateRef, ViewChild } from '@angular/core';
 import { Router } from '@angular/router';
 
-import { NgbModalRef } from '@ng-bootstrap/ng-bootstrap';
 import _ from 'lodash';
 import { Subscription } from 'rxjs';
 import { mergeMap } from 'rxjs/operators';
 
-import { HostService } from '~/app/shared/api/host.service';
+import { HostService, HostModalRef, HostFactsCapacitySource } from '~/app/shared/api/host.service';
+import { HostActionService } from '~/app/shared/services/host-action.service';
 import { OrchestratorService } from '~/app/shared/api/orchestrator.service';
+import { Host } from '~/app/shared/models/host.interface';
 import { ListWithDetails } from '~/app/shared/classes/list-with-details.class';
-import { ConfirmationModalComponent } from '~/app/shared/components/confirmation-modal/confirmation-modal.component';
-import { CriticalConfirmationModalComponent } from '~/app/shared/components/critical-confirmation-modal/critical-confirmation-modal.component';
-import { FormModalComponent } from '~/app/shared/components/form-modal/form-modal.component';
-import { SelectMessages } from '~/app/shared/components/select/select-messages.model';
-import { ActionLabelsI18n, URLVerbs } from '~/app/shared/constants/app.constants';
+import { ActionLabels, ActionLabelsI18n, URLVerbs } from '~/app/shared/constants/app.constants';
 import { TableComponent } from '~/app/shared/datatable/table/table.component';
 import { CellTemplate } from '~/app/shared/enum/cell-template.enum';
 import { Icons } from '~/app/shared/enum/icons.enum';
-import { NotificationType } from '~/app/shared/enum/notification-type.enum';
 import { CdTableAction } from '~/app/shared/models/cd-table-action';
 import { CdTableColumn } from '~/app/shared/models/cd-table-column';
 import { CdTableFetchDataContext } from '~/app/shared/models/cd-table-fetch-data-context';
 import { CdTableSelection } from '~/app/shared/models/cd-table-selection';
-import { FinishedTask } from '~/app/shared/models/finished-task';
 import { OrchestratorFeature } from '~/app/shared/models/orchestrator.enum';
 import { OrchestratorStatus } from '~/app/shared/models/orchestrator.interface';
 import { Permissions } from '~/app/shared/models/permissions';
 import { EmptyPipe } from '~/app/shared/pipes/empty.pipe';
 import { AuthStorageService } from '~/app/shared/services/auth-storage.service';
 import { CdTableServerSideService } from '~/app/shared/services/cd-table-server-side.service';
-import { NotificationService } from '~/app/shared/services/notification.service';
-import { TaskWrapperService } from '~/app/shared/services/task-wrapper.service';
 import { URLBuilderService } from '~/app/shared/services/url-builder.service';
 import { HostFormComponent } from './host-form/host-form.component';
 import { ModalCdsService } from '~/app/shared/services/modal-cds.service';
@@ -41,7 +34,8 @@ const BASE_URL = 'hosts';
   selector: 'cd-hosts',
   templateUrl: './hosts.component.html',
   styleUrls: ['./hosts.component.scss'],
-  providers: [{ provide: URLBuilderService, useValue: new URLBuilderService(BASE_URL) }]
+  providers: [{ provide: URLBuilderService, useValue: new URLBuilderService(BASE_URL) }],
+  standalone: false
 })
 export class HostsComponent extends ListWithDetails implements OnDestroy, OnInit {
   private sub = new Subscription();
@@ -92,53 +86,59 @@ export class HostsComponent extends ListWithDetails implements OnDestroy, OnInit
   tableActions: CdTableAction[];
   expandClusterActions: CdTableAction[];
   selection = new CdTableSelection();
-  modalRef: NgbModalRef;
+  modalRef?: HostModalRef;
   isExecuting = false;
-  errorMessage: string;
+  errorMessage: string[];
   enableMaintenanceBtn: boolean;
-  enableDrainBtn: boolean;
-  bsModalRef: NgbModalRef;
+  draining: boolean = false;
+  bsModalRef?: HostModalRef;
 
   icons = Icons;
   private tableContext: CdTableFetchDataContext = null;
   count = 5;
+  viewUrl = '/hosts';
 
   messages = {
     nonOrchHost: $localize`The feature is disabled because the selected host is not managed by Orchestrator.`
   };
 
   orchStatus: OrchestratorStatus;
-  actionOrchFeatures = {
-    add: [OrchestratorFeature.HOST_ADD],
-    edit: [OrchestratorFeature.HOST_LABEL_ADD, OrchestratorFeature.HOST_LABEL_REMOVE],
-    remove: [OrchestratorFeature.HOST_REMOVE],
-    maintenance: [
+  actionOrchFeatures: Record<string, OrchestratorFeature[]> = {
+    [ActionLabels.ADD]: [OrchestratorFeature.HOST_ADD],
+    [ActionLabels.EDIT]: [
+      OrchestratorFeature.HOST_LABEL_ADD,
+      OrchestratorFeature.HOST_LABEL_REMOVE
+    ],
+    [ActionLabels.REMOVE]: [OrchestratorFeature.HOST_REMOVE],
+    [ActionLabels.MAINTENANCE]: [
       OrchestratorFeature.HOST_MAINTENANCE_ENTER,
       OrchestratorFeature.HOST_MAINTENANCE_EXIT
     ],
-    drain: [OrchestratorFeature.HOST_DRAIN]
+    [ActionLabels.DRAIN]: [OrchestratorFeature.HOST_DRAIN]
   };
 
   constructor(
     private authStorageService: AuthStorageService,
     private emptyPipe: EmptyPipe,
     private hostService: HostService,
+    private hostActionService: HostActionService,
     private actionLabels: ActionLabelsI18n,
-    private taskWrapper: TaskWrapperService,
     private router: Router,
-    private notificationService: NotificationService,
     private orchService: OrchestratorService,
     private cdsModalService: ModalCdsService
   ) {
     super();
     this.permissions = this.authStorageService.getPermissions();
+  }
+
+  ngOnInit() {
     this.expandClusterActions = [
       {
-        name: this.actionLabels.EXPAND_CLUSTER,
+        name: this.actionLabels.ADD_STORAGE,
         permission: 'create',
         buttonKind: 'secondary',
         icon: Icons.expand,
-        routerLink: '/expand-cluster',
+        routerLink: '/add-storage',
         disable: (selection: CdTableSelection) => this.getDisable('add', selection),
         visible: () => this.showExpandClusterBtn
       }
@@ -154,39 +154,35 @@ export class HostsComponent extends ListWithDetails implements OnDestroy, OnInit
             : (this.bsModalRef = this.cdsModalService.show(HostFormComponent, {
                 hideMaintenance: this.hideMaintenance
               })),
-        disable: (selection: CdTableSelection) => this.getDisable('add', selection)
+        disable: (selection: CdTableSelection) => this.getDisable(ActionLabels.ADD, selection)
       },
       {
         name: this.actionLabels.EDIT,
         permission: 'update',
         icon: Icons.edit,
         click: () => this.editAction(),
-        disable: (selection: CdTableSelection) => this.getDisable('edit', selection)
+        disable: (selection: CdTableSelection) => this.getDisable(ActionLabels.EDIT, selection)
       },
       {
         name: this.actionLabels.START_DRAIN,
         permission: 'update',
         icon: Icons.exit,
         click: () => this.hostDrain(),
-        disable: (selection: CdTableSelection) =>
-          this.getDisable('drain', selection) || !this.enableDrainBtn,
-        visible: () => !this.showGeneralActionsOnly && this.enableDrainBtn
+        visible: () => !this.showGeneralActionsOnly && !this.draining
       },
       {
         name: this.actionLabels.STOP_DRAIN,
         permission: 'update',
         icon: Icons.exit,
         click: () => this.hostDrain(true),
-        disable: (selection: CdTableSelection) =>
-          this.getDisable('drain', selection) || this.enableDrainBtn,
-        visible: () => !this.showGeneralActionsOnly && !this.enableDrainBtn
+        visible: () => !this.showGeneralActionsOnly && this.draining
       },
       {
         name: this.actionLabels.REMOVE,
         permission: 'delete',
         icon: Icons.destroy,
         click: () => this.deleteAction(),
-        disable: (selection: CdTableSelection) => this.getDisable('remove', selection)
+        disable: (selection: CdTableSelection) => this.getDisable(ActionLabels.REMOVE, selection)
       },
       {
         name: this.actionLabels.ENTER_MAINTENANCE,
@@ -194,7 +190,7 @@ export class HostsComponent extends ListWithDetails implements OnDestroy, OnInit
         icon: Icons.enter,
         click: () => this.hostMaintenance(),
         disable: (selection: CdTableSelection) =>
-          this.getDisable('maintenance', selection) ||
+          this.getDisable(ActionLabels.MAINTENANCE, selection) ||
           this.isExecuting ||
           this.enableMaintenanceBtn,
         visible: () => !this.showGeneralActionsOnly && !this.enableMaintenanceBtn
@@ -205,15 +201,12 @@ export class HostsComponent extends ListWithDetails implements OnDestroy, OnInit
         icon: Icons.exit,
         click: () => this.hostMaintenance(),
         disable: (selection: CdTableSelection) =>
-          this.getDisable('maintenance', selection) ||
+          this.getDisable(ActionLabels.MAINTENANCE, selection) ||
           this.isExecuting ||
           !this.enableMaintenanceBtn,
         visible: () => !this.showGeneralActionsOnly && this.enableMaintenanceBtn
       }
     ];
-  }
-
-  ngOnInit() {
     this.columns = [
       {
         name: $localize`Hostname`,
@@ -222,29 +215,23 @@ export class HostsComponent extends ListWithDetails implements OnDestroy, OnInit
         cellTemplate: this.hostNameTpl
       },
       {
-        name: $localize`Service Instances`,
-        prop: 'service_instances',
-        flexGrow: 1.5,
-        cellTemplate: this.servicesTpl
-      },
-      {
         name: $localize`Labels`,
         prop: 'labels',
         flexGrow: 1,
-        cellTransformation: CellTemplate.badge,
+        cellTransformation: CellTemplate.tag,
         customTemplateConfig: {
-          class: 'badge-dark'
+          class: 'tag-dark'
         }
       },
       {
         name: $localize`Status`,
         prop: 'status',
         flexGrow: 0.8,
-        cellTransformation: CellTemplate.badge,
+        cellTransformation: CellTemplate.tag,
         customTemplateConfig: {
           map: {
-            maintenance: { class: 'badge-warning' },
-            available: { class: 'badge-success' }
+            maintenance: { class: 'tag-warning' },
+            available: { class: 'tag-success' }
           }
         }
       },
@@ -310,175 +297,64 @@ export class HostsComponent extends ListWithDetails implements OnDestroy, OnInit
   updateSelection(selection: CdTableSelection) {
     this.selection = selection;
     this.enableMaintenanceBtn = false;
-    this.enableDrainBtn = false;
     if (this.selection.hasSelection) {
       if (this.selection.first().status === 'maintenance') {
         this.enableMaintenanceBtn = true;
       }
 
-      if (!this.selection.first().labels.includes('_no_schedule')) {
-        this.enableDrainBtn = true;
-      }
+      this.selection.first().labels.includes('_no_schedule')
+        ? (this.draining = true)
+        : (this.draining = false);
     }
   }
 
   editAction() {
-    this.hostService.getLabels().subscribe((resp: string[]) => {
-      const host = this.selection.first();
-      const labels = new Set(resp.concat(this.hostService.predefinedLabels));
-      const allLabels = Array.from(labels).map((label) => {
-        return { content: label };
-      });
-      this.cdsModalService.show(FormModalComponent, {
-        titleText: $localize`Edit Host: ${host.hostname}`,
-        fields: [
-          {
-            type: 'select-badges',
-            name: 'labels',
-            value: host['labels'],
-            label: $localize`Labels`,
-            typeConfig: {
-              customBadges: true,
-              options: allLabels,
-              messages: new SelectMessages({
-                empty: $localize`There are no labels.`,
-                filter: $localize`Filter or add labels`,
-                add: $localize`Add label`
-              })
-            }
-          }
-        ],
-        submitButtonText: $localize`Edit Host`,
-        onSubmit: (values: any) => {
-          this.hostService.update(host['hostname'], true, values.labels).subscribe(() => {
-            this.notificationService.show(
-              NotificationType.success,
-              $localize`Updated Host "${host.hostname}"`
-            );
-            // Reload the data table content.
-            this.table.refreshBtn();
-          });
-        }
-      });
+    const host = this.selection.first() as Host;
+    this.hostActionService.openEditModal(host, (labels: string[]) => {
+      const selectedHost = this.selection.first();
+      if (selectedHost && selectedHost['hostname'] === host.hostname) {
+        host.labels = labels;
+        Object.assign(selectedHost, host);
+      }
+      // Reload the data table content.
+      this.table.refreshBtn();
     });
   }
 
   hostMaintenance() {
-    this.isExecuting = true;
-    const host = this.selection.first();
-    if (host['status'] !== 'maintenance') {
-      this.hostService.update(host['hostname'], false, [], true).subscribe(
-        () => {
-          this.isExecuting = false;
-          this.notificationService.show(
-            NotificationType.success,
-            $localize`"${host.hostname}" moved to maintenance`
-          );
-          this.table.refreshBtn();
-        },
-        (error) => {
-          this.isExecuting = false;
-          this.errorMessage = error.error['detail'].split(/\n/);
-          error.preventDefault();
-          if (
-            error.error['detail'].includes('WARNING') &&
-            !error.error['detail'].includes('It is NOT safe to stop') &&
-            !error.error['detail'].includes('ALERT') &&
-            !error.error['detail'].includes('unsafe to stop')
-          ) {
-            const modalVariables = {
-              titleText: $localize`Warning`,
-              buttonText: $localize`Continue`,
-              warning: true,
-              bodyTpl: this.maintenanceConfirmTpl,
-              showSubmit: true,
-              onSubmit: () => {
-                this.hostService.update(host['hostname'], false, [], true, true).subscribe(
-                  () => this.cdsModalService.dismissAll(),
-                  () => this.cdsModalService.dismissAll()
-                );
-              }
-            };
-            this.modalRef = this.cdsModalService.show(ConfirmationModalComponent, modalVariables);
-          } else {
-            this.notificationService.show(
-              NotificationType.error,
-              $localize`"${host.hostname}" cannot be put into maintenance`,
-              $localize`${error.error['detail']}`
-            );
-          }
-        }
-      );
-    } else {
-      this.hostService.update(host['hostname'], false, [], true).subscribe(() => {
-        this.isExecuting = false;
-        this.notificationService.show(
-          NotificationType.success,
-          $localize`"${host.hostname}" has exited maintenance`
-        );
-        this.table.refreshBtn();
-      });
-    }
+    const host = this.selection.first() as Host;
+    this.hostActionService.hostMaintenance(
+      host,
+      this.maintenanceConfirmTpl,
+      (isExecuting: boolean) => (this.isExecuting = isExecuting),
+      (errorMessage: string[]) => (this.errorMessage = errorMessage),
+      () => this.table.refreshBtn(),
+      () => undefined,
+      (modalRef: HostModalRef) => {
+        this.modalRef = modalRef;
+      }
+    );
   }
 
   hostDrain(stop = false) {
-    const host = this.selection.first();
-    if (stop) {
-      const index = host['labels'].indexOf('_no_schedule', 0);
-      host['labels'].splice(index, 1);
-      this.hostService.update(host['hostname'], true, host['labels']).subscribe(() => {
-        this.notificationService.show(
-          NotificationType.info,
-          $localize`"${host['hostname']}" stopped draining`
-        );
-        this.table.refreshBtn();
-      });
-    } else {
-      this.hostService.update(host['hostname'], false, [], false, false, true).subscribe(() => {
-        this.notificationService.show(
-          NotificationType.info,
-          $localize`"${host['hostname']}" started draining`
-        );
-        this.table.refreshBtn();
-      });
-    }
+    const host = this.selection.first() as Host;
+    this.hostActionService.hostDrain(host, stop, () => this.table.refreshBtn());
   }
 
-  getDisable(
-    action: 'add' | 'edit' | 'remove' | 'maintenance' | 'drain',
-    selection: CdTableSelection
-  ): boolean | string {
-    if (
-      action === 'remove' ||
-      action === 'edit' ||
-      action === 'maintenance' ||
-      action === 'drain'
-    ) {
-      if (!selection?.hasSingleSelection) {
-        return true;
-      }
-      if (!_.every(selection.selected, 'sources.orchestrator')) {
-        return this.messages.nonOrchHost;
-      }
-    }
-    return this.orchService.getTableActionDisableDesc(
+  getDisable(action: string, selection: CdTableSelection): boolean | string {
+    return this.hostService.getDisable(
+      action,
+      selection,
       this.orchStatus,
-      this.actionOrchFeatures[action]
+      this.actionOrchFeatures,
+      this.messages.nonOrchHost,
+      [ActionLabels.REMOVE, ActionLabels.EDIT, ActionLabels.MAINTENANCE, ActionLabels.DRAIN]
     );
   }
 
   deleteAction() {
     const hostname = this.selection.first().hostname;
-    this.modalRef = this.cdsModalService.show(CriticalConfirmationModalComponent, {
-      itemDescription: 'Host',
-      itemNames: [hostname],
-      actionDescription: 'remove',
-      submitActionObservable: () =>
-        this.taskWrapper.wrapTaskAroundCall({
-          task: new FinishedTask('host/remove', { hostname: hostname }),
-          call: this.hostService.delete(hostname)
-        })
-    });
+    this.modalRef = this.hostActionService.deleteAction(hostname);
   }
 
   checkHostsFactsAvailable() {
@@ -495,10 +371,12 @@ export class HostsComponent extends ListWithDetails implements OnDestroy, OnInit
   transformHostsData() {
     if (this.checkHostsFactsAvailable()) {
       _.forEach(this.hosts, (hostKey) => {
-        hostKey['memory_total_bytes'] = this.emptyPipe.transform(hostKey['memory_total_kb'] * 1024);
-        hostKey['raw_capacity'] = this.emptyPipe.transform(
-          hostKey['hdd_capacity_bytes'] + hostKey['flash_capacity_bytes']
-        );
+        const hostFacts = hostKey as HostFactsCapacitySource;
+        const totalMemoryBytes = this.hostService.getTotalMemoryBytes(hostFacts);
+        const rawCapacityBytes = this.hostService.getRawCapacityBytes(hostFacts);
+
+        hostKey['memory_total_bytes'] = this.emptyPipe.transform(totalMemoryBytes);
+        hostKey['raw_capacity'] = this.emptyPipe.transform(rawCapacityBytes);
       });
     } else {
       // mark host facts columns unavailable

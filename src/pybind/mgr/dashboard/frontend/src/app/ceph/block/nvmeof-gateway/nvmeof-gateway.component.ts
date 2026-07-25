@@ -1,121 +1,71 @@
-import { Component, TemplateRef, ViewChild } from '@angular/core';
+import { Component, OnDestroy, OnInit, TemplateRef, ViewChild } from '@angular/core';
+import { ActivatedRoute, Router } from '@angular/router';
 
 import _ from 'lodash';
 
 import { ActionLabelsI18n } from '~/app/shared/constants/app.constants';
 import { CdTableSelection } from '~/app/shared/models/cd-table-selection';
+import { BreadcrumbService } from '~/app/shared/services/breadcrumb.service';
 
-import { NvmeofService } from '../../../shared/api/nvmeof.service';
-import { CephServiceSpec } from '~/app/shared/models/service.interface';
-import { CephServiceService } from '~/app/shared/api/ceph-service.service';
-import { Daemon } from '~/app/shared/models/daemon.interface';
+enum TABS {
+  gateways = 'gateways',
+  subsystem = 'subsystem',
+  namespace = 'namespace'
+}
 
-type ComboBoxItem = {
-  content: string;
-  serviceName: string;
-  selected?: boolean;
-};
-
-type Gateway = {
-  id: string;
-  hostname: string;
-  status: number;
-  status_desc: string;
+const TAB_LABELS: Record<TABS, string> = {
+  [TABS.gateways]: $localize`Gateway groups`,
+  [TABS.subsystem]: $localize`Subsystems`,
+  [TABS.namespace]: $localize`Namespaces`
 };
 
 @Component({
   selector: 'cd-nvmeof-gateway',
   templateUrl: './nvmeof-gateway.component.html',
-  styleUrls: ['./nvmeof-gateway.component.scss']
+  styleUrls: ['./nvmeof-gateway.component.scss'],
+  standalone: false
 })
-export class NvmeofGatewayComponent {
+export class NvmeofGatewayComponent implements OnInit, OnDestroy {
+  selectedTab: TABS;
+  activeTab: TABS = TABS.gateways;
+
   @ViewChild('statusTpl', { static: true })
   statusTpl: TemplateRef<any>;
-
-  gateways: Gateway[] = [];
-  gatewayColumns: any;
   selection = new CdTableSelection();
-  gwGroups: ComboBoxItem[] = [];
-  groupService: string = null;
 
   constructor(
-    private nvmeofService: NvmeofService,
-    private cephServiceService: CephServiceService,
-    public actionLabels: ActionLabelsI18n
+    public actionLabels: ActionLabelsI18n,
+    private route: ActivatedRoute,
+    private router: Router,
+    private breadcrumbService: BreadcrumbService
   ) {}
 
   ngOnInit() {
-    this.getGatewayGroups();
-    this.gatewayColumns = [
-      {
-        name: $localize`Gateway ID`,
-        prop: 'id'
-      },
-      {
-        name: $localize`Hostname`,
-        prop: 'hostname'
-      },
-      {
-        name: $localize`Status`,
-        prop: 'status_desc',
-        cellTemplate: this.statusTpl
+    this.route.queryParams.subscribe((params) => {
+      if (params['tab'] && Object.values(TABS).includes(params['tab'])) {
+        this.activeTab = params['tab'] as TABS;
       }
-    ];
-  }
-
-  // for Status column
-  getStatusClass(row: Gateway): string {
-    return _.get(
-      {
-        '-1': 'badge-danger',
-        '0': 'badge-warning',
-        '1': 'badge-success'
-      },
-      row.status,
-      'badge-dark'
-    );
-  }
-
-  // Gateways
-  getGateways() {
-    this.cephServiceService.getDaemons(this.groupService).subscribe((daemons: Daemon[]) => {
-      this.gateways = daemons.length
-        ? daemons.map((daemon: Daemon) => {
-            return {
-              id: `client.${daemon.daemon_name}`,
-              hostname: daemon.hostname,
-              status_desc: daemon.status_desc,
-              status: daemon.status
-            };
-          })
-        : [];
+      this.breadcrumbService.setTabCrumb(TAB_LABELS[this.activeTab]);
     });
   }
 
-  // Gateway groups
-  onGroupSelection(selected: ComboBoxItem) {
-    selected.selected = true;
-    this.groupService = selected.serviceName;
-    this.getGateways();
+  ngOnDestroy() {
+    this.breadcrumbService.clearTabCrumb();
   }
 
-  onGroupClear() {
-    this.groupService = null;
-    this.getGateways();
-  }
-
-  getGatewayGroups() {
-    this.nvmeofService.listGatewayGroups().subscribe((response: CephServiceSpec[][]) => {
-      this.gwGroups = response?.[0]?.length
-        ? response[0].map((group: CephServiceSpec) => {
-            return {
-              content: group?.spec?.group,
-              serviceName: group?.service_name
-            };
-          })
-        : [];
-      // Select first group if no group is selected
-      if (!this.groupService && this.gwGroups.length) this.onGroupSelection(this.gwGroups[0]);
+  onSelected(tab: TABS) {
+    this.selectedTab = tab;
+    this.activeTab = tab;
+    this.breadcrumbService.setTabCrumb(TAB_LABELS[tab]);
+    this.router.navigate([], {
+      relativeTo: this.route,
+      queryParams: { tab },
+      queryParamsHandling: 'merge',
+      replaceUrl: true
     });
+  }
+
+  public get Tabs(): typeof TABS {
+    return TABS;
   }
 }

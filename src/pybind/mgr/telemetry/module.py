@@ -20,7 +20,9 @@ from threading import Event, Lock
 from collections import defaultdict
 from typing import cast, Any, DefaultDict, Dict, List, Optional, Tuple, TypeVar, TYPE_CHECKING, Union
 
-from mgr_module import CLICommand, CLIReadCommand, MgrModule, Option, OptionValue, ServiceInfoT
+from .cli import TelemetryCLICommand
+
+from mgr_module import MgrModule, Option, OptionValue, ServiceInfoT
 
 
 ALL_CHANNELS = ['basic', 'ident', 'crash', 'device', 'perf']
@@ -72,6 +74,7 @@ class Collection(str, enum.Enum):
     perf_memory_metrics = 'perf_memory_metrics'
     basic_pool_options_bluestore = 'basic_pool_options_bluestore'
     basic_pool_flags = 'basic_pool_flags'
+    basic_stretch_cluster = 'basic_stretch_cluster'
 
 MODULE_COLLECTION : List[Dict] = [
     {
@@ -146,6 +149,12 @@ MODULE_COLLECTION : List[Dict] = [
         "channel": "basic",
         "nag": False
     },
+    {
+        "name": Collection.basic_stretch_cluster,
+        "description": "Stretch mode information for stretch clusters",
+        "channel": "basic",
+        "nag": False
+    },
 ]
 
 ROOK_KEYS_BY_COLLECTION : List[Tuple[str, Collection]] = [
@@ -178,6 +187,7 @@ ROOK_KEYS_BY_COLLECTION : List[Tuple[str, Collection]] = [
 ]
 
 class Module(MgrModule):
+    CLICommand = TelemetryCLICommand
     metadata_keys = [
         "arch",
         "ceph_version",
@@ -738,8 +748,7 @@ class Module(MgrModule):
         return self.get('io_rate')
 
     def get_stats_per_pool(self) -> dict:
-        result = self.get('pg_dump')['pool_stats']
-
+        result = self.get('pool_stats', mutable=True)['pool_stats']
         # collect application metadata from osd_map
         osd_map = self.get('osd_map')
         application_metadata = {pool['pool']: pool['application_metadata'] for pool in osd_map['pools']}
@@ -801,27 +810,36 @@ class Module(MgrModule):
         return crashlist
 
     def gather_perf_counters(self, mode: str = 'separated') -> Dict[str, dict]:
-        # Extract perf counter data with get_unlabeled_perf_counters(), a method
-        # from mgr/mgr_module.py. This method returns a nested dictionary that
-        # looks a lot like perf schema, except with some additional fields.
-        #
-        # Example of output, a snapshot of a mon daemon:
-        #   "mon.b": {
-        #       "bluestore.kv_flush_lat": {
-        #           "count": 2431,
-        #           "description": "Average kv_thread flush latency",
-        #           "nick": "fl_l",
-        #           "priority": 8,
-        #           "type": 5,
-        #           "units": 1,
-        #           "value": 88814109
-        #       },
-        #   },
-        perf_counters = self.get_unlabeled_perf_counters()
+        """
+        Extract perf counter data with get_perf_counters(), a method from
+        mgr/mgr_module.py. This method returns a nested dictionary that looks a
+        lot like perf schema, except with some additional fields.
+
+        Example of output, a snapshot of a mon daemon:
+            "mon.b":{
+                "bluestore": [
+                    {
+                        "labels": {},
+                        "counters": {
+                            "kv_flush_lat": {
+                                "description": "bluestore.kv_flush_lat",
+                                "nick": "kfsl",
+                                "type": 5,
+                                "priority": 8,
+                                "units": 1,
+                                "value": 14814406948,
+                                "count": 141
+                            },
+                        }
+                    },
+                ]
+            }
+
+        """
+        perf_counters = self.get_perf_counters()
 
         # Initialize 'result' dict
-        result: Dict[str, dict] = defaultdict(lambda: defaultdict(
-            lambda: defaultdict(lambda: defaultdict(int))))
+        result: Dict[str, dict] = defaultdict(lambda: defaultdict(list))
 
         # 'separated' mode
         anonymized_daemon_dict = {}
@@ -843,11 +861,7 @@ class Module(MgrModule):
                 else:
                     result[daemon_type]['num_combined_daemons'] += 1
 
-            for collection in perf_counters_by_daemon:
-                # Split the collection to avoid redundancy in final report; i.e.:
-                #   bluestore.kv_flush_lat, bluestore.kv_final_lat -->
-                #   bluestore: kv_flush_lat, kv_final_lat
-                col_0, col_1 = collection.split('.')
+            for collection, sub_collection_list in perf_counters_by_daemon.items():
 
                 # Debug log for empty keys. This initially was a problem for prioritycache
                 # perf counters, where the col_0 was empty for certain mon counters:
@@ -857,42 +871,52 @@ class Module(MgrModule):
                 #        "cache_bytes": {...},                          "cache_bytes": {...},
                 #
                 # This log is here to detect any future instances of a similar issue.
-                if (daemon == "") or (col_0 == "") or (col_1 == ""):
+                if (daemon == "") or (collection == ""):
                     self.log.debug("Instance of an empty key: {}{}".format(daemon, collection))
+                    continue
 
-                if mode == 'separated':
-                    # Add value to result
-                    result[daemon][col_0][col_1]['value'] = \
-                            perf_counters_by_daemon[collection]['value']
+                result[daemon][collection] = []
 
-                    # Check that 'count' exists, as not all counters have a count field.
-                    if 'count' in perf_counters_by_daemon[collection]:
-                        result[daemon][col_0][col_1]['count'] = \
-                                perf_counters_by_daemon[collection]['count']
-                elif mode == 'aggregated':
-                    # Not every rgw daemon has the same schema. Specifically, each rgw daemon
-                    # has a uniquely-named collection that starts off identically (i.e.
-                    # "objecter-0x...") then diverges (i.e. "...55f4e778e140.op_rmw").
-                    # This bit of code combines these unique counters all under one rgw instance.
-                    # Without this check, the schema would remain separeted out in the final report.
-                    if col_0[0:11] == "objecter-0x":
-                        col_0 = "objecter-0x"
+                for sub_collection in sub_collection_list:
+                    sub_collection_result: Dict[str, dict] = defaultdict(lambda: defaultdict(dict))
+                    sub_collection_result['labels'] = sub_collection['labels']
+                    for sub_collection_counter_name, sub_collection_counter_info in sub_collection['counters'].items():
+                        if mode == 'separated':
+                            # Add value to result
+                            sub_collection_result['counters'][sub_collection_counter_name]['value'] = \
+                                sub_collection_counter_info['value']
 
-                    # Check that the value can be incremented. In some cases,
-                    # the files are of type 'pair' (real-integer-pair, integer-integer pair).
-                    # In those cases, the value is a dictionary, and not a number.
-                    #   i.e. throttle-msgr_dispatch_throttler-hbserver["wait"]
-                    if isinstance(perf_counters_by_daemon[collection]['value'], numbers.Number):
-                        result[daemon_type][col_0][col_1]['value'] += \
-                                perf_counters_by_daemon[collection]['value']
+                            # Check that 'count' exists, as not all counters have a count field.
+                            if 'count' in sub_collection_counter_info:
+                                sub_collection_result['counters'][sub_collection_counter_name]['count'] = \
+                                        sub_collection_counter_info['count']
+                        elif mode == 'aggregated':
+                            self.log.debug("telemetry in mode: agregated")
+                            # Not every rgw daemon has the same schema. Specifically, each rgw daemon
+                            # has a uniquely-named collection that starts off identically (i.e.
+                            # "objecter-0x...") then diverges (i.e. "...55f4e778e140.op_rmw").
+                            # This bit of code combines these unique counters all under one rgw instance.
+                            # Without this check, the schema would remain separeted out in the final report.
+                            if collection[0:11] == "objecter-0x":
+                                collection = "objecter-0x"
 
-                    # Check that 'count' exists, as not all counters have a count field.
-                    if 'count' in perf_counters_by_daemon[collection]:
-                        result[daemon_type][col_0][col_1]['count'] += \
-                                perf_counters_by_daemon[collection]['count']
-                else:
-                    self.log.error('Incorrect mode specified in gather_perf_counters: {}'.format(mode))
-                    return {}
+                            # Check that the value can be incremented. In some cases,
+                            # the files are of type 'pair' (real-integer-pair, integer-integer pair).
+                            # In those cases, the value is a dictionary, and not a number.
+                            #   i.e. throttle-msgr_dispatch_throttler-hbserver["wait"]
+                            if isinstance(sub_collection_counter_info['value'], numbers.Number):
+                                sub_collection_result['counters'][sub_collection_counter_name]['value'] += \
+                                        sub_collection_counter_info['value']
+
+                            # Check that 'count' exists, as not all counters have a count field.
+                            if 'count' in sub_collection_counter_info:
+                                sub_collection_result['counters'][sub_collection_counter_name]['count'] += \
+                                        sub_collection_counter_info['count']
+                        else:
+                            self.log.error('Incorrect mode specified in gather_perf_counters: {}'.format(mode))
+                            return {}
+
+                    result[daemon][collection].append(sub_collection_result)
 
         if mode == 'separated':
             # for debugging purposes only, this data is never reported
@@ -979,8 +1003,8 @@ class Module(MgrModule):
             res[anon_host][anon_devid] = m
         return res
 
-    def get_latest(self, daemon_type: str, daemon_name: str, stat: str) -> int:
-        data = self.get_counter(daemon_type, daemon_name, stat)[stat]
+    def get_unlabeled_counter_latest(self, daemon_type: str, daemon_name: str, stat: str) -> int:
+        data = self.get_unlabeled_counter(daemon_type, daemon_name, stat)[stat]
         if data:
             return data[-1][1]
         else:
@@ -1141,6 +1165,7 @@ class Module(MgrModule):
                             'eio',
                             'bulk',
                             'crimson',
+                            'ec_optimizations',
                             ]
 
                         pool_data['flags_names'] = [flag for flag in pool['flags_names'].split(',') if flag in flags_to_report]
@@ -1196,22 +1221,22 @@ class Module(MgrModule):
                 rbytes = 0
                 rsnaps = 0
                 for gid, mds in fs['info'].items():
-                    num_sessions += self.get_latest('mds', mds['name'],
+                    num_sessions += self.get_unlabeled_counter_latest('mds', mds['name'],
                                                     'mds_sessions.session_count')
-                    cached_ino += self.get_latest('mds', mds['name'],
+                    cached_ino += self.get_unlabeled_counter_latest('mds', mds['name'],
                                                   'mds_mem.ino')
-                    cached_dn += self.get_latest('mds', mds['name'],
+                    cached_dn += self.get_unlabeled_counter_latest('mds', mds['name'],
                                                  'mds_mem.dn')
-                    cached_cap += self.get_latest('mds', mds['name'],
+                    cached_cap += self.get_unlabeled_counter_latest('mds', mds['name'],
                                                   'mds_mem.cap')
-                    subtrees += self.get_latest('mds', mds['name'],
+                    subtrees += self.get_unlabeled_counter_latest('mds', mds['name'],
                                                 'mds.subtrees')
                     if mds['rank'] == 0:
-                        rfiles = self.get_latest('mds', mds['name'],
+                        rfiles = self.get_unlabeled_counter_latest('mds', mds['name'],
                                                  'mds.root_rfiles')
-                        rbytes = self.get_latest('mds', mds['name'],
+                        rbytes = self.get_unlabeled_counter_latest('mds', mds['name'],
                                                  'mds.root_rbytes')
-                        rsnaps = self.get_latest('mds', mds['name'],
+                        rsnaps = self.get_unlabeled_counter_latest('mds', mds['name'],
                                                  'mds.root_rsnaps')
                 report['fs']['filesystems'].append({  # type: ignore
                     'max_mds': fs['max_mds'],
@@ -1317,6 +1342,17 @@ class Module(MgrModule):
 
             # Rook
             self.get_rook_data(report)
+
+            # Stretch Mode
+            if self.is_enabled_collection(Collection.basic_stretch_cluster):
+                stretch_mode = osd_map.get("stretch_mode", {})
+                report['stretch_cluster'] = {
+                    'stretch_mode_enabled': stretch_mode.get("stretch_mode_enabled", {}),
+                    'stretch_bucket_count': stretch_mode.get("stretch_bucket_count", {}),
+                    'degraded_stretch_mode': stretch_mode.get("degraded_stretch_mode", {}),
+                    'recovering_stretch_mode': stretch_mode.get("recovering_stretch_mode", {}),
+                    'stretch_mode_bucket': stretch_mode.get("stretch_mode_bucket", {}),
+                }
 
         if 'crash' in channels:
             report['crashes'] = self.gather_crashinfo()
@@ -1633,7 +1669,7 @@ class Module(MgrModule):
 
         return 0, msg, ''
 
-    @CLIReadCommand('telemetry status')
+    @TelemetryCLICommand.Read('telemetry status')
     def status(self) -> Tuple[int, str, str]:
         '''
         Show current configuration
@@ -1645,7 +1681,7 @@ class Module(MgrModule):
                             if self.last_upload else self.last_upload)
         return 0, json.dumps(r, indent=4, sort_keys=True), ''
 
-    @CLIReadCommand('telemetry diff')
+    @TelemetryCLICommand.Read('telemetry diff')
     def diff(self) -> Tuple[int, str, str]:
         '''
         Show the diff between opted-in collection and available collection
@@ -1665,7 +1701,7 @@ class Module(MgrModule):
 
         return 0, r, ''
 
-    @CLICommand('telemetry on')
+    @TelemetryCLICommand('telemetry on')
     def on(self, license: Optional[str] = None) -> Tuple[int, str, str]:
         '''
         Enable telemetry reports from this cluster
@@ -1700,7 +1736,7 @@ To enable, add '--license {LICENSE}' to the 'ceph telemetry on' command.'''
 
             return 0, msg, ''
 
-    @CLICommand('telemetry off')
+    @TelemetryCLICommand('telemetry off')
     def off(self) -> Tuple[int, str, str]:
         '''
         Disable telemetry reports from this cluster
@@ -1727,35 +1763,35 @@ To enable, add '--license {LICENSE}' to the 'ceph telemetry on' command.'''
         msg = 'Telemetry is now disabled.'
         return 0, msg, ''
 
-    @CLIReadCommand('telemetry enable channel all')
+    @TelemetryCLICommand.Read('telemetry enable channel all')
     def enable_channel_all(self, channels: List[str] = ALL_CHANNELS) -> Tuple[int, str, str]:
         '''
         Enable all channels
         '''
         return self.toggle_channel('enable', channels)
 
-    @CLIReadCommand('telemetry enable channel')
+    @TelemetryCLICommand.Read('telemetry enable channel')
     def enable_channel(self, channels: Optional[List[str]] = None) -> Tuple[int, str, str]:
         '''
         Enable a list of channels
         '''
         return self.toggle_channel('enable', channels)
 
-    @CLIReadCommand('telemetry disable channel all')
+    @TelemetryCLICommand.Read('telemetry disable channel all')
     def disable_channel_all(self, channels: List[str] = ALL_CHANNELS) -> Tuple[int, str, str]:
         '''
         Disable all channels
         '''
         return self.toggle_channel('disable', channels)
 
-    @CLIReadCommand('telemetry disable channel')
+    @TelemetryCLICommand.Read('telemetry disable channel')
     def disable_channel(self, channels: Optional[List[str]] = None) -> Tuple[int, str, str]:
         '''
         Disable a list of channels
         '''
         return self.toggle_channel('disable', channels)
 
-    @CLIReadCommand('telemetry channel ls')
+    @TelemetryCLICommand.Read('telemetry channel ls')
     def channel_ls(self) -> Tuple[int, str, str]:
         '''
         List all channels
@@ -1788,7 +1824,7 @@ To enable, add '--license {LICENSE}' to the 'ceph telemetry on' command.'''
 
         return 0, table.get_string(sortby="NAME"), ''
 
-    @CLIReadCommand('telemetry collection ls')
+    @TelemetryCLICommand.Read('telemetry collection ls')
     def collection_ls(self) -> Tuple[int, str, str]:
         '''
         List all collections
@@ -1845,7 +1881,7 @@ To enable, add '--license {LICENSE}' to the 'ceph telemetry on' command.'''
 
         return 0, f'{msg}{table.get_string(sortby="NAME")}', ''
 
-    @CLICommand('telemetry send')
+    @TelemetryCLICommand('telemetry send')
     def do_send(self,
                 endpoint: Optional[List[EndPoint]] = None,
                 license: Optional[str] = None) -> Tuple[int, str, str]:
@@ -1862,7 +1898,7 @@ Please consider enabling the telemetry module with 'ceph telemetry on'.'''
             self.last_report = self.compile_report()
             return self.send(self.last_report, endpoint)
 
-    @CLIReadCommand('telemetry show')
+    @TelemetryCLICommand.Read('telemetry show')
     def show(self, channels: Optional[List[str]] = None) -> Tuple[int, str, str]:
         '''
         Show a sample report of opted-in collections (except for 'device')
@@ -1882,7 +1918,7 @@ Please consider enabling the telemetry module with 'ceph telemetry on'.'''
 
         return 0, report, ''
 
-    @CLIReadCommand('telemetry preview')
+    @TelemetryCLICommand.Read('telemetry preview')
     def preview(self, channels: Optional[List[str]] = None) -> Tuple[int, str, str]:
         '''
         Preview a sample report of the most recent collections available (except for 'device')
@@ -1919,7 +1955,7 @@ Please consider enabling the telemetry module with 'ceph telemetry on'.'''
 
         return 0, report, ''
 
-    @CLIReadCommand('telemetry show-device')
+    @TelemetryCLICommand.Read('telemetry show-device')
     def show_device(self) -> Tuple[int, str, str]:
         '''
         Show a sample device report
@@ -1938,7 +1974,7 @@ Please consider enabling the telemetry module with 'ceph telemetry on'.'''
 
         return 0, json.dumps(self.get_report_locked('device'), indent=4, sort_keys=True), ''
 
-    @CLIReadCommand('telemetry preview-device')
+    @TelemetryCLICommand.Read('telemetry preview-device')
     def preview_device(self) -> Tuple[int, str, str]:
         '''
         Preview a sample device report of the most recent device collection
@@ -1968,7 +2004,7 @@ Please consider enabling the telemetry module with 'ceph telemetry on'.'''
         report = json.dumps(report, indent=4, sort_keys=True)
         return 0, report, ''
 
-    @CLIReadCommand('telemetry show-all')
+    @TelemetryCLICommand.Read('telemetry show-all')
     def show_all(self) -> Tuple[int, str, str]:
         '''
         Show a sample report of all enabled channels (including 'device' channel)
@@ -1989,7 +2025,7 @@ Please consider enabling the telemetry module with 'ceph telemetry on'.'''
         self.format_perf_histogram(report)
         return 0, json.dumps(report, indent=4, sort_keys=True), ''
 
-    @CLIReadCommand('telemetry preview-all')
+    @TelemetryCLICommand.Read('telemetry preview-all')
     def preview_all(self) -> Tuple[int, str, str]:
         '''
         Preview a sample report of the most recent collections available of all channels (including 'device')

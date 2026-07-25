@@ -1,5 +1,5 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab ft=cpp
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab ft=cpp
 
 /*
  * Ceph - scalable distributed file system
@@ -97,7 +97,7 @@ Aio::OpFunc aio_abstract(librados::IoCtx ctx, Op&& op,
       // executor so it can safely call back into Aio without locking
       auto ex = yield.get_executor();
 
-      librados::async_operate(yield, ctx, r.obj.oid, &op, 0, trace_ctx,
+      librados::async_operate(ex, ctx, r.obj.oid, std::move(op), 0, trace_ctx,
                               bind_executor(ex, Handler{aio, ctx, r}));
     };
 }

@@ -1,0 +1,28 @@
+@use '@carbon/styles/scss/spacing';
+
+:host {
+  flex-shrink: 0;
+}
+
+.notification-header {
+  flex-shrink: 0;
+  padding: spacing.$spacing-03 spacing.$spacing-05;
+  background-color: var(--cds-layer-01);
+  border-block-end: 1px solid var(--cds-border-subtle-01);
+
+  &__title {
+    margin-top: 0.4rem;
+  }
+
+  &__dismiss-btn {
+    color: var(--cds-text-primary);
+    padding-top: 0;
+    padding-left: spacing.$spacing-06;
+  }
+
+  &__heading-and-button {
+    display: flex;
+    flex-direction: row;
+    justify-content: space-between;
+  }
+}

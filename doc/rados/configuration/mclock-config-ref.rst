@@ -96,7 +96,7 @@ balanced (*default*)
 The *balanced* profile is the default mClock profile. This profile allocates
 equal reservation/priority to client operations and background recovery
 operations. Background best-effort ops are given lower reservation and therefore
-take a longer time to complete when are are competing operations. This profile
+take a longer time to complete when there are competing operations. This profile
 helps meet the normal/steady-state requirements of the cluster. This is the
 case when external client performance requirement is not critical and there are
 other background operations that still need attention within the OSD.
@@ -112,7 +112,7 @@ built-in profiles may be enabled by following the steps mentioned in next sectio
 +------------------------+-------------+--------+-------+
 | background recovery    | 50%         | 1      | MAX   |
 +------------------------+-------------+--------+-------+
-| background best-effort | MIN         | 1      | 90%   |
+| background best-effort |  5%         | 2      | 90%   |
 +------------------------+-------------+--------+-------+
 
 high_client_ops
@@ -120,7 +120,7 @@ high_client_ops
 This profile optimizes client performance over background activities by
 allocating more reservation and limit to client operations as compared to
 background operations in the OSD. This profile, for example, may be enabled
-to provide the needed performance for I/O intensive applications for a
+to provide the needed performance for I/O-intensive applications for a
 sustained period of time at the cost of slower recoveries. The table shows
 the resource control parameters set by the profile:
 
@@ -131,14 +131,14 @@ the resource control parameters set by the profile:
 +------------------------+-------------+--------+-------+
 | background recovery    | 40%         | 1      | MAX   |
 +------------------------+-------------+--------+-------+
-| background best-effort | MIN         | 1      | 70%   |
+| background best-effort |  5%         | 4      | 70%   |
 +------------------------+-------------+--------+-------+
 
 high_recovery_ops
 ^^^^^^^^^^^^^^^^^
 This profile optimizes background recovery performance as compared to external
 clients and other background operations within the OSD. This profile, for
-example, may be enabled by an administrator temporarily to speed-up background
+example, may be enabled by an administrator temporarily to speed up background
 recoveries during non-peak hours. The table shows the resource control
 parameters set by the profile:
 
@@ -149,7 +149,7 @@ parameters set by the profile:
 +------------------------+-------------+--------+-------+
 | background recovery    | 70%         | 2      | MAX   |
 +------------------------+-------------+--------+-------+
-| background best-effort | MIN         | 1      | MAX   |
+| background best-effort |  5%         | 2      | MAX   |
 +------------------------+-------------+--------+-------+
 
 .. note:: Across the built-in profiles, internal background best-effort clients
@@ -228,7 +228,7 @@ in order to ensure mClock scheduler is able to provide predictable QoS.
 mClock Config Options
 ---------------------
 .. important:: These defaults cannot be changed using any of the config
-   subsytem commands like *config set* or via the *config daemon* or *config
+   subsystem commands like *config set* or via the *config daemon* or *config
    tell* interfaces. Although the above command(s) report success, the mclock
    QoS parameters are reverted to their respective built-in profile defaults.
 
@@ -292,6 +292,10 @@ sleep options are disabled (set to 0),
 - :confval:`osd_recovery_sleep_hdd`
 - :confval:`osd_recovery_sleep_ssd`
 - :confval:`osd_recovery_sleep_hybrid`
+- :confval:`osd_recovery_sleep_degraded`
+- :confval:`osd_recovery_sleep_degraded_hdd`
+- :confval:`osd_recovery_sleep_degraded_ssd`
+- :confval:`osd_recovery_sleep_degraded_hybrid`
 - :confval:`osd_scrub_sleep`
 - :confval:`osd_delete_sleep`
 - :confval:`osd_delete_sleep_hdd`
@@ -608,9 +612,9 @@ Run custom drive benchmark if defaults are not accurate (manual)
 If the default OSD capacity is not accurate, the recommendation is to run a
 custom benchmark using your preferred tool (e.g. Fio) on the drive and then
 override the ``osd_mclock_max_capacity_iops_[hdd, ssd]`` option as described
-in the `Specifying  Max OSD Capacity`_ section.
+in the `Set or Override Max IOPS Capacity of an OSD`_ section.
 
-This step is highly recommended until an alternate mechansim is worked upon.
+This step is highly recommended until an alternate mechanism is worked upon.
 
 Steps to Manually Benchmark an OSD (Optional)
 =============================================
@@ -621,7 +625,7 @@ Steps to Manually Benchmark an OSD (Optional)
 
 .. tip:: If you have already determined the benchmark data and wish to manually
          override the max osd capacity for an OSD, you may skip to section
-         `Specifying  Max OSD Capacity`_.
+         `Set or Override Max IOPS Capacity of an OSD`_.
 
 
 Any existing benchmarking tool (e.g. Fio) can be used for this purpose. In this
@@ -709,29 +713,99 @@ overall throughput was roughly equal to the baseline throughput. Note that in
 general for HDDs, the bluestore throttle values are expected to be higher when
 compared to SSDs.
 
+.. _override_max_iops_capacity:
 
-Specifying  Max OSD Capacity
-----------------------------
+Set or Override Max IOPS Capacity of an OSD
+-------------------------------------------
 
-The steps in this section may be performed only if you want to override the
-max osd capacity automatically set during OSD initialization. The option
-``osd_mclock_max_capacity_iops_[hdd, ssd]`` for an OSD can be set by running the
-following command:
+The steps in this section may be performed to set or override the max IOPS
+capacity of an OSD. The ``osd_mclock_max_capacity_iops_[hdd, ssd]`` option for
+an OSD can be overridden by running a command of the following form:
 
-  .. prompt:: bash #
+.. prompt:: bash #
 
-     ceph config set osd.N osd_mclock_max_capacity_iops_[hdd,ssd] <value>
+  ceph config set osd.N osd_mclock_max_capacity_iops_[hdd,ssd] <value>
 
 For example, the following command sets the max capacity for a specific OSD
 (say "osd.0") whose underlying device type is HDD to 350 IOPS:
 
-  .. prompt:: bash #
+.. prompt:: bash #
 
-    ceph config set osd.0 osd_mclock_max_capacity_iops_hdd 350
+  ceph config set osd.0 osd_mclock_max_capacity_iops_hdd 350
 
 Alternatively, you may specify the max capacity for OSDs within the Ceph
 configuration file under the respective [osd.N] section. See
 :ref:`ceph-conf-settings` for more details.
+
+Global Override of Max IOPS Capacity for multiple OSDs
+------------------------------------------------------
+
+The max IOPS capacity of multiple OSDs may be overridden by a global config
+specification. This section shows the steps to globally override the
+individually scoped values in the mon store.
+
+    .. note:: The examples use :confval:`osd_mclock_max_capacity_iops_hdd` and
+              the steps are also applicable for SSD based OSDs in which case
+              the option to use is :confval:`osd_mclock_max_capacity_iops_ssd`.
+
+Below are steps to override the IOPS capacities of individual OSDs. Note that
+the individual value is taken by the OSD after it runs the usual startup
+benchmark.
+
+#. Run the following command to verify the individual values set for the OSDs in
+   the central config database:
+
+    .. prompt:: bash #
+
+      ceph config dump | grep osd_mclock_max_capacity_iops
+
+    ::
+
+      WHO     MASK  LEVEL  OPTION                            VALUE       RO
+      osd.0         basic  osd_mclock_max_capacity_iops_hdd  379.197568    
+      osd.1         basic  osd_mclock_max_capacity_iops_hdd  400.903575    
+      osd.2         basic  osd_mclock_max_capacity_iops_hdd  398.303428    
+      osd.3         basic  osd_mclock_max_capacity_iops_hdd  419.035854    
+
+#. If there are no individual values reported, skip to the next step. Otherwise,
+   remove all the individual values reported in the previous step with a command
+   of the following form (where 'x' is the OSD id):
+
+    .. prompt:: bash #
+
+      ceph config rm osd.x osd_mclock_max_capacity_iops_hdd
+
+#. Confirm that the `ceph config dump` command from step 1 does not show any
+   individual values.
+
+#. Set the global value of `osd_mclock_max_capacity_iops_hdd` with a command of
+   the following form:
+
+    .. prompt:: bash #
+
+      ceph config set global osd_mclock_max_capacity_iops_hdd 111
+
+#. Confirm that the global option is set by running:
+
+    .. prompt:: bash #
+
+      ceph config dump | grep osd_mclock_max_capacity_iops
+
+    ::
+
+      global        basic  osd_mclock_max_capacity_iops_hdd  111.000000    
+
+
+#. Confirm that the global setting is now in effect for any OSD that no longer
+   has a specific per-OSD central config setting:
+
+    .. prompt:: bash #
+
+      ceph config show osd.0 | grep osd_mclock_max_capacity_iops_hdd
+
+    ::
+
+      osd_mclock_max_capacity_iops_hdd                 111.000000                               mon
 
 
 .. index:: mclock; config settings

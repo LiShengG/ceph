@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph - scalable distributed file system
  *
@@ -19,7 +20,7 @@
 
 #ifdef CEPH_DEBUG_MUTEX
 
-extern bool g_lockdep;
+__attribute__((visibility("default"))) extern bool g_lockdep;
 
 extern void lockdep_register_ceph_context(CephContext *cct);
 extern void lockdep_unregister_ceph_context(CephContext *cct);

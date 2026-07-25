@@ -26,7 +26,7 @@ import os
 import json
 import pickle
 import logging
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, no_type_check
 
 import numpy as np
 
@@ -119,6 +119,7 @@ class RHDiskFailurePredictor(Predictor):
 
         self.model_dirpath = model_dirpath
 
+    @no_type_check
     def __preprocess(self, disk_days: Sequence[DevSmartT], manufacturer: str) -> Optional[np.ndarray]:
         """Scales and transforms input dataframe to feed it to prediction model
 
@@ -168,7 +169,7 @@ class RHDiskFailurePredictor(Predictor):
         roll_window_size = 6
 
         # rolling means generator
-        dataset_size = disk_days_attrs.shape[0] - roll_window_size + 1
+        dataset_size = disk_days_attrs.shape[0] - roll_window_size + 1  # type: ignore
         gen = (disk_days_attrs[i: i + roll_window_size, ...].mean(axis=0)
                for i in range(dataset_size))
         means = np.vstack(gen)  # type: ignore

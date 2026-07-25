@@ -12,7 +12,7 @@ import _ from 'lodash';
 import { forkJoin, Observable, of } from 'rxjs';
 import { catchError, debounceTime, distinctUntilChanged, map, mergeMap } from 'rxjs/operators';
 
-import { SUPPORTED_FSAL } from '~/app/ceph/nfs/models/nfs.fsal';
+import { RGW_USER_EXPORT_PATH, SUPPORTED_FSAL } from '~/app/ceph/nfs/models/nfs.fsal';
 import { Directory, NfsService } from '~/app/shared/api/nfs.service';
 import { RgwBucketService } from '~/app/shared/api/rgw-bucket.service';
 import { RgwSiteService } from '~/app/shared/api/rgw-site.service';
@@ -38,7 +38,8 @@ import { DEFAULT_SUBVOLUME_GROUP } from '~/app/shared/constants/cephfs.constant'
 @Component({
   selector: 'cd-nfs-form',
   templateUrl: './nfs-form.component.html',
-  styleUrls: ['./nfs-form.component.scss']
+  styleUrls: ['./nfs-form.component.scss'],
+  standalone: false
 })
 export class NfsFormComponent extends CdForm implements OnInit {
   @ViewChild('nfsClients', { static: true })
@@ -111,7 +112,7 @@ export class NfsFormComponent extends CdForm implements OnInit {
   ) {
     super();
     this.permission = this.authStorageService.getPermissions().pool;
-    this.resource = $localize`NFS export`;
+    this.resource = $localize`NFS share`;
     this.storageBackend = getFsalFromRoute(this.router.url);
   }
 
@@ -150,8 +151,8 @@ export class NfsFormComponent extends CdForm implements OnInit {
         }
       );
       this.nfsForm.get('cluster_id').disable();
+      this.nfsForm.get('fsal').disable();
       this.nfsForm.get('path').disable();
-      this.nfsForm.get('fsal.user_id').disable();
     } else {
       this.action = this.actionLabels.CREATE;
       this.route.params.subscribe(
@@ -188,6 +189,7 @@ export class NfsFormComponent extends CdForm implements OnInit {
   async getSubVol() {
     const fs_name = this.nfsForm.getValue('fsal').fs_name;
     const subvolgrp = this.nfsForm.getValue('subvolume_group');
+
     await this.setSubVolGrpPath();
 
     (subvolgrp === this.defaultSubVolGroup
@@ -264,7 +266,7 @@ export class NfsFormComponent extends CdForm implements OnInit {
     const subVolumeControl = this.nfsForm.get('subvolume');
 
     // SubVolume is required if SubVolume Group is "_nogroup".
-    if (subvolumeGroup == this.defaultSubVolGroup) {
+    if (subvolumeGroup === DEFAULT_SUBVOLUME_GROUP) {
       subVolumeControl?.setValidators([Validators.required]);
     } else {
       subVolumeControl?.clearValidators();
@@ -401,6 +403,31 @@ export class NfsFormComponent extends CdForm implements OnInit {
     this.nfsForm.patchValue(res);
     this.setPathValidation();
     this.clients = res.clients;
+
+    if (this.isEdit) {
+      if (res?.fsal?.name === SUPPORTED_FSAL.CEPH && res?.path) {
+        this.getSubVolGrp(res.fsal.fs_name);
+        this.resolveCephfsPath(res.path, res.fsal.fs_name);
+      }
+    }
+  }
+
+  // Setting up Subvolumegroup and Subvolume for CephFS paths on Edit.
+  resolveCephfsPath(path: string, fsName: string) {
+    if (!path?.startsWith('/volumes/')) return;
+
+    const splitPath = path.split('/');
+    const subvolumeGroup = splitPath[2] ?? null;
+    const subvolume = splitPath[3] ?? null;
+
+    this.nfsForm.patchValue({
+      fsal: {
+        ...this.nfsForm.get('fsal').value,
+        fs_name: fsName
+      },
+      subvolumeGroup,
+      subvolume
+    });
   }
 
   resolveClusters(clusters: string[]) {
@@ -471,8 +498,9 @@ export class NfsFormComponent extends CdForm implements OnInit {
         )
         .subscribe({
           error: (error) => {
-            const fsalDescr = this.nfsService.nfsFsal.find((f) => f.value === this.storageBackend)
-              .descr;
+            const fsalDescr = this.nfsService.nfsFsal.find(
+              (f) => f.value === this.storageBackend
+            ).descr;
             this.storageBackendError = $localize`${fsalDescr} backend is not available. ${error}`;
           }
         });
@@ -491,7 +519,7 @@ export class NfsFormComponent extends CdForm implements OnInit {
   setBucket() {
     this.nfsForm.get('path').enable();
     this.nfsForm.get('fsal.user_id').setValue('');
-    this.nfsForm.get('fsal.user_id').disable();
+    this.nfsForm.get('fsal').disable();
 
     this.setPathValidation();
   }
@@ -616,13 +644,12 @@ export class NfsFormComponent extends CdForm implements OnInit {
   }
 
   private buildRequest() {
-    const requestModel: any = _.cloneDeep(this.nfsForm.value);
-
+    const requestModel: any = _.cloneDeep(this.nfsForm.getRawValue());
     if (this.isEdit) {
       requestModel.export_id = _.parseInt(this.export_id);
+      requestModel.path = this.nfsForm.get('path').value;
       if (requestModel.fsal.name === SUPPORTED_FSAL.RGW) {
         requestModel.fsal.user_id = this.nfsForm.getValue('fsal').user_id;
-        requestModel.path = this.nfsForm.getValue('path');
       }
     }
 
@@ -631,7 +658,7 @@ export class NfsFormComponent extends CdForm implements OnInit {
       if (requestModel.rgw_export_type === 'bucket') {
         delete requestModel.fsal.user_id;
       } else {
-        requestModel.path = '';
+        requestModel.path = RGW_USER_EXPORT_PATH;
       }
     } else {
       delete requestModel.fsal.user_id;

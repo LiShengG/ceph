@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph - scalable distributed file system
  *
@@ -15,6 +16,9 @@
 #ifndef OPREQUEST_H_
 #define OPREQUEST_H_
 
+#include "msg/Message.h"
+#include "msg/MessageRef.h"
+#include "msg/msg_types.h"
 #include "common/TrackedOp.h"
 #include "common/tracer.h"
 /**
@@ -49,7 +53,6 @@ protected:
 
 public:
   ~MgrOpRequest() override {
-    request->put();
   }
 
   template<class T>

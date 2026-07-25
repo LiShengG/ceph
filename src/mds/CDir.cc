@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*- 
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*- 
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph - scalable distributed file system
  *
@@ -30,8 +31,11 @@
 #include "LogSegment.h"
 #include "MDBalancer.h"
 #include "SnapClient.h"
+#include "SnapRealm.h"
+#include "events/EMetaBlob.h"
 
 #include "common/bloom_filter.hpp"
+#include "common/debug.h"
 #include "common/likely.h"
 #include "include/Context.h"
 #include "common/Clock.h"
@@ -41,6 +45,8 @@
 #include "common/config.h"
 #include "include/ceph_assert.h"
 #include "include/compat.h"
+
+#include "messages/MClientReply.h" // for struct DirStat
 
 #define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_mds
@@ -86,7 +92,7 @@ public:
 
 ostream& operator<<(ostream& out, const CDir& dir)
 {
-  out << "[dir " << dir.dirfrag() << " " << dir.get_path() << "/"
+  out << "[dir " << dir.dirfrag() << " " << dir.get_trimmed_path() << "/"
       << " [" << dir.first << ",head]";
   if (dir.is_auth()) {
     out << " auth";
@@ -218,6 +224,8 @@ CDir::CDir(CInode *in, frag_t fg, MDCache *mdc, bool auth) :
   if (auth)
     state_set(STATE_AUTH);
 }
+
+CDir::~CDir() noexcept = default;
 
 /**
  * Check the recursive statistics on size for consistency.
@@ -762,6 +770,10 @@ bool CDir::is_in_bloom(std::string_view name)
   if (!bloom)
     return false;
   return bloom->contains(name.data(), name.size());
+}
+
+void CDir::remove_bloom() {
+  bloom.reset();
 }
 
 void CDir::remove_null_dentries() {
@@ -1407,7 +1419,7 @@ CDir::fnode_ptr CDir::project_fnode(const MutationRef& mut)
   return pf;
 }
 
-void CDir::pop_and_dirty_projected_fnode(LogSegment *ls, const MutationRef& mut)
+void CDir::pop_and_dirty_projected_fnode(LogSegmentRef const& ls, const MutationRef& mut)
 {
   ceph_assert(!projected_fnode.empty());
   auto pf = std::move(projected_fnode.front());
@@ -1430,7 +1442,7 @@ version_t CDir::pre_dirty(version_t min)
   return projected_version;
 }
 
-void CDir::mark_dirty(LogSegment *ls, version_t pv)
+void CDir::mark_dirty(LogSegmentRef const& ls, version_t pv)
 {
   ceph_assert(is_auth());
 
@@ -1444,7 +1456,7 @@ void CDir::mark_dirty(LogSegment *ls, version_t pv)
   _mark_dirty(ls);
 }
 
-void CDir::_mark_dirty(LogSegment *ls)
+void CDir::_mark_dirty(LogSegmentRef const& ls)
 {
   if (!state_test(STATE_DIRTY)) {
     dout(10) << __func__ << " (was clean) " << *this << " version " << get_version() << dendl;
@@ -1462,7 +1474,7 @@ void CDir::_mark_dirty(LogSegment *ls)
   }
 }
 
-void CDir::mark_new(LogSegment *ls)
+void CDir::mark_new(LogSegmentRef const& ls)
 {
   ls->new_dirfrags.push_back(&item_new);
   state_clear(STATE_CREATING);
@@ -1716,7 +1728,7 @@ public:
     ret1(0), ret2(0), ret3(0) { }
   void finish(int r) override {
     // check the correctness of backtrace
-    if (r >= 0 && ret3 != -CEPHFS_ECANCELED)
+    if (r >= 0 && ret3 != -ECANCELED)
       dir->inode->verify_diri_backtrace(btbl, ret3);
     if (r >= 0) r = ret1;
     if (r >= 0) r = ret2;
@@ -1760,7 +1772,7 @@ void CDir::_omap_fetch(std::set<string> *keys, MDSContext *c)
     rd.getxattr("parent", &fin->btbl, &fin->ret3);
     rd.set_last_op_flags(CEPH_OSD_OP_FLAG_FAILOK);
   } else {
-    fin->ret3 = -CEPHFS_ECANCELED;
+    fin->ret3 = -ECANCELED;
   }
 
   mdcache->mds->objecter->read(oid, oloc, rd, CEPH_NOSNAP, NULL, 0,
@@ -1873,8 +1885,7 @@ CDentry *CDir::_load_dentry(
         dout(12) << "_fetched  got remote link " << ino << " (don't have it)" << dendl;
       }
     }
-  }
-  else if (type == 'I' || type == 'i') {
+  } else if (type == 'I' || type == 'i') {
     InodeStore inode_data;
     mempool::mds_co::string alternate_name;
     // inode
@@ -2007,7 +2018,7 @@ void CDir::_omap_fetched(bufferlist& hdrbl, map<string, bufferlist>& omap,
   dout(10) << "_fetched header " << hdrbl.length() << " bytes "
 	   << omap.size() << " keys for " << *this << dendl;
 
-  ceph_assert(r == 0 || r == -CEPHFS_ENOENT || r == -CEPHFS_ENODATA);
+  ceph_assert(r == 0 || r == -ENOENT || r == -ENODATA);
   ceph_assert(is_auth());
   ceph_assert(!is_frozen());
 
@@ -2015,7 +2026,7 @@ void CDir::_omap_fetched(bufferlist& hdrbl, map<string, bufferlist>& omap,
     dout(0) << "_fetched missing object for " << *this << dendl;
 
     clog->error() << "dir " << dirfrag() << " object missing on disk; some "
-                     "files may be lost (" << get_path() << ")";
+                     "files may be lost (" << get_trimmed_path() << ")";
 
     go_bad(complete);
     return;
@@ -2030,14 +2041,14 @@ void CDir::_omap_fetched(bufferlist& hdrbl, map<string, bufferlist>& omap,
       derr << "Corrupt fnode in dirfrag " << dirfrag()
 	   << ": " << err.what() << dendl;
       clog->warn() << "Corrupt fnode header in " << dirfrag() << ": "
-		   << err.what() << " (" << get_path() << ")";
+		   << err.what() << " (" << get_trimmed_path() << ")";
       go_bad(complete);
       return;
     }
     if (!p.end()) {
       clog->warn() << "header buffer of dir " << dirfrag() << " has "
 		  << hdrbl.length() - p.get_off() << " extra bytes ("
-                  << get_path() << ")";
+                  << get_trimmed_path() << ")";
       go_bad(complete);
       return;
     }
@@ -2155,10 +2166,10 @@ void CDir::_omap_fetched(bufferlist& hdrbl, map<string, bufferlist>& omap,
     } catch (const buffer::error &err) {
       mdcache->mds->clog->warn() << "Corrupt dentry '" << key.name << "' in "
                                   "dir frag " << dirfrag() << ": "
-                               << err.what() << "(" << get_path() << ")";
+                               << err.what() << "(" << get_trimmed_path() << ")";
 
       // Remember that this dentry is damaged.  Subsequent operations
-      // that try to act directly on it will get their CEPHFS_EIOs, but this
+      // that try to act directly on it will get their EIOs, but this
       // dirfrag as a whole will continue to look okay (minus the
       // mysteriously-missing dentry)
       go_bad_dentry(key.snapid, key.name);
@@ -2282,7 +2293,7 @@ void CDir::go_bad(bool complete)
 
   state_clear(STATE_FETCHING);
   auth_unpin(this);
-  finish_waiting(WAIT_COMPLETE, -CEPHFS_EIO);
+  finish_waiting(WAIT_COMPLETE, -EIO);
 }
 
 // -----------------------
@@ -2517,8 +2528,14 @@ void CDir::_omap_commit_ops(int r, int op_prio, int64_t metapool, version_t vers
     }
 
     unsigned size = item.key.length() + bl.length() + 2 * sizeof(__u32);
-    if (write_size > 0 && write_size + size > max_write_size)
-      commit_one();
+    if (write_size > 0 && write_size + size > max_write_size) {
+      if (!_set.empty() || !_rm.empty()) {
+        commit_one();
+      } else {
+        dout(1) << "skipping empty commit, inode size exceeded max_dir_commit_size ("
+                << size << " vs. " << max_write_size << ")" << dendl;
+      }
+    }
 
     write_size += size;
     _set[std::move(item.key)] = std::move(bl);
@@ -2742,7 +2759,7 @@ void CDir::_committed(int r, version_t v)
 {
   if (r < 0) {
     // the directory could be partly purged during MDS failover
-    if (r == -CEPHFS_ENOENT && committed_version == 0 &&
+    if (r == -ENOENT && committed_version == 0 &&
 	!inode->is_base() && get_parent_dir()->inode->is_stray()) {
       r = 0;
       if (inode->snaprealm)
@@ -2911,7 +2928,7 @@ void CDir::finish_export()
   dirty_old_rstat.clear();
 }
 
-void CDir::decode_import(bufferlist::const_iterator& blp, LogSegment *ls)
+void CDir::decode_import(bufferlist::const_iterator& blp, LogSegmentRef const& ls)
 {
   DECODE_START(1, blp);
   decode(first, blp);
@@ -3779,7 +3796,22 @@ bool CDir::scrub_local()
   return good;
 }
 
-std::string CDir::get_path() const
+/* XXX: Return string containing only final 10 components of the path. This
+ * shortened path is to be used usually for only logging. This prevents the
+ * unnecessary generation of full version of a very long path (imagine a path
+ * with 2000 components) from inode because not only repeatedly printing long
+ * path in logs is unnecessary and unreadable but more importantly because it
+ * is an expensive process (since it's done for more or less individual log
+ * entries).
+ */
+std::string CDir::get_trimmed_path() const
+{
+  std::string path;
+  get_inode()->make_trimmed_path_string(path, true);
+  return path;
+}
+
+std::string CDir::get_path(bool trim_path) const
 {
   std::string path;
   get_inode()->make_path_string(path, true);

@@ -263,13 +263,12 @@ class FuseMountBase(CephFSMountBase):
                 return False
 
         fstype = proc.stdout.getvalue().rstrip('\n')
-        if fstype == 'fuseblk':
+        if fstype in ('fuseblk', 'fuse'):
             log.info('ceph-fuse is mounted on %s', self.hostfs_mntpt)
             return True
         else:
-            log.debug('ceph-fuse not mounted, got fs type {fstype!r}'.format(
-                fstype=fstype))
-            return False
+            raise RuntimeError('fstype expected fuseblk or fuse but found '
+                               f'{fstype}')
 
     def wait_until_mounted(self):
         """
@@ -433,7 +432,7 @@ class FuseMountBase(CephFSMountBase):
         return ""
 
     def find_admin_socket(self):
-        pyscript = """
+        pyscript = r"""
 import glob
 import re
 import os
@@ -450,7 +449,7 @@ def _find_admin_socket(client_name):
             return files[0]
 
         for f in files:
-                pid = re.match(".*\.(\d+)\.asok$", f).group(1)
+                pid = re.match(r".*\.(\d+)\.asok$", f).group(1)
                 if os.path.exists("/proc/{{0}}".format(pid)):
                     with open("/proc/{{0}}/cmdline".format(pid), 'r') as proc_f:
                         contents = proc_f.read()

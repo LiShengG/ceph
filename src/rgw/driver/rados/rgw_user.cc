@@ -1,5 +1,5 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab ft=cpp
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab ft=cpp
 
 #include "rgw_user.h"
 #include "common/errno.h"
@@ -8,7 +8,9 @@
 #include "rgw_account.h"
 #include "rgw_bucket.h"
 #include "rgw_metadata.h"
+#ifdef WITH_RADOSGW_RADOS
 #include "rgw_metadata_lister.h"
+#endif
 #include "rgw_quota.h"
 #include "rgw_rest_iam.h" // validate_iam_user_name()
 
@@ -30,33 +32,6 @@ static string key_type_to_str(int key_type) {
       return "s3";
       break;
   }
-}
-
-static bool char_is_unreserved_url(char c)
-{
-  if (isalnum(c))
-    return true;
-
-  switch (c) {
-  case '-':
-  case '.':
-  case '_':
-  case '~':
-    return true;
-  default:
-    return false;
-  }
-}
-
-static bool validate_access_key(string& key)
-{
-  const char *p = key.c_str();
-  while (*p) {
-    if (!char_is_unreserved_url(*p))
-      return false;
-    p++;
-  }
-  return true;
 }
 
 static void set_err_msg(std::string *sink, std::string msg)
@@ -189,6 +164,11 @@ static void dump_user_info(Formatter *f, RGWUserInfo &info,
   }
   encode_json("type", user_source_type, f);
   encode_json("mfa_ids", info.mfa_ids, f);
+  encode_json("account_id", info.account_id, f);
+  encode_json("path", info.path, f);
+  encode_json("create_date", info.create_date, f);
+  encode_json("tags", info.tags, f);
+  encode_json("group_ids", info.group_ids, f);
   if (stats) {
     encode_json("stats", *stats, f);
   }
@@ -495,41 +475,6 @@ int RGWAccessKeyPool::check_op(RGWUserAdminOpState& op_state,
     op_state.set_access_key_exist();
   }
   return 0;
-}
-
-void rgw_generate_secret_key(CephContext* cct,
-                             std::string& secret_key)
-{
-  char secret_key_buf[SECRET_KEY_LEN + 1];
-  gen_rand_alphanumeric_plain(cct, secret_key_buf, sizeof(secret_key_buf));
-  secret_key = secret_key_buf;
-}
-
-int rgw_generate_access_key(const DoutPrefixProvider* dpp,
-                            optional_yield y,
-                            rgw::sal::Driver* driver,
-                            std::string& access_key_id)
-{
-  std::string id;
-  int r = 0;
-
-  do {
-    id.resize(PUBLIC_ID_LEN + 1);
-    gen_rand_alphanumeric_upper(dpp->get_cct(), id.data(), id.size());
-    id.pop_back(); // remove trailing null
-
-    if (!validate_access_key(id))
-      continue;
-
-    std::unique_ptr<rgw::sal::User> duplicate_check;
-    r = driver->get_user_by_access_key(dpp, id, y, &duplicate_check);
-  } while (r == 0);
-
-  if (r == -ENOENT) {
-    access_key_id = std::move(id);
-    return 0;
-  }
-  return r;
 }
 
 // Generate a new random key
@@ -1683,8 +1628,8 @@ static int adopt_user_bucket(const DoutPrefixProvider* dpp,
                              optional_yield y,
                              rgw::sal::Driver* driver,
                              const rgw_bucket& bucketid,
-                             const rgw_owner& new_owner)
-{
+                             const rgw_owner& new_owner,
+                             const std::string& new_owner_name) {
   // retry in case of racing writes to the bucket instance metadata
   static constexpr auto max_retries = 10;
   int tries = 0;
@@ -1701,7 +1646,7 @@ static int adopt_user_bucket(const DoutPrefixProvider* dpp,
       return r;
     }
 
-    r = bucket->chown(dpp, new_owner, y);
+    r = bucket->chown(dpp, new_owner, new_owner_name, y);
     if (r < 0) {
       ldpp_dout(dpp, 1) << "failed to chown bucket " << bucketid
           << ": " << cpp_strerror(r) << dendl;
@@ -1714,8 +1659,8 @@ static int adopt_user_bucket(const DoutPrefixProvider* dpp,
 
 static int adopt_user_buckets(const DoutPrefixProvider* dpp, optional_yield y,
                               rgw::sal::Driver* driver, const rgw_user& user,
-                              const rgw_account_id& account_id)
-{
+                              const rgw_account_id& account_id,
+                              const std::string& account_name) {
   const size_t max_chunk = dpp->get_cct()->_conf->rgw_list_buckets_max_chunk;
   constexpr bool need_stats = false;
 
@@ -1731,7 +1676,8 @@ static int adopt_user_buckets(const DoutPrefixProvider* dpp, optional_yield y,
     }
 
     for (const auto& ent : listing.buckets) {
-      r = adopt_user_bucket(dpp, y, driver, ent.bucket, account_id);
+      r = adopt_user_bucket(dpp, y, driver, ent.bucket, account_id,
+                            account_name);
       if (r < 0 && r != -ENOENT) {
         return r;
       }
@@ -2164,9 +2110,19 @@ int RGWUser::execute_modify(const DoutPrefixProvider *dpp, RGWUserAdminOpState& 
         set_err_msg(err_msg, err);
         return ret;
       }
+      RGWAccountInfo account_info;
+      rgw::sal::Attrs attrs;
+      RGWObjVersionTracker objv;
+      int r = driver->load_account_by_id(dpp, y, op_state.account_id,
+                                         account_info,
+                                         attrs, objv);
+      if (r < 0) {
+        err = "Failed to load account by id";
+        return r;
+      }
       // change account on user's buckets
       ret = adopt_user_buckets(dpp, y, driver, user_info.user_id,
-                               user_info.account_id);
+                               user_info.account_id, account_info.name);
       if (ret < 0) {
         set_err_msg(err_msg, "failed to change ownership of user's buckets");
         return ret;
@@ -2738,6 +2694,7 @@ public:
   }
 };
 
+#ifdef WITH_RADOSGW_RADOS
 class RGWUserMetadataHandler : public RGWMetadataHandler {
   RGWSI_User *svc_user{nullptr};
  public:
@@ -2891,7 +2848,7 @@ std::string RGWUserMetadataHandler::get_marker(void *handle)
   auto lister = static_cast<RGWMetadataLister*>(handle);
   return lister->get_marker();
 }
-
+#endif
 
 RGWUserCtl::RGWUserCtl(RGWSI_Zone *zone_svc, RGWSI_User *user_svc)
 {
@@ -3021,11 +2978,13 @@ int RGWUserCtl::remove_info(const DoutPrefixProvider *dpp,
   return svc.user->remove_user_info(info, params.objv_tracker, y, dpp);
 }
 
+#ifdef WITH_RADOSGW_RADOS
 auto create_user_metadata_handler(RGWSI_User *user_svc)
     -> std::unique_ptr<RGWMetadataHandler>
 {
   return std::make_unique<RGWUserMetadataHandler>(user_svc);
 }
+#endif
 
 void rgw_user::dump(Formatter *f) const
 {

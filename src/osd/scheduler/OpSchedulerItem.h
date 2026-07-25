@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph - scalable distributed file system
  *
@@ -14,7 +15,10 @@
 
 #pragma once
 
+#include <cstdint>
+#include <optional>
 #include <ostream>
+#include <string>
 
 #include "include/types.h"
 #include "include/utime_fmt.h"
@@ -23,21 +27,14 @@
 #include "osd/PG.h"
 #include "osd/PGPeeringEvent.h"
 #include "messages/MOSDOp.h"
+#include "common/mclock_common.h"
+#include "common/WorkQueue.h" // for class ThreadPool
 
 
 class OSD;
 struct OSDShard;
 
 namespace ceph::osd::scheduler {
-
-enum class op_scheduler_class : uint8_t {
-  background_recovery = 0,
-  background_best_effort,
-  immediate,
-  client,
-};
-
-std::ostream& operator<<(std::ostream& out, const op_scheduler_class& class_id);
 
 class OpSchedulerItem {
 public:
@@ -76,7 +73,10 @@ public:
     virtual std::string print() const = 0;
 
     virtual void run(OSD *osd, OSDShard *sdata, PGRef& pg, ThreadPool::TPHandle &handle) = 0;
-    virtual op_scheduler_class get_scheduler_class() const = 0;
+    virtual SchedulerClass get_scheduler_class() const = 0;
+    virtual utime_t get_time_queued() const {
+      return utime_t();
+    }
 
     virtual ~OpQueueable() {}
     friend std::ostream& operator<<(std::ostream& out, const OpQueueable& q) {
@@ -161,12 +161,16 @@ public:
     return qitem->peering_requires_pg();
   }
 
-  op_scheduler_class get_scheduler_class() const {
+  SchedulerClass get_scheduler_class() const {
     return qitem->get_scheduler_class();
   }
 
   void set_qos_cost(uint32_t scaled_cost) {
     qos_cost = scaled_cost;
+  }
+
+  utime_t get_time_queued() const {
+    return qitem ? qitem->get_time_queued() : utime_t();
   }
 
   friend std::ostream& operator<<(std::ostream& out, const OpSchedulerItem& item) {
@@ -201,13 +205,13 @@ protected:
     return pgid;
   }
 
-  static op_scheduler_class priority_to_scheduler_class(int priority) {
+  static SchedulerClass priority_to_scheduler_class(int priority) {
     if (priority >= CEPH_MSG_PRIO_HIGH) {
-      return op_scheduler_class::immediate;
+      return SchedulerClass::immediate;
     } else if (priority >= PeeringState::recovery_msg_priority_t::DEGRADED) {
-      return op_scheduler_class::background_recovery;
+      return SchedulerClass::background_recovery;
     } else {
-      return op_scheduler_class::background_best_effort;
+      return SchedulerClass::background_best_effort;
     }
   }
 
@@ -223,10 +227,12 @@ public:
 };
 
 class PGOpItem : public PGOpQueueable {
+  utime_t time_queued;
   OpRequestRef op;
 
 public:
-  PGOpItem(spg_t pg, OpRequestRef op) : PGOpQueueable(pg), op(std::move(op)) {}
+  PGOpItem(spg_t pg, OpRequestRef op)
+    : PGOpQueueable(pg), time_queued(ceph_clock_now()), op(std::move(op)) {}
 
   std::ostream &print(std::ostream &rhs) const final {
     return rhs << "PGOpItem(op=" << *(op->get_req()) << ")";
@@ -240,23 +246,64 @@ public:
     return op;
   }
 
-  op_scheduler_class get_scheduler_class() const final {
-    auto type = op->get_req()->get_type();
-    if (type == CEPH_MSG_OSD_OP ||
-	type == CEPH_MSG_OSD_BACKOFF) {
-      return op_scheduler_class::client;
-    } else {
-      return op_scheduler_class::immediate;
+  SchedulerClass get_scheduler_class() const final {
+    switch (op->get_req()->get_type()) {
+    case CEPH_MSG_OSD_OP:
+    case CEPH_MSG_OSD_BACKOFF:
+      return SchedulerClass::client;
+    /**
+     * EC SubOp reads for mClock are now classed based on their priority.
+     * The primary reason is to prevent subOps from overwhelming the
+     * 'immediate' queue during OSD events like failures, removal,
+     * reweight and any operation that trigger recovery/backfills. A sudden
+     * and long enough sustained burst of subOps in the 'immediate' could
+     * result in slow ops since client ops are preempted due to ops in the
+     * higher priority 'immediate' queue.
+     *
+     * The new classification described below improves the scheduling
+     * of client and other classes of operation during recovery/backfill as
+     * they are no longer preempted by recovery EC subOps in the 'immediate'
+     * queue. EC SubOps are now handled as follows:
+     *
+     *  - EC SubOp reads generated during recovery will either go into the
+     *    'background_recovery' or 'background_best_effort' class based on
+     *    the recovery priority set for the op. EC SubOp reads generated due
+     *    to client will continue to be classified as 'immediate'.
+     *
+     *  - EC SubOp writes generated as a result of client operations will
+     *    continue to be classified as 'immediate'.
+     *
+     *  - EC SubOp replies are considered high priority and therefore
+     *    continue to be classed as 'immediate'.
+     *
+     *  Note: The 'cost' for EC subOp read operation is set according to
+     *  the amount of data to be read/written.
+     */
+    case MSG_OSD_EC_READ: {
+      auto prio = op->get_req()->get_priority();
+      if (prio <= PeeringState::recovery_msg_priority_t::FORCED) {
+        return priority_to_scheduler_class(prio);
+      }
+      [[fallthrough]];
     }
+    default:
+      return SchedulerClass::immediate;
+    }
+  }
+
+  utime_t get_time_queued() const final{
+    return time_queued;
   }
 
   void run(OSD *osd, OSDShard *sdata, PGRef& pg, ThreadPool::TPHandle &handle) final;
 };
 
 class PGPeeringItem : public PGOpQueueable {
+  utime_t time_queued;
   PGPeeringEventRef evt;
 public:
-  PGPeeringItem(spg_t pg, PGPeeringEventRef e) : PGOpQueueable(pg), evt(e) {}
+  PGPeeringItem(spg_t pg, PGPeeringEventRef e)
+    : PGOpQueueable(pg), time_queued(ceph_clock_now()), evt(e) {}
   std::ostream &print(std::ostream &rhs) const final {
     return rhs << "PGPeeringEvent(" << evt->get_desc() << ")";
   }
@@ -273,8 +320,11 @@ public:
   const PGCreateInfo *creates_pg() const override {
     return evt->create_info.get();
   }
-  op_scheduler_class get_scheduler_class() const final {
-    return op_scheduler_class::immediate;
+  SchedulerClass get_scheduler_class() const final {
+    return SchedulerClass::immediate;
+  }
+  utime_t get_time_queued() const final{
+    return time_queued;
   }
 };
 
@@ -296,8 +346,8 @@ public:
   }
   void run(
     OSD *osd, OSDShard *sdata, PGRef& pg, ThreadPool::TPHandle &handle) final;
-  op_scheduler_class get_scheduler_class() const final {
-    return op_scheduler_class::background_best_effort;
+  SchedulerClass get_scheduler_class() const final {
+    return SchedulerClass::background_best_effort;
   }
 };
 
@@ -319,8 +369,8 @@ public:
   }
   void run(
     OSD *osd, OSDShard *sdata, PGRef& pg, ThreadPool::TPHandle &handle) final;
-  op_scheduler_class get_scheduler_class() const final {
-    return op_scheduler_class::background_best_effort;
+  SchedulerClass get_scheduler_class() const final {
+    return SchedulerClass::background_best_effort;
   }
 };
 
@@ -359,9 +409,9 @@ class PGScrubItem : public PGOpQueueable {
 	   OSDShard* sdata,
 	   PGRef& pg,
 	   ThreadPool::TPHandle& handle) override = 0;
-  op_scheduler_class get_scheduler_class() const final
+  SchedulerClass get_scheduler_class() const final
   {
-    return op_scheduler_class::background_best_effort;
+    return SchedulerClass::background_best_effort;
   }
 };
 
@@ -505,9 +555,12 @@ public:
   uint64_t get_reserved_pushes() const final {
     return reserved_pushes;
   }
+  utime_t get_time_queued() const final {
+    return time_queued;
+  }
   void run(
     OSD *osd, OSDShard *sdata, PGRef& pg, ThreadPool::TPHandle &handle) final;
-  op_scheduler_class get_scheduler_class() const final {
+  SchedulerClass get_scheduler_class() const final {
     return priority_to_scheduler_class(priority);
   }
 };
@@ -533,9 +586,12 @@ public:
     return fmt::format(
 	"PGRecoveryContext(pgid={} c={} epoch={})", get_pgid(), (void*)c.get(), epoch);
   }
+  utime_t get_time_queued() const final {
+    return time_queued;
+  }
   void run(
     OSD *osd, OSDShard *sdata, PGRef& pg, ThreadPool::TPHandle &handle) final;
-  op_scheduler_class get_scheduler_class() const final {
+  SchedulerClass get_scheduler_class() const final {
     return priority_to_scheduler_class(priority);
   }
 };
@@ -559,8 +615,8 @@ public:
   }
   void run(
     OSD *osd, OSDShard *sdata, PGRef& pg, ThreadPool::TPHandle &handle) final;
-  op_scheduler_class get_scheduler_class() const final {
-    return op_scheduler_class::background_best_effort;
+  SchedulerClass get_scheduler_class() const final {
+    return SchedulerClass::background_best_effort;
   }
 };
 
@@ -598,8 +654,12 @@ public:
     return op;
   }
 
-  op_scheduler_class get_scheduler_class() const final {
+  SchedulerClass get_scheduler_class() const final {
     return priority_to_scheduler_class(op->get_req()->get_priority());
+  }
+
+  utime_t get_time_queued() const final {
+    return time_queued;
   }
 
   void run(OSD* osd, OSDShard* sdata, PGRef& pg, ThreadPool::TPHandle& handle)
@@ -618,7 +678,7 @@ struct fmt::formatter<ceph::osd::scheduler::OpSchedulerItem> {
   {
     // matching existing op_scheduler_item_t::operator<<() format
     using class_t =
-	std::underlying_type_t<ceph::osd::scheduler::op_scheduler_class>;
+	std::underlying_type_t<SchedulerClass>;
     const auto qos_cost = opsi.was_queued_via_mclock()
 			      ? fmt::format(" qos_cost {}", opsi.qos_cost)
 			      : "";

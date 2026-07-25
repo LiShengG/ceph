@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph - scalable distributed file system
  *
@@ -16,6 +17,8 @@
 
 #include "PaxosService.h"
 #include "NVMeofGwMap.h"
+
+struct Subscription;
 
 struct LastBeacon {
   NvmeGwId gw_id;
@@ -39,7 +42,7 @@ class NVMeofGwMon: public PaxosService,
   NVMeofGwMap map;  //NVMeGWMap
   NVMeofGwMap pending_map;
   std::map<LastBeacon, ceph::coarse_mono_clock::time_point> last_beacon;
-  ceph::coarse_mono_clock::time_point last_tick;
+  ceph::coarse_mono_clock::time_point last_beacon_check;
 
 public:
   NVMeofGwMon(Monitor &mn, Paxos &p, const std::string& service_name)
@@ -49,7 +52,9 @@ public:
   ~NVMeofGwMon() override {}
 
   // config observer
-  const char** get_tracked_conf_keys() const override;
+  std::vector<std::string> get_tracked_keys() const noexcept override {
+    return {};
+  }
   void handle_conf_change(
     const ConfigProxy& conf, const std::set<std::string> &changed) override {};
 
@@ -69,6 +74,9 @@ public:
   bool prepare_update(MonOpRequestRef op) override;
 
   bool preprocess_command(MonOpRequestRef op);
+  bool nvme_gw_show_command(ceph::Formatter* f,
+       bufferlist &rdata, const std::string  &pool,
+       const std::string &group);
   bool prepare_command(MonOpRequestRef op);
 
   void encode_full(MonitorDBStore::TransactionRef t) override {}
@@ -81,12 +89,31 @@ public:
 
   void check_subs(bool type);
   void check_sub(Subscription *sub);
+  void check_sub_unconditional(Subscription *sub);
+ 
+  const NVMeofGwMap& get_map() const { return map; }
+
+  std::map<NvmeGroupKey, std::map<NvmeGwId, utime_t>> gws_deleting_time;
 
 private:
   void synchronize_last_beacon();
   void process_gw_down(const NvmeGwId &gw_id,
-     const NvmeGroupKey& group_key, bool &propose_pending,
-     gw_availability_t avail);
+     const NvmeGroupKey& group_key, bool &propose_pending);
+  bool get_gw_by_addr(const  entity_addr_t &sub_addr,
+       NvmeGwId &gw_id, NvmeGroupKey& group_key);
+  epoch_t get_ack_map_epoch(bool gw_created, const NvmeGroupKey& group_key);
+  void recreate_gw_epoch();
+  void restore_pending_map_info(NVMeofGwMap & tmp_map);
+  void cleanup_pending_map();
+  void get_gw_listeners(ceph::Formatter *f, std::pair<std::string, std::string>& group_key);
+  int apply_beacon(const NvmeGwId &gw_id, int gw_version,
+             const NvmeGroupKey& group_key, void *msg,
+			 const BeaconSubsystems& sub, gw_availability_t &avail, bool &propose_pending);
+  void do_send_map_ack(MonOpRequestRef op, bool gw_created, bool gw_propose,
+       uint64_t stored_sequence, bool is_correct_sequence,
+       const NvmeGroupKey& group_key, const NvmeGwId &gw_id);
+  void check_beacon_timeout(ceph::coarse_mono_clock::time_point now,
+       bool &propose_pending);
 };
 
 #endif /* MON_NVMEGWMONITOR_H_ */

@@ -1,5 +1,5 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
 
 #ifndef __CEPH_LOG_LOG_H
 #define __CEPH_LOG_LOG_H
@@ -35,6 +35,7 @@ class Log : private Thread
 {
 public:
   using Thread::is_started;
+  using prefix_hook_t = const char* (*)();
 
   Log(const SubsystemMap *s);
   ~Log() override;
@@ -80,6 +81,14 @@ public:
   /// induce a segv on the next log event
   void inject_segv();
   void reset_segv();
+
+  /**
+   * Set a hook to get the log prefix (replaces thread ID in log output).
+   *
+   * @note Not thread-safe. Must be called once during startup before any
+   *       logging occurs. Designed for single-threaded unit test harnesses only.
+   */
+  static void set_prefix_hook(prefix_hook_t hook);
 
 protected:
   using EntryVector = std::vector<ConcreteEntry>;

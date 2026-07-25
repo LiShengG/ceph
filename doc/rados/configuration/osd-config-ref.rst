@@ -20,7 +20,7 @@ with ``0`` using the following convention. ::
 In a configuration file, you may specify settings for all Ceph OSD Daemons in
 the cluster by adding configuration settings to the ``[osd]`` section of your
 configuration file. To add settings directly to a specific Ceph OSD Daemon
-(e.g., ``host``), enter  it in an OSD-specific section of your configuration
+(e.g., ``host``), enter it in an OSD-specific section of your configuration
 file. For example:
 
 .. code-block:: ini
@@ -50,7 +50,9 @@ automatically.
 When using Filestore, the journal size should be at least twice the product of the expected drive
 speed multiplied by ``filestore_max_sync_interval``. However, the most common
 practice is to partition the journal drive (often an SSD), and mount it such
-that Ceph uses the entire partition for the journal.
+that Ceph uses the entire partition for the journal. Note that Filestore has been
+deprecated for several releases and any legacy Filestore OSDs should be migrated
+to BlueStore.
 
 .. confval:: osd_uuid
 .. confval:: osd_data
@@ -95,7 +97,7 @@ Journal Settings
 ================
 
 This section applies only to the older Filestore OSD back end.  Since Luminous
-BlueStore has been default and preferred.
+BlueStore has been the default and preferred.
 
 By default, Ceph expects that you will provision a Ceph OSD Daemon's journal at
 the following path, which is usually a symlink to a device or partition::
@@ -225,13 +227,13 @@ steps as described in `mClock Config Reference`_.
 Core Concepts
 `````````````
 
-Ceph's QoS support is implemented using a queueing scheduler
+Ceph's QoS support is implemented using a queuing scheduler
 based on `the dmClock algorithm`_. This algorithm allocates the I/O
 resources of the Ceph cluster in proportion to weights, and enforces
 the constraints of minimum reservation and maximum limitation, so that
 the services can compete for the resources fairly. Currently the
 *mclock_scheduler* operation queue divides Ceph services involving I/O
-resources into following buckets:
+resources into the following buckets:
 
 - client op: the iops issued by client
 - osd subop: the iops issued by primary OSD
@@ -239,7 +241,7 @@ resources into following buckets:
 - pg recovery: the recovery related requests
 - pg scrub: the scrub related requests
 
-And the resources are partitioned using following three sets of tags. In other
+And the resources are partitioned using the following three sets of tags. In other
 words, the share of each type of service is controlled by three tags:
 
 #. reservation: the minimum IOPS allocated for the service.
@@ -249,7 +251,7 @@ words, the share of each type of service is controlled by three tags:
 
 In Ceph, operations are graded with "cost". And the resources allocated
 for serving various services are consumed by these "costs". So, for
-example, the more reservation a services has, the more resource it is
+example, the more reservation a service has, the more resource it is
 guaranteed to possess, as long as it requires. Assuming there are 2
 services: recovery and client ops:
 
@@ -343,7 +345,7 @@ the distributed version of mClock).
 
 Various organizations and individuals are currently experimenting with
 mClock as it exists in this code base along with their modifications
-to the code base. We hope you'll share you're experiences with your
+to the code base. We hope you'll share your experiences with your
 mClock and dmClock experiments on the ``ceph-devel`` mailing list.
 
 .. confval:: osd_async_recovery_min_cost
@@ -414,8 +416,8 @@ the same time. This can make the recovery process time consuming and resource
 intensive.
 
 To maintain operational performance, Ceph performs recovery with limitations on
-the number recovery requests, threads and object chunk sizes which allows Ceph
-perform well in a degraded state.
+the number of recovery requests, threads and object chunk sizes which allows Ceph
+to perform well in a degraded state.
 
 .. note:: Some of these settings are automatically reset if the `mClock`_
           scheduler is active, see `mClock backfill`_.
@@ -431,6 +433,10 @@ perform well in a degraded state.
 .. confval:: osd_recovery_sleep_hdd
 .. confval:: osd_recovery_sleep_ssd
 .. confval:: osd_recovery_sleep_hybrid
+.. confval:: osd_recovery_sleep_degraded
+.. confval:: osd_recovery_sleep_degraded_hdd
+.. confval:: osd_recovery_sleep_degraded_ssd
+.. confval:: osd_recovery_sleep_degraded_hybrid
 .. confval:: osd_recovery_priority
 
 Tiering
@@ -457,8 +463,8 @@ Miscellaneous
 .. _pool: ../../operations/pools
 .. _Configuring Monitor/OSD Interaction: ../mon-osd-interaction
 .. _Monitoring OSDs and PGs: ../../operations/monitoring-osd-pg#peering
-.. _mClock: ../mclock-config-ref.rst
-.. _mClock backfill: ../mclock-config-ref.rst#recovery-backfill-options
+.. _mClock: ../mclock-config-ref
+.. _mClock backfill: ../mclock-config-ref#recovery-backfill-options
 .. _Pool & PG Config Reference: ../pool-pg-config-ref
 .. _Journal Config Reference: ../journal-ref
 .. _cache target dirty high ratio: ../../operations/pools#cache-target-dirty-high-ratio

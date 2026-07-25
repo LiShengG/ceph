@@ -2,7 +2,7 @@
 set -e
 
 if [ -f /etc/debian_version ]; then
-    for package in python3-pip python3-dev python3-xmltodict python3-pika libevent-dev libxml2-dev libxslt-dev zlib1g-dev; do
+    for package in python3-pip python3-dev python3-xmltodict python3-pika libevent-dev libxml2-dev libxslt-dev zlib1g-dev libkrb5-dev; do
         if [ "$(dpkg --status -- $package 2>/dev/null|sed -n 's/^Status: //p')" != "install ok installed" ]; then
             # add a space after old values
             missing="${missing:+$missing }$package"
@@ -14,7 +14,7 @@ if [ -f /etc/debian_version ]; then
     fi
 fi
 if [ -f /etc/redhat-release ]; then
-    for package in python3-pip python3-devel python3-xmltodict python3-pika libevent-devel libxml2-devel libxslt-devel zlib-devel; do
+    for package in python3-pip python3-devel python3-xmltodict python3-pika libevent-devel libxml2-devel libxslt-devel zlib-devel krb5-devel; do
         if [ "$(rpm -qa $package 2>/dev/null)" == "" ]; then
             missing="${missing:+$missing }$package"
         fi
@@ -29,17 +29,5 @@ python3 -m venv --system-site-packages virtualenv
 
 # avoid pip bugs
 ./virtualenv/bin/pip install --upgrade pip
-#pip3 install --upgrade setuptools cffi  # address pip issue: https://github.com/pypa/pip/issues/6264
-
-# work-around change in pip 1.5
-#./virtualenv/bin/pip install six
-#./virtualenv/bin/pip install -I nose
-#./virtualenv/bin/pip install setuptools
 
 ./virtualenv/bin/pip install -U -r requirements.txt
-
-# forbid setuptools from using the network because it'll try to use
-# easy_install, and we really wanted pip; next line will fail if pip
-# requirements.txt does not match setup.py requirements -- sucky but
-# good enough for now
-./virtualenv/bin/python setup.py develop

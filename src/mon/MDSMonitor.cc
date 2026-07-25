@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph - scalable distributed file system
  *
@@ -12,6 +13,8 @@
  * 
  */
 
+#include "MDSMonitor.h"
+
 #include <regex>
 #include <sstream>
 #include <queue>
@@ -19,16 +22,19 @@
 #include <boost/range/adaptors.hpp>
 #include <boost/utility.hpp>
 
-#include "MDSMonitor.h"
 #include "FSCommands.h"
 #include "Monitor.h"
 #include "MonitorDBStore.h"
+#include "MonMap.h"
 #include "OSDMonitor.h"
+#include "Paxos.h"
 
 #include "common/strtol.h"
 #include "common/perf_counters.h"
 #include "common/config.h"
 #include "common/cmdparse.h"
+#include "common/debug.h"
+#include "common/errno.h"
 #include "messages/MMDSMap.h"
 #include "messages/MFSMap.h"
 #include "messages/MFSMapUser.h"
@@ -39,7 +45,10 @@
 #include "include/ceph_assert.h"
 #include "include/str_list.h"
 #include "include/stringify.h"
+#include "include/util.h" // for dump_services()
+#include "mds/cephfs_features.h"
 #include "mds/mdstypes.h"
+#include "mds/cephfs_features.h" // for CEPHFS_FEATURE_*
 #include "Session.h"
 
 using namespace TOPNSPC::common;
@@ -84,7 +93,7 @@ namespace TOPNSPC::common {
 template<> bool cmd_getval(const cmdmap_t& cmdmap,
 			   string_view k, mds_gid_t &val)
 {
-  return cmd_getval(cmdmap, k, (int64_t&)val);
+  return cmd_getval(cmdmap, k, reinterpret_cast<int64_t&>(val));
 }
 
 template<> bool cmd_getval(const cmdmap_t& cmdmap,
@@ -1393,6 +1402,10 @@ bool MDSMonitor::fail_mds_gid(FSMap &fsmap, mds_gid_t gid)
   return blocklist_epoch != 0;
 }
 
+bool MDSMonitor::is_leader() const {
+  return mon.is_leader();
+}
+
 mds_gid_t MDSMonitor::gid_from_arg(const FSMap &fsmap, const string &arg, ostream &ss)
 {
   // Try parsing as a role
@@ -1548,9 +1561,15 @@ out:
   }
 }
 
-bool MDSMonitor::has_health_warnings(vector<mds_metric_t> warnings)
+bool MDSMonitor::has_health_warnings(const vector<mds_metric_t>& warnings, const mds_gid_t& gid)
 {
-  for (auto& [gid, health] : pending_daemon_health) {
+  for (auto& [_gid, health] : pending_daemon_health) {
+    if (gid != MDS_GID_NONE) {
+      if (gid != mds_gid_t(_gid)) {
+	continue;
+      }
+    }
+
     for (auto& metric : health.metrics) {
       // metric.type here is the type of health warning. We are only
       // looking for types of health warnings passed to this func member
@@ -1562,6 +1581,17 @@ bool MDSMonitor::has_health_warnings(vector<mds_metric_t> warnings)
     }
   }
 
+  return false;
+}
+
+bool MDSMonitor::has_health_warnings(const vector<mds_metric_t>& warnings,
+				     const std::vector<mds_gid_t>& gids)
+{
+  for (auto& gid : gids) {
+    if (has_health_warnings(warnings, gid)) {
+      return true;
+    }
+  }
   return false;
 }
 
@@ -1631,7 +1661,7 @@ int MDSMonitor::filesystem_command(
     }
 
     if (!confirm &&
-        has_health_warnings({MDS_HEALTH_TRIM, MDS_HEALTH_CACHE_OVERSIZED})) {
+        has_health_warnings({MDS_HEALTH_TRIM, MDS_HEALTH_CACHE_OVERSIZED}, gid)) {
       ss << errmsg_for_unhealthy_mds;
       return -EPERM;
     }

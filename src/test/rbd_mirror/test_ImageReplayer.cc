@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph distributed storage system
  *
@@ -14,6 +15,8 @@
  *
  */
 
+#include "common/Clock.h" // for ceph_clock_now()
+#include "common/Cond.h"
 #include "include/rados/librados.hpp"
 #include "include/rbd/librbd.hpp"
 #include "include/stringify.h"
@@ -143,8 +146,13 @@ public:
                           cls::rbd::MIRROR_PEER_DIRECTION_RX_TX,
                           "siteA", "client", m_local_mirror_uuid}));
 
+      std::string remote_fsid;
+      librados::Rados remote_rados(m_remote_ioctx);
+      EXPECT_EQ(0, remote_rados.cluster_fsid(&remote_fsid));
+
       m_pool_meta_cache.set_remote_pool_meta(
-        m_remote_ioctx.get_id(), {m_remote_mirror_uuid, remote_peer_uuid});
+        remote_fsid, m_remote_ioctx.get_id(),
+        {m_remote_mirror_uuid, remote_peer_uuid});
     }
 
     EXPECT_EQ(0, librbd::api::Mirror<>::uuid_get(m_remote_ioctx,
@@ -245,6 +253,7 @@ public:
   void unwatch() {
     if (m_watch_handle != 0) {
       m_remote_ioctx.unwatch2(m_watch_handle);
+      m_remote_cluster.watch_flush();
       delete m_watch_ctx;
       m_watch_ctx = nullptr;
       m_watch_handle = 0;

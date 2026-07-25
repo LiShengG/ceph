@@ -17,6 +17,10 @@ import { StatefulTabDirective } from './stateful-tab.directive';
 import { TrimDirective } from './trim.directive';
 import { RequiredFieldDirective } from './required-field.directive';
 import { ReactiveFormsModule } from '@angular/forms';
+import { OptionalFieldDirective } from './optional-field.directive';
+import { DimlessBinaryPerMinuteDirective } from './dimless-binary-per-minute.directive';
+import { DynamicInputComboboxDirective } from './dynamic-input-combobox.directive';
+import { ValidateDirective } from './validate.directive';
 
 @NgModule({
   imports: [ReactiveFormsModule],
@@ -36,7 +40,11 @@ import { ReactiveFormsModule } from '@angular/forms';
     CdFormGroupDirective,
     CdFormValidationDirective,
     AuthStorageDirective,
-    RequiredFieldDirective
+    RequiredFieldDirective,
+    OptionalFieldDirective,
+    DimlessBinaryPerMinuteDirective,
+    DynamicInputComboboxDirective,
+    ValidateDirective
   ],
   exports: [
     AutofocusDirective,
@@ -54,7 +62,11 @@ import { ReactiveFormsModule } from '@angular/forms';
     CdFormGroupDirective,
     CdFormValidationDirective,
     AuthStorageDirective,
-    RequiredFieldDirective
+    RequiredFieldDirective,
+    OptionalFieldDirective,
+    DimlessBinaryPerMinuteDirective,
+    DynamicInputComboboxDirective,
+    ValidateDirective
   ]
 })
 export class DirectivesModule {}

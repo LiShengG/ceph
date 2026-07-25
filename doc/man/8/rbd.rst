@@ -392,7 +392,7 @@ Commands
 :command:`image-meta set` *image-spec* *key* *value*
   Set metadata key with the value. They will displayed in `image-meta list`.
 
-:command:`import` [--export-format *format (1 or 2)*] [--image-format *format-id*] [--object-size *size-in-B/K/M*] [--stripe-unit *size-in-B/K/M* --stripe-count *num*] [--image-feature *feature-name*]... [--image-shared] *src-path* [*image-spec*]
+:command:`import` [--export-format *format (1 or 2)*] [--image-format *format-id*] [--object-size *size-in-B/K/M*] [--stripe-unit *size-in-B/K/M* --stripe-count *num*] [--image-feature *feature-name*] [--estimated-size *size-in-M/G/T*]... [--image-shared] *src-path* [*image-spec*]
   Create a new image and import its data from path (use - for
   stdin).  The import operation will try to create sparse rbd images 
   if possible.  For import from stdin, the sparsification unit is
@@ -783,11 +783,10 @@ Per client instance `rbd device map` options:
   For msgr2.1 protocol this option is ignored.
 
 * cephx_require_signatures - Require msgr1 message signing feature (since 3.19,
-  default).  This option is deprecated and will be removed in the future as the
-  feature has been supported since the Bobtail release.
+  default).  This option is deprecated and will be removed in a future release.
 
 * nocephx_require_signatures - Don't require msgr1 message signing feature
-  (since 3.19).  This option is deprecated and will be removed in the future.
+  (since 3.19).  This option is deprecated and will be removed in a future release.
 
 * tcp_nodelay - Disable Nagle's algorithm on client sockets (since 4.0,
   default).
@@ -870,6 +869,11 @@ Per mapping (block device) `rbd device map` options:
 * read_from_replica=balance - When issued a read on a replicated pool, pick
   a random OSD for serving it (since 5.8).
 
+  When issued a read on an erasure-coded pool, pick the shard that stores the
+  data, giving a performance uplift over routing the request via the primary
+  (requires Umbrella server and client; kernel client support is planned for a
+  future release).
+
   This mode is safe for general use only since Octopus (i.e. after "ceph osd
   require-osd-release octopus").  Otherwise it should be limited to read-only
   workloads such as images mapped read-only everywhere or snapshots.
@@ -895,7 +899,7 @@ Per mapping (block device) `rbd device map` options:
   backend that the data is incompressible, disabling compression in aggressive
   mode (since 5.8).
 
-* ms_mode=legacy - Use msgr1 on-the-wire protocol (since 5.11, default).
+* ms_mode=legacy - Use msgr1 on-the-wire protocol (since 5.11).
 
 * ms_mode=crc - Use msgr2.1 on-the-wire protocol, select 'crc' mode, also
   referred to as plain mode (since 5.11).  If the daemon denies 'crc' mode,
@@ -907,8 +911,8 @@ Per mapping (block device) `rbd device map` options:
   fail the connection.
 
 * ms_mode=prefer-crc - Use msgr2.1 on-the-wire protocol, select 'crc'
-  mode (since 5.11).  If the daemon denies 'crc' mode in favor of 'secure'
-  mode, agree to 'secure' mode.
+  mode (since 5.11, default).  If the daemon denies 'crc' mode in favor of
+  'secure' mode, agree to 'secure' mode.
 
 * ms_mode=prefer-secure - Use msgr2.1 on-the-wire protocol, select 'secure'
   mode (since 5.11).  If the daemon denies 'secure' mode in favor of 'crc'
@@ -1037,7 +1041,7 @@ To restore an image from trash and rename it::
 
 To create a mirror snapshot schedule for an image::
 
-       rbd mirror snapshot schedule add --pool mypool --image myimage 12h 14:00:00-05:00
+       rbd mirror snapshot schedule add --pool mypool --image myimage 12h 2020-01-14T11:30+05:30
 
 Availability
 ============

@@ -1,5 +1,5 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
 
 #include "BitmapFreelistManager.h"
 
@@ -9,6 +9,7 @@
 #include "include/stringify.h"
 
 #include "common/debug.h"
+#include "common/strtol.h" // for strict_iecstrtoll()
 
 #define dout_context cct
 #define dout_subsys ceph_subsys_bluestore
@@ -115,7 +116,7 @@ int BitmapFreelistManager::create(uint64_t new_size, uint64_t granularity,
 
 int BitmapFreelistManager::_expand(uint64_t old_size, KeyValueDB* db)
 {
-  assert(old_size < size);
+  ceph_assert(old_size < size);
   ceph_assert(std::has_single_bit(bytes_per_block));
 
   KeyValueDB::Transaction txn;
@@ -160,6 +161,15 @@ int BitmapFreelistManager::_expand(uint64_t old_size, KeyValueDB* db)
   db->submit_transaction_sync(txn);
 
   return 0;
+}
+
+int BitmapFreelistManager::expand(uint64_t new_size, KeyValueDB* db){
+  if (new_size == size){
+    return 0;
+  }
+  uint64_t old_size = size;
+  size = new_size;
+  return _expand(old_size ,db);
 }
 
 int BitmapFreelistManager::read_size_meta_from_db(KeyValueDB* kvdb,

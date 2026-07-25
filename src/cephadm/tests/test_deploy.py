@@ -316,7 +316,7 @@ def test_deploy_a_monitoring_container(cephadm_fs, funkypatch):
         runfile_lines = f.read().splitlines()
     assert 'podman' in runfile_lines[-1]
     assert runfile_lines[-1].endswith(
-        'quay.io/titans/prometheus:latest --config.file=/etc/prometheus/prometheus.yml --storage.tsdb.path=/prometheus --storage.tsdb.retention.time=15d --storage.tsdb.retention.size=0 --web.external-url=http://10.10.10.10:9095 --web.listen-address=1.2.3.4:9095'
+        'quay.io/titans/prometheus:latest --config.file=/etc/prometheus/prometheus.yml --storage.tsdb.path=/prometheus --web.listen-address=1.2.3.4:9095 --storage.tsdb.retention.time=15d --storage.tsdb.retention.size=0 --web.external-url=http://10.10.10.10:9095'
     )
     assert '--user 8765' in runfile_lines[-1]
     assert f'-v /var/lib/ceph/{fsid}/prometheus.fire/etc/prometheus:/etc/prometheus:Z' in runfile_lines[-1]
@@ -444,6 +444,31 @@ def test_deploy_ceph_osd_container(cephadm_fs, funkypatch):
     assert _make_run_dir.call_count == 1
     assert _make_run_dir.call_args[0][1] == 8765
     assert _make_run_dir.call_args[0][2] == 8765
+
+
+def test_deploy_ceph_osd_container_crimson(cephadm_fs, funkypatch):
+    mocks = _common_patches(funkypatch)
+    _make_run_dir = funkypatch.patch('cephadmlib.file_utils.make_run_dir')
+    fsid = 'b01dbeef-701d-9abe-0000-e1e5a47004a7'
+    with with_cephadm_ctx([]) as ctx:
+        ctx.container_engine = mock_podman()
+        ctx.fsid = fsid
+        ctx.name = 'osd.quux'
+        ctx.image = 'quay.io/ceph/ceph:latest'
+        ctx.reconfig = False
+        ctx.allow_ptrace = False
+        ctx.osd_fsid = '00000000-0000-0000-0000-000000000000'
+        ctx.config_blobs = {
+            'config': 'XXXXXXX',
+            'keyring': 'YYYYYY',
+            'osd_type': 'crimson',
+        }
+        _cephadm._common_deploy(ctx)
+
+    basedir = pathlib.Path(f'/var/lib/ceph/{fsid}/osd.quux')
+    with open(basedir / 'unit.run') as f:
+        runfile_lines = f.read().splitlines()
+    assert '--entrypoint /usr/bin/ceph-osd-crimson' in runfile_lines[-1]
 
 
 def test_deploy_ceph_exporter_container(cephadm_fs, funkypatch):

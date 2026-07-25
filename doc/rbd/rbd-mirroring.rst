@@ -66,6 +66,9 @@ These pool configuration steps should be performed on both peer clusters. These
 procedures assume that both clusters, named "site-a" and "site-b", are accessible
 from a single host for clarity.
 
+The pool must have the same name on both peer clusters. See :ref:`Renaming a
+Pool<rados_renaming_a_pool>` for instructions on renaming pools.
+
 See the `rbd`_ manpage for additional details of how to connect to different
 Ceph clusters.
 
@@ -87,12 +90,20 @@ site name to describe the local cluster::
 
         rbd mirror pool enable [--site-name {local-site-name}] {pool-name} {mode}
 
-The mirroring mode can either be ``image`` or ``pool``:
+The mirroring mode can be ``image``, ``pool`` or ``init-only``:
 
-* **image**: When configured in ``image`` mode, mirroring must
-  `explicitly enabled`_ on each image.
-* **pool** (default):  When configured in ``pool`` mode, all images in the pool
-  with the journaling feature enabled are mirrored.
+* **image**: When configured in ``image`` mode, mirroring must be
+  `explicitly enabled`_ for each intended image in the default namespace
+  of the pool. Other namespaces aren't affected and must be
+  `configured separately`_.
+* **pool**: When configured in ``pool`` mode, all images in the default
+  namespace of the pool with the journaling feature enabled are mirrored.
+  Other namespaces aren't affected and must be `configured separately`_.
+* **init-only**: When configured in ``init-only`` mode, no images in the
+  default namespace of the pool will be mirrored but other namespaces can
+  still be configured. This is needed to allow some other namespace to be
+  mirrored to the default namespace of the remote pool but can be useful
+  on its own as well.
 
 For example::
 
@@ -237,9 +248,11 @@ pool as follows:
 Namespace Configuration
 =======================
 
-Mirroring can be configured on a namespace in a pool. The pool must already
-have been configured for mirroring. The namespace can be mirrored to a namespace
-with the same or a different name in the remote pool.
+Mirroring can be enabled on non-default namespaces of a pool independent of
+the default namespace. The pool must be configured for mirroring in advance.
+A given namespace can be mirrored to a namespace with the same or a different
+name in the remote pool, including to the default namespace (referred to as
+``''`` or ``""``).
 
 Enable Mirroring
 ----------------
@@ -252,9 +265,9 @@ remote namespace name::
 
 The mirroring mode can either be ``image`` or ``pool``:
 
-* **image**: When configured in ``image`` mode, mirroring must
-  `explicitly enabled`_ on each image.
-* **pool** (default):  When configured in ``pool`` mode, all images in the namespace
+* **image**: When configured in ``image`` mode, mirroring must be
+  `explicitly enabled`_ for each intended image in the namespace.
+* **pool**: When configured in ``pool`` mode, all images in the namespace
   with the journaling feature enabled are mirrored.
 
 For example::
@@ -262,12 +275,29 @@ For example::
         $ rbd --cluster site-a mirror pool enable image-pool/namespace-a image --remote-namespace namespace-b
         $ rbd --cluster site-b mirror pool enable image-pool/namespace-b image --remote-namespace namespace-a
 
-This will set up image mode mirroring between image-pool/namespace-a on cluster
-site-a and image-pool/namespace-b on cluster site-b.
-The namespace and remote-namespace pair configured on a cluster must
+This will set up image mode mirroring between ``image-pool/namespace-a`` on
+cluster ``site-a`` and ``image-pool/namespace-b`` on cluster ``site-b``.
+The namespace and remote-namespace pair configured on a local cluster must
 match the remote-namespace and namespace respectively on the remote cluster.
 If the ``--remote-namespace`` option is not provided, the namespace will be
 mirrored to a namespace with the same name in the remote pool.
+
+To set up pool mode mirroring between ``image-pool`` (default namespace) on
+cluster ``site-a`` and ``image-pool/namespace-c`` on cluster ``site-b``::
+
+        $ rbd --cluster site-a mirror pool enable image-pool pool --remote-namespace namespace-c
+        $ rbd --cluster site-b mirror pool enable image-pool init-only
+        $ rbd --cluster site-b mirror pool enable image-pool/namespace-c pool --remote-namespace ""
+
+To set up pool mode mirroring between ``image-pool`` (default namespace) on
+cluster ``site-a`` and ``image-pool/namespace-d`` on cluster ``site-b`` and
+at the same time image mode mirroring between ``image-pool`` (default namespace)
+on cluster ``site-b`` and ``image-pool/namespace-e`` on cluster ``site-a``::
+
+        $ rbd --cluster site-a mirror pool enable image-pool pool --remote-namespace namespace-d
+        $ rbd --cluster site-a mirror pool enable image-pool/namespace-e image --remote-namespace ""
+        $ rbd --cluster site-b mirror pool enable image-pool image --remote-namespace namespace-e
+        $ rbd --cluster site-b mirror pool enable image-pool/namespace-d pool --remote-namespace ""
 
 Disable Mirroring
 -----------------
@@ -391,6 +421,10 @@ globally, per-pool, or per-image levels. Multiple mirror-snapshot schedules can
 be defined at any level, but only the most-specific snapshot schedules that
 match an individual mirrored image will run.
 
+When multiple images share the same schedule interval and no explicit
+``start-time`` is defined, snapshot creation is automatically staggered across
+the interval to reduce scheduling spikes.
+
 To create a mirror-snapshot schedule with ``rbd``, specify the
 ``mirror snapshot schedule add`` command along with an optional pool or
 image name; interval; and optional start time::
@@ -398,10 +432,11 @@ image name; interval; and optional start time::
         rbd mirror snapshot schedule add [--pool {pool-name}] [--image {image-name}] {interval} [{start-time}]
 
 The ``interval`` can be specified in days, hours, or minutes using ``d``, ``h``,
-``m`` suffix respectively. The optional ``start-time`` can be specified using
-the ISO 8601 time format. For example::
+``m`` suffix respectively. The optional ``start-time`` must be specified in
+the ISO 8601 time format. If no UTC offset is provided, UTC is assumed. For
+example::
 
-        $ rbd --cluster site-a mirror snapshot schedule add --pool image-pool 24h 14:00:00-05:00
+        $ rbd --cluster site-a mirror snapshot schedule add --pool image-pool 24h 2020-01-14T11:30+05:30
         $ rbd --cluster site-a mirror snapshot schedule add --pool image-pool --image image1 6h
 
 To remove a mirror-snapshot schedules with ``rbd``, specify the
@@ -411,12 +446,13 @@ corresponding ``add`` schedule command.
 To list all snapshot schedules for a specific level (global, pool, or image)
 with ``rbd``, specify the ``mirror snapshot schedule ls`` command along with
 an optional pool or image name. Additionally, the ``--recursive`` option can
-be specified to list all schedules at the specified level and below. For
-example::
+be specified to list all schedules at the specified level and below.
+
+Schedule start times are always displayed in UTC. For example::
 
         $ rbd --cluster site-a mirror snapshot schedule ls --pool image-pool --recursive
         POOL        NAMESPACE IMAGE  SCHEDULE                            
-        image-pool  -         -      every 1d starting at 14:00:00-05:00 
+        image-pool  -         -      every 1d starting at 2020-01-14 06:00:00
         image-pool            image1 every 6h                            
 
 To view the status for when the next snapshots will be created for
@@ -426,11 +462,12 @@ image name::
 
         rbd mirror snapshot schedule status [--pool {pool-name}] [--image {image-name}]
 
-For example::
+The next schedule time is always displayed in UTC. For example::
 
         $ rbd --cluster site-a mirror snapshot schedule status
         SCHEDULE TIME       IMAGE             
-        2020-02-26 18:00:00 image-pool/image1 
+        2026-01-24 06:00:00 image-pool/image1
+
 
 Disable Image Mirroring
 -----------------------
@@ -521,6 +558,10 @@ For example::
    local cluster's ``rbd-mirror`` daemon process is responsible for performing
    the resync asynchronously.
 
+.. note:: For snapshot-based mirroring, resync replicates the image contents
+   only up to the most recent mirror-snapshot. Create a new mirror-snapshot on
+   the primary image to sync the latest updates.
+
 Mirror Status
 =============
 
@@ -584,6 +625,7 @@ The ``rbd-mirror`` can also be run in foreground by ``rbd-mirror`` command::
 .. _rbd: ../../man/8/rbd
 .. _ceph-conf: ../../rados/configuration/ceph-conf/#running-multiple-clusters
 .. _explicitly enabled: #enable-image-mirroring
+.. _configured separately: #namespace-configuration
 .. _bootstrap token: #bootstrap-peers
 .. _force resync command: #force-image-resync
 .. _demote the image: #image-promotion-and-demotion

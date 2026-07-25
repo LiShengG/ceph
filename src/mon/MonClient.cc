@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*- 
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*- 
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph - scalable distributed file system
  *
@@ -51,6 +52,7 @@
 #include "MonClient.h"
 #include "error_code.h"
 #include "MonMap.h"
+#include "mon_types.h" // for ceph::features::mon::*
 
 #include "auth/Auth.h"
 #include "auth/KeyRing.h"
@@ -62,6 +64,7 @@
 #undef dout_prefix
 #define dout_prefix *_dout << "monclient" << (_hunting() ? "(hunting)":"") << ": "
 
+namespace asio = boost::asio;
 namespace bs = boost::system;
 using std::string;
 using namespace std::literals;
@@ -316,6 +319,12 @@ bool MonClient::ms_dispatch(Message *m)
 
   std::lock_guard lock(monc_lock);
 
+  if (stopping) {
+    ldout(cct, 5) << " dropping because stopping: " << *m << dendl;
+    m->put();
+    return true;
+  }
+
   if (!m->get_connection()->is_anon() &&
       m->get_source().type() == CEPH_ENTITY_TYPE_MON) {
     if (_hunting()) {
@@ -486,11 +495,13 @@ int MonClient::init()
 {
   ldout(cct, 10) << __func__ << dendl;
 
+  std::lock_guard l(monc_lock);
+  stopping = false;
+
   entity_name = cct->_conf->name;
 
   auth_registry.refresh_config();
 
-  std::lock_guard l(monc_lock);
   keyring.reset(new KeyRing);
   if (auth_registry.is_supported_method(messenger->get_mytype(),
 					CEPH_AUTH_CEPHX)) {
@@ -534,10 +545,11 @@ void MonClient::shutdown()
   monc_lock.lock();
   stopping = true;
   while (!version_requests.empty()) {
-    ceph::async::post(std::move(version_requests.begin()->second),
-		      monc_errc::shutting_down, 0, 0);
     ldout(cct, 20) << __func__ << " canceling and discarding version request "
 		   << version_requests.begin()->first << dendl;
+    asio::post(service.get_executor(),
+               asio::append(std::move(version_requests.begin()->second),
+                            make_error_code(monc_errc::shutting_down), 0, 0));
     version_requests.erase(version_requests.begin());
   }
   while (!mon_commands.empty()) {
@@ -563,7 +575,6 @@ void MonClient::shutdown()
   }
   monc_lock.lock();
   timer.shutdown();
-  stopping = false;
   monc_lock.unlock();
 }
 
@@ -710,7 +721,7 @@ void MonClient::_finish_auth(int auth_err)
     ceph_assert(auth);
     _check_auth_tickets();
   } else if (auth_err == -EAGAIN && !active_con) {
-    ldout(cct,10) << __func__ 
+    ldout(cct,10) << __func__
                   << " auth returned EAGAIN, reopening the session to try again"
                   << dendl;
     _reopen_session();
@@ -767,8 +778,11 @@ void MonClient::_reopen_session(int rank)
 
   // throw out version check requests
   while (!version_requests.empty()) {
-    ceph::async::post(std::move(version_requests.begin()->second),
-		      monc_errc::session_reset, 0, 0);
+    ldout(cct, 20) << __func__ << " canceling and discarding version request "
+		   << version_requests.begin()->first << dendl;
+    asio::post(service.get_executor(),
+               asio::append(std::move(version_requests.begin()->second),
+                            make_error_code(monc_errc::session_reset), 0, 0));
     version_requests.erase(version_requests.begin());
   }
 
@@ -962,6 +976,11 @@ void MonClient::_finish_hunting(int auth_err)
 void MonClient::tick()
 {
   ldout(cct, 10) << __func__ << dendl;
+
+  if (stopping) {
+    ldout(cct, 1) << "skipping tick on shutdown" << dendl;
+    return;
+  }
 
   utime_t now = ceph_clock_now();
 
@@ -1163,12 +1182,31 @@ int MonClient::wait_auth_rotating(double timeout)
 
 // ---------
 
+MonClient::MonCommand::MonCommand(MonClient& monc, uint64_t t, CommandCompletion&& onfinish)
+  : tid(t), onfinish(std::move(onfinish)) {
+  auto timeout =
+      monc.cct->_conf.get_val<std::chrono::seconds>("rados_mon_op_timeout");
+  if (timeout.count() > 0) {
+    cancel_timer.emplace(monc.service, timeout);
+    cancel_timer->async_wait(
+      [this, &monc](boost::system::error_code ec) {
+        if (ec)
+          return;
+        std::scoped_lock l(monc.monc_lock);
+        monc._cancel_mon_command(tid);
+      });
+  }
+}
+
+MonClient::MonCommand::~MonCommand() = default;
+
 void MonClient::_send_command(MonCommand *r)
 {
   if (r->is_tell()) {
     ++r->send_attempts;
     if (r->send_attempts > cct->_conf->mon_client_directed_command_retry) {
-      _finish_command(r, monc_errc::mon_unavailable, "mon unavailable", {});
+      _finish_command(r, make_error_code(monc_errc::mon_unavailable),
+		      "mon unavailable", {});
       return;
     }
     // tell-style command
@@ -1180,7 +1218,8 @@ void MonClient::_send_command(MonCommand *r)
 	if (r->target_rank >= (int)monmap.size()) {
 	  ldout(cct, 10) << " target " << r->target_rank
 			 << " >= max mon " << monmap.size() << dendl;
-	  _finish_command(r, monc_errc::rank_dne, "mon rank dne"sv, {});
+	  _finish_command(r, make_error_code(monc_errc::rank_dne),
+			  "mon rank dne"sv, {});
 	  return;
 	}
 	r->target_con = messenger->connect_to_mon(
@@ -1189,7 +1228,8 @@ void MonClient::_send_command(MonCommand *r)
 	if (!monmap.contains(r->target_name)) {
 	  ldout(cct, 10) << " target " << r->target_name
 			 << " not present in monmap" << dendl;
-	  _finish_command(r, monc_errc::mon_dne, "mon dne"sv, {});
+	  _finish_command(r, make_error_code(monc_errc::mon_dne),
+			  "mon dne"sv, {});
 	  return;
 	}
 	r->target_con = messenger->connect_to_mon(
@@ -1224,7 +1264,8 @@ void MonClient::_send_command(MonCommand *r)
       if (r->target_rank >= (int)monmap.size()) {
 	ldout(cct, 10) << " target " << r->target_rank
 		       << " >= max mon " << monmap.size() << dendl;
-	_finish_command(r, monc_errc::rank_dne, "mon rank dne"sv, {});
+	_finish_command(r, make_error_code(monc_errc::rank_dne),
+			"mon rank dne"sv, {});
 	return;
       }
       _reopen_session(r->target_rank);
@@ -1239,7 +1280,8 @@ void MonClient::_send_command(MonCommand *r)
       if (!monmap.contains(r->target_name)) {
 	ldout(cct, 10) << " target " << r->target_name
 		       << " not present in monmap" << dendl;
-	_finish_command(r, monc_errc::mon_dne, "mon dne"sv, {});
+	_finish_command(r, make_error_code(monc_errc::mon_dne),
+			"mon dne"sv, {});
 	return;
       }
       _reopen_session(monmap.get_rank(r->target_name));
@@ -1249,6 +1291,7 @@ void MonClient::_send_command(MonCommand *r)
   }
 
   // normal CLI command
+  r->sent_name = active_con ? monmap.get_name(active_con->get_con()->get_peer_addr()) : "";
   ldout(cct, 10) << __func__ << " " << r->tid << " " << r->cmd << dendl;
   auto m = ceph::make_message<MMonCommand>(monmap.fsid);
   m->set_tid(r->tid);
@@ -1286,6 +1329,25 @@ void MonClient::_resend_mon_commands()
       // starting with octopus, tell commands use their own connetion and need no
       // special resend when we finish hunting.
     } else {
+      if (!cct->_conf->mon_client_hunt_on_resend) {
+        // Ensure the target name of the resend mon command matches the rank
+        // of the current active connection.
+        ldout(cct, 20) << __func__ << " " << cmd->tid << " " << cmd->cmd
+                       << " last sent_name " << cmd->sent_name << dendl;
+        if (!monmap.contains(cmd->sent_name)) {
+          ldout(cct, 20) << __func__ << " " << cmd->tid << " " << cmd->cmd
+                        << " sent_name " << cmd->sent_name << " not in monmap using mon:" <<
+                        monmap.get_name(active_con->get_con()->get_peer_addr()) << dendl;
+        } else if (active_con && cmd->sent_name.length() &&
+                   cmd->sent_name != monmap.get_name(active_con->get_con()->get_peer_addr()) &&
+                   monmap.contains(cmd->sent_name)) {
+          ldout(cct, 20) << __func__ << " " << cmd->tid << " " << cmd->cmd
+                         << " wants mon " << cmd->sent_name
+                         << " current connection is " << monmap.get_name(active_con->get_con()->get_peer_addr())
+                         << ", reopening session" << dendl;
+          _reopen_session(monmap.get_rank(cmd->sent_name));
+        }
+      }
       _send_command(cmd); // might remove cmd from mon_commands
     }
   }
@@ -1344,6 +1406,57 @@ void MonClient::handle_command_reply(MCommandReply *reply)
   reply->put();
 }
 
+class MonClient::ContextVerter {
+  std::string* outs;
+  ceph::bufferlist* outbl;
+  Context* onfinish;
+
+public:
+  ContextVerter(std::string* outs, ceph::bufferlist* outbl, Context* onfinish)
+    : outs(outs), outbl(outbl), onfinish(onfinish) {}
+  ~ContextVerter() = default;
+  ContextVerter(const ContextVerter&) = default;
+  ContextVerter& operator =(const ContextVerter&) = default;
+  ContextVerter(ContextVerter&&) = default;
+  ContextVerter& operator =(ContextVerter&&) = default;
+
+  void operator()(boost::system::error_code e,
+		  std::string s,
+		  ceph::bufferlist bl) {
+    if (outs)
+      *outs = std::move(s);
+    if (outbl)
+      *outbl = std::move(bl);
+    if (onfinish)
+      onfinish->complete(ceph::from_error_code(e));
+  }
+};
+
+void MonClient::start_mon_command(std::vector<std::string>&& cmd, bufferlist&& inbl,
+				  bufferlist *outbl, std::string *outs,
+				  Context *onfinish)
+{
+  start_mon_command(std::move(cmd), std::move(inbl),
+		    ContextVerter(outs, outbl, onfinish));
+}
+
+void MonClient::start_mon_command(int mon_rank, std::vector<std::string>&& cmd,
+				  bufferlist&& inbl, bufferlist *outbl, std::string *outs,
+				  Context *onfinish)
+{
+  start_mon_command(mon_rank, std::move(cmd), std::move(inbl),
+		    ContextVerter(outs, outbl, onfinish));
+}
+
+void MonClient::start_mon_command(std::string&& mon_name,  ///< mon name, with mon. prefix
+				  std::vector<std::string>&& cmd, bufferlist&& inbl,
+				  bufferlist *outbl, std::string *outs,
+				  Context *onfinish)
+{
+  start_mon_command(std::move(mon_name), std::move(cmd), std::move(inbl),
+		    ContextVerter(outs, outbl, onfinish));
+}
+
 int MonClient::_cancel_mon_command(uint64_t tid)
 {
   ceph_assert(ceph_mutex_is_locked(monc_lock));
@@ -1357,7 +1470,8 @@ int MonClient::_cancel_mon_command(uint64_t tid)
   ldout(cct, 10) << __func__ << " tid " << tid << dendl;
 
   MonCommand *cmd = it->second;
-  _finish_command(cmd, monc_errc::timed_out, "timed out"sv, {});
+  _finish_command(cmd, make_error_code(monc_errc::timed_out),
+		  "timed out"sv, {});
   return 0;
 }
 
@@ -1366,8 +1480,9 @@ void MonClient::_finish_command(MonCommand *r, bs::error_code ret,
 {
   ldout(cct, 10) << __func__ << " " << r->tid << " = " << ret << " " << rs
 		 << dendl;
-  ceph::async::post(std::move(r->onfinish), ret, std::string(rs),
-		    std::move(bl));
+  asio::post(service.get_executor(),
+	     asio::append(std::move(r->onfinish), ret, std::string(rs),
+			  std::move(bl)));
   if (r->target_con) {
     r->target_con->mark_down();
   }
@@ -1389,8 +1504,9 @@ void MonClient::handle_get_version_reply(MMonGetVersionReply* m)
     ldout(cct, 10) << __func__ << " finishing " << iter->first << " version "
 		   << m->version << dendl;
     version_requests.erase(iter);
-    ceph::async::post(std::move(req), bs::error_code(),
-		      m->version, m->oldest_version);
+    asio::post(service.get_executor(),
+	       asio::append(std::move(req), bs::error_code(),
+			    m->version, m->oldest_version));
   }
   m->put();
 }
@@ -1405,6 +1521,11 @@ int MonClient::get_auth_request(
   std::lock_guard l(monc_lock);
   ldout(cct,10) << __func__ << " con " << con << " auth_method " << *auth_method
 		<< dendl;
+
+  if (stopping) {
+    ldout(cct, 5) << __func__ << " dropping because stopping" << dendl;
+    return -ECANCELED;
+  }
 
   // connection to mon?
   if (con->get_peer_type() == CEPH_ENTITY_TYPE_MON) {
@@ -1455,6 +1576,11 @@ int MonClient::handle_auth_reply_more(
 {
   std::lock_guard l(monc_lock);
 
+  if (stopping) {
+    ldout(cct, 5) << __func__ << " dropping because stopping" << dendl;
+    return -ECANCELED;
+  }
+
   if (con->get_peer_type() == CEPH_ENTITY_TYPE_MON) {
     if (con->is_anon()) {
       for (auto& i : mon_commands) {
@@ -1491,8 +1617,14 @@ int MonClient::handle_auth_done(
   CryptoKey *session_key,
   std::string *connection_secret)
 {
+  std::lock_guard l(monc_lock);
+
+  if (stopping) {
+    ldout(cct, 5) << __func__ << " dropping because stopping" << dendl;
+    return -ECANCELED;
+  }
+
   if (con->get_peer_type() == CEPH_ENTITY_TYPE_MON) {
-    std::lock_guard l(monc_lock);
     if (con->is_anon()) {
       for (auto& i : mon_commands) {
 	if (i.second->target_con == con) {
@@ -1547,9 +1679,15 @@ int MonClient::handle_auth_bad_method(
   const std::vector<uint32_t>& allowed_methods,
   const std::vector<uint32_t>& allowed_modes)
 {
+  std::lock_guard l(monc_lock);
+
+  if (stopping) {
+    ldout(cct, 5) << __func__ << " dropping because stopping" << dendl;
+    return -ECANCELED;
+  }
+
   auth_meta->allowed_methods = allowed_methods;
 
-  std::lock_guard l(monc_lock);
   if (con->get_peer_type() == CEPH_ENTITY_TYPE_MON) {
     if (con->is_anon()) {
       for (auto& i : mon_commands) {
@@ -1605,6 +1743,13 @@ int MonClient::handle_auth_request(
   const ceph::buffer::list& payload,
   ceph::buffer::list *reply)
 {
+  std::lock_guard l(monc_lock);
+
+  if (stopping) {
+    ldout(cct, 5) << __func__ << " dropping because stopping" << dendl;
+    return -ECANCELED;
+  }
+
   if (payload.length() == 0) {
     // for some channels prior to nautilus (osd heartbeat), we
     // tolerate the lack of an authorizer.
@@ -1841,7 +1986,7 @@ int MonConnection::handle_auth_bad_method(
   auth_registry->get_supported_methods(con->get_peer_type(), &auth_supported);
   auto p = std::find(auth_supported.begin(), auth_supported.end(),
 		     old_auth_method);
-  assert(p != auth_supported.end());
+  ceph_assert(p != auth_supported.end());
   p = std::find_first_of(std::next(p), auth_supported.end(),
 			 allowed_methods.begin(), allowed_methods.end());
   if (p == auth_supported.end()) {

@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph - scalable distributed file system
  *
@@ -14,6 +15,7 @@
 
 #include <fcntl.h>
 #include <glob.h>
+#include <kv/KeyValueDB.h>
 #include <stdio.h>
 #include <string.h>
 #include <iostream>
@@ -41,11 +43,11 @@
 #include "common/Cond.h"
 #include "common/debug.h"
 #include "common/errno.h"
+#include "common/JSONFormatter.h"
 #include "common/options.h" // for the size literals
 #include "common/pretty_binary.h"
 #include "include/stringify.h"
 #include "include/coredumpctl.h"
-#include "include/unordered_map.h"
 #include "os/kv.h"
 #include "store_test_fixture.h"
 
@@ -200,22 +202,42 @@ protected:
   }
 };
 
+#ifdef WITH_BLUESTORE
 
-class MultiLabelTest : public StoreTestDeferredSetup {
-  public:
-  std::string get_data_dir() {
-    return data_dir;
-  }
+
+class CheckedUmount: public StoreTestDeferredSetup {
+public:
   bool mounted = false;
-  int mount() {
+  virtual int mount() {
     int r = store->mount();
     if (r == 0) mounted = true;
     return r;
   }
-  void umount() {
+  virtual void umount() {
     ASSERT_TRUE(mounted);
     store->umount();
     mounted = false;
+  }
+
+protected:
+  void DeferredSetup() {
+    StoreTest::SetUp();
+    mounted = true;
+  }
+  void TearDown() override {
+    if (mounted) {
+      store->umount();
+    }
+    StoreTest::RemoveTestObjectStore();
+    store = nullptr;
+    StoreTest::TearDown();
+  }
+};
+
+class MultiLabelTest : public CheckedUmount {
+  public:
+  std::string get_data_dir() {
+    return data_dir;
   }
   bool bdev_supports_label() {
     BlueStore* bstore = dynamic_cast<BlueStore*> (store.get());
@@ -240,13 +262,7 @@ class MultiLabelTest : public StoreTestDeferredSetup {
   }
   bool read_bdev_label(bluestore_bdev_label_t* label, uint64_t position) {
     string bdev_path = get_data_dir() + "/block";
-    unique_ptr<BlockDevice> bdev(BlockDevice::create(
-      g_ceph_context, bdev_path, nullptr, nullptr, nullptr, nullptr));
-    int r = bdev->open(bdev_path);
-    if (r < 0)
-      return r;
-    r = BlueStore::debug_read_bdev_label(g_ceph_context, bdev.get(), bdev_path, label, position);
-    bdev->close();
+    int r = BlueStore::read_bdev_label_at_pos(g_ceph_context, bdev_path, position, label);
     return r;
   }
   bool write_bdev_label(const bluestore_bdev_label_t& label, uint64_t position) {
@@ -260,20 +276,207 @@ class MultiLabelTest : public StoreTestDeferredSetup {
     bdev->close();
     return r;
   }
-  protected:
-  void DeferredSetup() {
-    StoreTest::SetUp();
-    mounted = true;
+};
+
+class CorruptedOnodesTest : public CheckedUmount {
+public:
+  std::string get_data_dir() {
+    return data_dir;
   }
-  void TearDown() override {
-    if (mounted) {
-      store->umount();
+  int mount() override {
+    int r = store->mount();
+    if (r == 0) mounted = true;
+    return r;
+  }
+  void umount() override {
+    ASSERT_TRUE(mounted);
+    store->umount();
+    mounted = false;
+  }
+
+  int write_object(
+    coll_t cid,
+    ObjectStore::CollectionHandle ch,
+    ghobject_t hoid,
+    size_t size)
+  {
+    ObjectStore::Transaction t;
+    bufferlist bl;
+    bl.append(std::string(size, 'x'));
+    t.write(cid, hoid, 0, bl.length(), bl);
+    int r = queue_transaction(store, ch, std::move(t));
+    return r;
+  }
+
+  coll_t cid;
+  ObjectStore::CollectionHandle ch;
+
+  void prepare_store()
+  {
+    static constexpr uint64_t _1G = uint64_t(1024)*1024*1024;
+    static constexpr uint64_t _1M = uint64_t(1) * 1024 * 1024;
+    SetVal(g_conf(), "bluestore_block_size", stringify(101 * _1G).c_str());
+    g_conf().apply_changes(nullptr);
+    DeferredSetup();
+
+    cid = coll_t(spg_t(pg_t(1, 222), shard_id_t::NO_SHARD));
+
+    ghobject_t hoid1(hobject_t(sobject_t("aaaa_Object 1", CEPH_NOSNAP), "", 1, 222, ""));
+    ghobject_t hoid_special(hobject_t(sobject_t("my_special_object", CEPH_NOSNAP), "", 1, 222, ""));
+    ghobject_t hoid2(hobject_t(sobject_t("zzzz_Object 2", CEPH_NOSNAP), "", 1, 222, ""));
+    //set hashes to have special object in the middle
+    hoid1.hobj.       set_hash(0x00000000); //0
+    hoid_special.hobj.set_hash(0x80000000); //1
+    hoid2.hobj.       set_hash(0x40000000); //2
+
+    ch = store->create_new_collection(cid);
+    {
+      ObjectStore::Transaction t;
+      t.create_collection(cid, 0);
+      int r = queue_transaction(store, ch, std::move(t));
+      ASSERT_EQ(r, 0);
     }
-    StoreTest::RemoveTestObjectStore();
-    store = nullptr;
-    StoreTest::TearDown();
+
+    write_object(cid, ch, hoid1, 4 * _1M);
+    write_object(cid, ch, hoid_special, 4 * _1M);
+    write_object(cid, ch, hoid2, 4 * _1M);
+
+    ch.reset();
+    umount();
+  }
+
+  void cleanup_store()
+  {
+    ghobject_t hoid1(hobject_t(sobject_t("aaaa_Object 1", CEPH_NOSNAP),"", 1, 222,""));
+    ghobject_t hoid_special(hobject_t(sobject_t("my_special_object", CEPH_NOSNAP),"", 1, 222,""));
+    ghobject_t hoid2(hobject_t(sobject_t("zzzz_Object 2", CEPH_NOSNAP),"", 1, 222,""));
+    mount();
+    ch = store->open_collection(cid);
+    {
+      ObjectStore::Transaction t;
+      t.remove(cid, hoid1);
+      t.remove(cid, hoid_special);
+      t.remove(cid, hoid2);
+      t.remove_collection(cid);
+      int r = queue_transaction(store, ch, std::move(t));
+      ASSERT_EQ(r, 0);
+    }
+    ch.reset();
+    umount();
   }
 };
+
+class UnsharingBlobsOnRemove : public CheckedUmount {
+public:
+  struct MyCond : public C_SaferCond {
+    void reset() {
+      done = false;
+    }
+  };
+
+  std::string get_data_dir() {
+    return data_dir;
+  }
+ 
+  void write_object(
+    ghobject_t hoid,
+    size_t pos,
+    size_t size)
+  {
+    ObjectStore::Transaction t;
+    bufferlist bl;
+    bl.append(std::string(size, 'x'));
+    t.write(cid, hoid, pos, bl.length(), bl);
+    int r = queue_transaction(store, ch, std::move(t));
+    EXPECT_EQ(r, 0);
+  }
+
+  size_t count_shared_blob_trackers()
+  {
+    BlueStore* bstore = dynamic_cast<BlueStore*> (store.get());
+    auto* kv = bstore->get_kv();
+    // to be inline with BlueStore.cc
+    const string PREFIX_SHARED_BLOB = "X";
+    size_t cnt = 0;
+    auto it = kv->get_iterator(PREFIX_SHARED_BLOB);
+    ceph_assert(it);
+    for (it->lower_bound(string()); it->valid(); it->next()) {
+      ++cnt;
+    }
+    return cnt;
+  }
+
+  void commit_transaction()
+  {
+    t.register_on_commit(&mycond);
+    int r = queue_transaction(store, ch, std::move(t));
+    EXPECT_EQ(r, 0);
+    mycond.wait();
+    mycond.reset();
+    t = ObjectStore::Transaction();
+  }
+
+  BlueStore::OnodeRef get_onode(const coll_t& cid, const ghobject_t& hoid) {
+    BlueStore* bstore = dynamic_cast<BlueStore*> (store.get());
+    return bstore->debug_get_onode(cid, hoid);
+  }
+
+  size_t count_shared_blobs(BlueStore::OnodeRef o)
+  {
+    std::set<BlueStore::Blob*> visited;
+    size_t cnt = 0;
+    for (const auto& e : o->extent_map.extent_map) {
+      if (e.blob->get_blob().is_shared()) {
+        if (visited.emplace(e.blob.get()).second) {
+          cnt++;
+        }
+      }
+    }
+    return cnt;
+  }
+
+  coll_t cid;
+  ObjectStore::CollectionHandle ch;
+  uint16_t poolid;
+  ObjectStore::Transaction t;
+  MyCond mycond;
+  void prepare_store()
+  {
+    static constexpr uint64_t _1G = uint64_t(1024)*1024*1024;
+    SetVal(g_conf(), "bluestore_block_size", stringify(10 * _1G).c_str());
+    g_conf().apply_changes(nullptr);
+    DeferredSetup();
+    poolid = 1234;
+    cid = coll_t(spg_t(pg_t(1, poolid), shard_id_t::NO_SHARD));
+
+    ch = store->create_new_collection(cid);
+    {
+      ObjectStore::Transaction t;
+      t.create_collection(cid, 0);
+      int r = queue_transaction(store, ch, std::move(t));
+      ASSERT_EQ(r, 0);
+    }
+
+    ch.reset();
+    umount();
+  }
+
+  void cleanup_store()
+  {
+    mount();
+    ch = store->open_collection(cid);
+    {
+      ObjectStore::Transaction t;
+      t.remove_collection(cid);
+      int r = queue_transaction(store, ch, std::move(t));
+      ASSERT_EQ(r, 0);
+    }
+    ch.reset();
+    umount();
+  }
+};
+
+#endif // WITH_BLUESTORE
 
 class StoreTestSpecificAUSize : public StoreTestDeferredSetup {
 
@@ -757,20 +960,16 @@ TEST_P(StoreTest, FiemapHoles) {
     decode(m, p);
     cout << " got " << m << std::endl;
     ASSERT_TRUE(!m.empty());
-    // kstore always returns [0, object_size] regardless of offset and length
-    // FIXME: if fiemap logic in kstore is refined
-    if (string(GetParam()) != "kstore") {
-      ASSERT_GE(m[SKIP_STEP], 3u);
-      auto last = m.crbegin();
-      if (m.size() == 1) {
-        ASSERT_EQ(SKIP_STEP, last->first);
-      } else if (m.size() == MAX_EXTENTS - 2) {
-        for (uint64_t i = 1; i < MAX_EXTENTS - 1; i++) {
-	  ASSERT_TRUE(m.count(SKIP_STEP*i));
-	}
+    ASSERT_GE(m[SKIP_STEP], 3u);
+    auto last = m.crbegin();
+    if (m.size() == 1) {
+      ASSERT_EQ(SKIP_STEP, last->first);
+    } else if (m.size() == MAX_EXTENTS - 2) {
+      for (uint64_t i = 1; i < MAX_EXTENTS - 1; i++) {
+        ASSERT_TRUE(m.count(SKIP_STEP*i));
       }
-      ASSERT_GT(last->first + last->second, SKIP_STEP * (MAX_EXTENTS - 1));
     }
+    ASSERT_GT(last->first + last->second, SKIP_STEP * (MAX_EXTENTS - 1));
   }
   {
     ObjectStore::Transaction t;
@@ -1348,12 +1547,15 @@ void StoreTest::doCompressionTest()
   EXPECT_EQ(store->mount(), 0);
   ch = store->open_collection(cid);
   {
+    C_SaferCond c;
     ObjectStore::Transaction t;
     t.remove(cid, hoid);
     t.remove_collection(cid);
     cerr << "Cleaning" << std::endl;
+    t.register_on_commit(&c);
     r = queue_transaction(store, ch, std::move(t));
     ASSERT_EQ(r, 0);
+      c.wait();
   }
 }
 
@@ -1592,8 +1794,9 @@ TEST_P(StoreTestSpecificAUSize, ReproBug41901Test) {
   if(string(GetParam()) != "bluestore")
     return;
 
+  SetVal(g_conf(), "bluestore_write_v2", "false");
   SetVal(g_conf(), "bluestore_max_blob_size", "524288");
-  SetVal(g_conf(), "bluestore_debug_enforce_settings", "hdd");
+  SetVal(g_conf(), "bluestore_debug_enforce_settings", "hybrid");
   g_conf().apply_changes(nullptr);
   StartDeferred(65536);
 
@@ -1686,6 +1889,7 @@ TEST_P(StoreTestSpecificAUSize, ReproBug41901Test) {
 TEST_P(StoreTestSpecificAUSize, BluestoreStatFSTest) {
   if(string(GetParam()) != "bluestore")
     return;
+  SetVal(g_conf(), "bluestore_write_v2", "false");
   SetVal(g_conf(), "bluestore_block_db_path", "");
   StartDeferred(65536);
   SetVal(g_conf(), "bluestore_compression_mode", "force");
@@ -2216,6 +2420,7 @@ TEST_P(StoreTestSpecificAUSize, BluestoreStatFSTest) {
 TEST_P(StoreTestSpecificAUSize, BluestoreFragmentedBlobTest) {
   if(string(GetParam()) != "bluestore")
     return;
+  SetVal(g_conf(), "bluestore_write_v2", "false");
   SetVal(g_conf(), "bluestore_block_db_path", "");
   StartDeferred(0x10000);
 
@@ -3017,9 +3222,13 @@ TEST_P(StoreTest, SimpleAttrTest) {
   int r;
   coll_t cid;
   ghobject_t hoid(hobject_t(sobject_t("attr object 1", CEPH_NOSNAP)));
-  bufferlist val, val2;
+  bufferlist val, val2, val_exactly_10, empty_bl;
   val.append("value");
   val.append("value2");
+  bufferptr bp = bufferptr("0123456789abcdef", 0x10);
+  ASSERT_EQ(bp.length(), 0x10);
+  val_exactly_10.append(bp);
+  ASSERT_EQ(val_exactly_10.get_num_buffers(), 1);
   {
     auto ch = store->open_collection(cid);
     ASSERT_FALSE(ch);
@@ -3047,6 +3256,8 @@ TEST_P(StoreTest, SimpleAttrTest) {
     t.touch(cid, hoid);
     t.setattr(cid, hoid, "foo", val);
     t.setattr(cid, hoid, "bar", val2);
+    t.setattr(cid, hoid, "tiramisu", val_exactly_10);
+    t.setattr(cid, hoid, "empty", empty_bl);
     r = queue_transaction(store, ch, std::move(t));
     ASSERT_EQ(r, 0);
   }
@@ -3067,10 +3278,48 @@ TEST_P(StoreTest, SimpleAttrTest) {
     bl.append(bp);
     ASSERT_TRUE(bl_eq(val, bl));
 
+    r = store->getattr(ch, hoid, "tiramisu", bp);
+    ASSERT_EQ(0, r);
+    bufferlist bl1;
+    bl1.append(bp);
+    ASSERT_TRUE(bl_eq(val_exactly_10, bl1));
+
+    r = store->getattr(ch, hoid, "empty", bp);
+    ASSERT_EQ(0, r);
+    EXPECT_EQ(bp.length(), 0);
+
     map<string,bufferptr,less<>> bm;
     r = store->getattrs(ch, hoid, bm);
     ASSERT_EQ(0, r);
+  }
+  ch.reset();
+  EXPECT_EQ(store->umount(), 0);
+  EXPECT_EQ(store->mount(), 0);
+  ch = store->open_collection(cid);
+  {
+    bufferptr bp;
+    r = store->getattr(ch, hoid, "nofoo", bp);
+    ASSERT_EQ(-ENODATA, r);
 
+    r = store->getattr(ch, hoid, "foo", bp);
+    ASSERT_EQ(0, r);
+    bufferlist bl;
+    bl.append(bp);
+    ASSERT_TRUE(bl_eq(val, bl));
+
+    r = store->getattr(ch, hoid, "tiramisu", bp);
+    ASSERT_EQ(0, r);
+    bufferlist bl1;
+    bl1.append(bp);
+    ASSERT_TRUE(bl_eq(val_exactly_10, bl1));
+
+    r = store->getattr(ch, hoid, "empty", bp);
+    ASSERT_EQ(0, r);
+    EXPECT_EQ(bp.length(), 0);
+
+    map<string,bufferptr,less<>> bm;
+    r = store->getattrs(ch, hoid, bm);
+    ASSERT_EQ(0, r);
   }
   {
     ObjectStore::Transaction t;
@@ -3710,23 +3959,18 @@ TEST_P(StoreTest, OmapSimple) {
     ASSERT_EQ(r.size(), km.size());
     cout << "r: " << r << std::endl;
   }
-  // test iterator with seek_to_first
+  // test iterator with initial lower_bound. when an empty
+  // string is passed, lower_bound() becomes an alias
+  // to seek_to_first().
   {
     map<string,bufferlist> r;
-    ObjectMap::ObjectMapIterator iter = store->get_omap_iterator(ch, hoid);
-    for (iter->seek_to_first(); iter->valid(); iter->next()) {
-      r[iter->key()] = iter->value();
-    }
-    cout << "r: " << r << std::endl;
-    ASSERT_EQ(r.size(), km.size());
-  }
-  // test iterator with initial lower_bound
-  {
-    map<string,bufferlist> r;
-    ObjectMap::ObjectMapIterator iter = store->get_omap_iterator(ch, hoid);
-    for (iter->lower_bound(string()); iter->valid(); iter->next()) {
-      r[iter->key()] = iter->value();
-    }
+    store->omap_iterate(
+      ch, hoid,
+      ObjectStore::omap_iter_seek_t::min_lower_bound(),
+      [&r] (std::string_view key, std::string_view value) mutable {
+        r[std::string{key}].append(value);
+        return ObjectStore::omap_iter_ret_t::NEXT;
+      });
     cout << "r: " << r << std::endl;
     ASSERT_EQ(r.size(), km.size());
   }
@@ -3853,6 +4097,164 @@ TEST_P(StoreTest, SimpleCloneRangeTest) {
 }
 
 #if defined(WITH_BLUESTORE)
+TEST_P(StoreTest, BlueStoreReconstructAllocationsTest)
+{
+  if (string(GetParam()) != "bluestore")
+    return;
+  SetVal(g_conf(), "bluestore_debug_inject_allocation_from_file_failure", "1.0");
+  g_conf().apply_changes(nullptr);
+
+  int r;
+  coll_t cid;
+  auto ch = store->create_new_collection(cid);
+  {
+    ObjectStore::Transaction t;
+    t.create_collection(cid, 0);
+    cerr << "Creating collection " << cid << std::endl;
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+
+  ghobject_t hoid1(hobject_t(sobject_t("Object 1", CEPH_NOSNAP)));
+  ghobject_t coid1 = hoid1;
+  coid1.hobj.snap = 1;
+  ghobject_t coid2 = hoid1;
+  coid2.hobj.snap = 2;
+  ghobject_t hoid2(hobject_t(sobject_t("Object 2", CEPH_NOSNAP)));
+
+  {
+    constexpr uint64_t FULL_BUFFER_LEN = 8192;
+    bufferlist data;
+    data.append(string(FULL_BUFFER_LEN, 'a'));
+
+    ObjectStore::Transaction t1;
+    t1.write(cid, hoid1, 0, data.length(), data);
+    cerr << "Creating object and write " << hoid1 << std::endl;
+    r = queue_transaction(store, ch, std::move(t1));
+    ASSERT_EQ(r, 0);
+
+    ObjectStore::Transaction clone_t1;
+    clone_t1.clone(cid, hoid1, coid1);
+    cerr << "Clone object " << coid1 << std::endl;
+    r = queue_transaction(store, ch, std::move(clone_t1));
+    ASSERT_EQ(r, 0);
+
+    ObjectStore::Transaction clone_t2;
+    clone_t2.clone(cid, hoid1, coid2);
+    cerr << "Clone object " << coid2 << std::endl;
+    r = queue_transaction(store, ch, std::move(clone_t2));
+    ASSERT_EQ(r, 0);
+
+    bufferlist new_data;
+    new_data.append(string(4096, 'b'));
+    ObjectStore::Transaction t2;
+    t2.write(cid, hoid1, 0, new_data.length(), new_data);
+    cerr << "Write object " << hoid1 << std::endl;
+    r = queue_transaction(store, ch, std::move(t2));
+    ASSERT_EQ(r, 0);
+
+    {
+      ch.reset();
+      // this trims hoid one out of onode cache
+      EXPECT_EQ(store->umount(), 0);
+    }
+    // Clearing shared blob causes freespace tracker miscount.
+    {
+      auto bluestore = new BlueStore(g_ceph_context, data_dir);
+      KeyValueDB* db_ptr;
+      int r = bluestore->open_db_environment(&db_ptr, false, false);
+      ASSERT_EQ(r, 0);
+
+      {
+	// to be inline with BlueStore.cc
+	const std::string PREFIX_SHARED_BLOB = "X";
+
+	size_t cnt = 0;
+	auto it = db_ptr->get_iterator(PREFIX_SHARED_BLOB, KeyValueDB::ITERATOR_NOCACHE);
+	ASSERT_NE(it, nullptr);
+	for (it->lower_bound(std::string()); it->valid(); it->next())
+	{
+	  std::cerr << "shared blob key '" << pretty_binary_string(it->key()) << "'" << std::endl;
+	  ++cnt;
+	}
+	ASSERT_EQ(cnt, 1);
+
+	auto dbt = db_ptr->get_transaction();
+	for (it->lower_bound(std::string()); it->valid(); it->next())
+	{
+	  std::cerr << "rm shared blob key '" << pretty_binary_string(it->key()) << "'" << std::endl;
+	  dbt->rmkey(PREFIX_SHARED_BLOB, it->key());
+	}
+	r = db_ptr->submit_transaction_sync(dbt);
+	ASSERT_EQ(r, 0);
+      }
+
+      bluestore->close_db_environment();
+      delete bluestore;
+    }
+
+    {
+      ch.reset();
+      // this trims hoid one out of onode cache
+      // ASSERT_EQ(store->umount(), 0);
+      EXPECT_EQ(store->mount(), 0);
+      ch = store->open_collection(cid);
+    }
+
+    {
+      BlueStore* bstore = dynamic_cast<BlueStore*>(store.get());
+      auto* kv = bstore->get_kv();
+
+      // to be inline with BlueStore.cc
+      const string PREFIX_SHARED_BLOB = "X";
+
+      size_t cnt = 0;
+      auto it = kv->get_iterator(PREFIX_SHARED_BLOB);
+      ceph_assert(it);
+      std::cerr << "Checking shared blob key" << std::endl;
+      for (it->lower_bound(string()); it->valid(); it->next())
+      {
+	std::cerr << "shared blob key '" << pretty_binary_string(it->key()) << "'" << std::endl;
+	++cnt;
+      }
+      ASSERT_EQ(cnt, 0);
+    }
+
+    new_data.clear();
+    new_data.append(string(FULL_BUFFER_LEN, 'c'));
+
+    ObjectStore::Transaction t3;
+    t3.write(cid, hoid2, 0, data.length(), new_data);
+    cerr << "Creating object and write " << hoid2 << std::endl;
+    r = queue_transaction(store, ch, std::move(t3));
+    ASSERT_EQ(r, 0);
+
+    {
+      ch.reset();
+      // this trims hoid one out of onode cache
+      EXPECT_EQ(store->umount(), 0);
+      EXPECT_EQ(store->fsck(true), 4);
+      store->repair(true);
+      EXPECT_EQ(store->fsck(true), 0);
+      EXPECT_EQ(store->mount(), 0);
+      ch = store->open_collection(cid);
+    }
+  }
+
+  {
+    ObjectStore::Transaction t;
+    // clean up
+    t.remove(cid, hoid1);
+    t.remove(cid, coid1);
+    t.remove(cid, coid2);
+    t.remove(cid, hoid2);
+    t.remove_collection(cid);
+    cerr << "Cleaning" << std::endl;
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+  ch.reset();
+}
 TEST_P(StoreTest, BlueStoreUnshareBlobSimple) {
   if (string(GetParam()) != "bluestore")
     return;
@@ -4004,6 +4406,102 @@ TEST_P(StoreTest, BlueStoreUnshareBlobTest) {
         ++cnt;
       }
       ASSERT_EQ(cnt, 0);
+    }
+  }
+  {
+    ghobject_t hoid(hobject_t(sobject_t("Object 2", CEPH_NOSNAP)));
+    ghobject_t coid1 = hoid;
+    coid1.hobj.snap = 1;
+    ghobject_t coid2 = hoid;
+    coid2.hobj.snap = 2;
+
+    bufferlist data, newdata;
+    data.append(string(1<<20, 'a')); //Conditions for resharding are met.
+
+    ObjectStore::Transaction t;
+    t.write(cid, hoid, 0, data.length(), data);
+    cerr << "Creating object and write 1M " << hoid << std::endl;
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+
+    ObjectStore::Transaction clone_t1;
+    clone_t1.clone(cid, hoid, coid1);
+    cerr << "Clone object" << std::endl;
+    r = queue_transaction(store, ch, std::move(clone_t1));
+    ASSERT_EQ(r, 0);
+
+    ObjectStore::Transaction clone_t2;
+    clone_t2.clone(cid, hoid, coid2);
+    cerr << "Clone object" << std::endl;
+    r = queue_transaction(store, ch, std::move(clone_t2));
+    ASSERT_EQ(r, 0);
+
+    data.clear();
+    data.append(string(4096, 'b'));
+
+    ObjectStore::Transaction t3;
+    t3.write(cid, hoid, 0, data.length(), data);
+    cerr << "Writing 4k to source object " << hoid << std::endl;
+    r = queue_transaction(store, ch, std::move(t3));
+    ASSERT_EQ(r, 0);
+    ObjectStore::Transaction t4;
+    t4.write(cid, hoid, 8192, data.length(), data);
+    cerr << "Writing 4k to source object " << hoid << std::endl;
+    t4.write(cid, hoid, 16384, data.length(), data);
+    cerr << "Writing 4k to source object " << hoid << std::endl;
+    r = queue_transaction(store, ch, std::move(t4));
+    ASSERT_EQ(r, 0);
+
+    {
+      BlueStore* bstore = dynamic_cast<BlueStore*> (store.get());
+      ch.reset();
+      // this trims hoid one out of onode cache
+      EXPECT_EQ(bstore->umount(), 0);
+      bluestore_stats_t store_stats1;
+      EXPECT_EQ(bstore->fsck_with_stats(true, store_stats1), 0);
+      EXPECT_EQ(bstore->mount(), 0);
+      ch = bstore->open_collection(cid);
+
+      ObjectStore::Transaction c1_remove_t;
+      c1_remove_t.remove(cid, coid1);
+      cerr << "Deleting dest object" << coid1 << std::endl;
+      r = queue_transaction(bstore, ch, std::move(c1_remove_t));
+      ASSERT_EQ(r, 0);
+
+      ch.reset();
+      // this ensures remove operation submitted to kv store
+      EXPECT_EQ(bstore->umount(), 0);
+      bluestore_stats_t store_stats2;
+      EXPECT_EQ(bstore->fsck_with_stats(true, store_stats2), 0);
+      EXPECT_EQ(bstore->mount(), 0);
+      ch = bstore->open_collection(cid);
+
+      ASSERT_EQ(store_stats1.num_objects-store_stats2.num_objects, 1);
+      ASSERT_EQ(store_stats1.num_shared_blobs, store_stats2.num_shared_blobs);
+
+      ObjectStore::Transaction c2_remove_t;
+      c2_remove_t.remove(cid, coid2);
+      cerr << "Deleting dest object" << coid2 << std::endl;
+      r = queue_transaction(store, ch, std::move(c2_remove_t));
+      ASSERT_EQ(r, 0);
+
+      ch.reset();
+      // this ensures remove operation submitted to kv store
+      EXPECT_EQ(bstore->umount(), 0);
+      bluestore_stats_t store_stats3;
+      EXPECT_EQ(bstore->fsck_with_stats(true, store_stats3), 0);
+      EXPECT_EQ(bstore->mount(), 0);
+      ch = bstore->open_collection(cid);
+
+      ASSERT_EQ(store_stats2.num_objects-store_stats3.num_objects, 1);
+      ASSERT_EQ(store_stats3.num_shared_blobs, 0);
+    }
+    {
+      ObjectStore::Transaction t;
+      t.remove(cid, hoid);
+      cerr << "Cleaning" << std::endl;
+      r = queue_transaction(store, ch, std::move(t));
+      ASSERT_EQ(r, 0);
     }
   }
   {
@@ -6098,10 +6596,6 @@ TEST_P(StoreTest, OMapTest) {
     ASSERT_EQ(cur_attrs.size(), size_t(1));
     ASSERT_TRUE(bl_eq(bl1, bl3));
  
-    set<string> keys;
-    r = store->omap_get_keys(ch, hoid, &keys);
-    ASSERT_EQ(r, 0);
-    ASSERT_EQ(keys.size(), size_t(1));
   }
 
   // test omap_clear, omap_rmkey_range
@@ -6185,8 +6679,6 @@ TEST_P(StoreTest, OMapIterator) {
     r = queue_transaction(store, ch, std::move(t));
     ASSERT_EQ(r, 0);
   }
-  ObjectMap::ObjectMapIterator iter;
-  bool correct;
   //basic iteration
   for (int i = 0; i < 100; i++) {
     if (!(i%5)) {
@@ -6195,26 +6687,28 @@ TEST_P(StoreTest, OMapIterator) {
     bufferlist bl;
 
     // FileStore may deadlock two active iterators over the same data
-    iter = ObjectMap::ObjectMapIterator();
-
-    iter = store->get_omap_iterator(ch, hoid);
-    for (iter->seek_to_first(), count=0; iter->valid(); iter->next(), count++) {
-      string key = iter->key();
-      bufferlist value = iter->value();
-      correct = attrs.count(key) && (string(value.c_str()) == string(attrs[key].c_str()));
-      if (!correct) {
-	if (attrs.count(key) > 0) {
-	  std::cout << "key " << key << "in omap , " << value.c_str() << " : " << attrs[key].c_str() << std::endl;
-	}
-	else
-	  std::cout << "key " << key << "should not exists in omap" << std::endl;
-      }
-      ASSERT_EQ(correct, true);
-    }
+    count = 0;
+    store->omap_iterate(
+      ch, hoid,
+      ObjectStore::omap_iter_seek_t::min_lower_bound(),
+      [&attrs, &count] (std::string_view key_, std::string_view value) mutable {
+        std::string key{key_};
+        const bool correct = attrs.count(key) && (value == attrs[key].to_str());
+        if (!correct) {
+          if (attrs.count(key) > 0) {
+            std::cout << "key " << key << "in omap , " << value << " : " << attrs[key].c_str() << std::endl;
+          }
+          else {
+            std::cout << "key " << key << "should not exists in omap" << std::endl;
+          }
+        }
+        [correct] { // workaround the void return within the macro
+	  ASSERT_EQ(correct, true);
+	}();
+        ++count;
+        return ObjectStore::omap_iter_ret_t::NEXT;
+      });
     ASSERT_EQ((int)attrs.size(), count);
-
-    // FileStore may deadlock an active iterator vs queue_transaction
-    iter = ObjectMap::ObjectMapIterator();
 
     char buf[100];
     snprintf(buf, sizeof(buf), "%d", i);
@@ -6230,25 +6724,40 @@ TEST_P(StoreTest, OMapIterator) {
     ASSERT_EQ(r, 0);
   }
 
-  iter = store->get_omap_iterator(ch, hoid);
+  std::string out_key;
+  auto get_single_key =
+    [&out_key](std::string_view key, std::string_view value) mutable {
+      out_key = std::string{key};
+      return ObjectStore::omap_iter_ret_t::STOP;
+    };
   //lower bound
   string bound_key = "key-5";
-  iter->lower_bound(bound_key);
-  correct = bound_key <= iter->key();
+  store->omap_iterate(
+    ch, hoid,
+    ObjectStore::omap_iter_seek_t{
+      .seek_position = bound_key,
+      .seek_type = ObjectStore::omap_iter_seek_t::LOWER_BOUND
+    },
+    get_single_key);
+  bool correct = bound_key <= out_key;
   if (!correct) {
-    std::cout << "lower bound, bound key is " << bound_key << " < iter key is " << iter->key() << std::endl;
+    std::cout << "lower bound, bound key is " << bound_key << " < out key is " << out_key << std::endl;
   }
   ASSERT_EQ(correct, true);
   //upper bound
-  iter->upper_bound(bound_key);
-  correct = iter->key() > bound_key;
+  store->omap_iterate(
+    ch, hoid,
+    ObjectStore::omap_iter_seek_t{
+      .seek_position = bound_key,
+      .seek_type = ObjectStore::omap_iter_seek_t::UPPER_BOUND
+    },
+    get_single_key);
+  correct = out_key > bound_key;
   if (!correct) {
-    std::cout << "upper bound, bound key is " << bound_key << " >= iter key is " << iter->key() << std::endl;
+    std::cout << "upper bound, bound key is " << bound_key << " >= out key is " << out_key << std::endl;
   }
   ASSERT_EQ(correct, true);
 
-  // FileStore may deadlock an active iterator vs queue_transaction
-  iter = ObjectMap::ObjectMapIterator();
   {
     ObjectStore::Transaction t;
     t.remove(cid, hoid);
@@ -7165,33 +7674,33 @@ INSTANTIATE_TEST_SUITE_P(
   ObjectStore,
   StoreTest,
   ::testing::Values(
-    "memstore",
+    "memstore"
 #if defined(WITH_BLUESTORE)
-    "bluestore",
+    , "bluestore"
 #endif
-    "kstore"));
+    ));
 
 // Note: instantiate all stores to preserve store numbering order only
 INSTANTIATE_TEST_SUITE_P(
   ObjectStore,
   StoreTestSpecificAUSize,
   ::testing::Values(
-    "memstore",
+    "memstore"
 #if defined(WITH_BLUESTORE)
-    "bluestore",
+    , "bluestore"
 #endif
-    "kstore"));
+    ));
 
 // Note: instantiate all stores to preserve store numbering order only
 INSTANTIATE_TEST_SUITE_P(
   ObjectStore,
   StoreTestOmapUpgrade,
   ::testing::Values(
-    "memstore",
+    "memstore"
 #if defined(WITH_BLUESTORE)
-    "bluestore",
+    , "bluestore"
 #endif
-    "kstore"));
+    ));
 
 #if defined(WITH_BLUESTORE)
 INSTANTIATE_TEST_SUITE_P(
@@ -7199,13 +7708,26 @@ INSTANTIATE_TEST_SUITE_P(
   StoreTestDeferredSetup,
   ::testing::Values(
     "bluestore"));
-#endif
 
 INSTANTIATE_TEST_SUITE_P(
   ObjectStore,
   MultiLabelTest,
   ::testing::Values(
     "bluestore"));
+
+INSTANTIATE_TEST_SUITE_P(
+  BlueStore,
+  CorruptedOnodesTest,
+  ::testing::Values("bluestore")
+);
+
+INSTANTIATE_TEST_SUITE_P(
+  BlueStore,
+  UnsharingBlobsOnRemove,
+  ::testing::Values("bluestore")
+);
+
+#endif // WITH_BLUESTORE
 
 struct deferred_test_t {
   uint32_t bdev_block_size;
@@ -7219,6 +7741,8 @@ void PrintTo(const deferred_test_t& t, ::std::ostream* os)
   *os << t.bdev_block_size << "/" << t.min_alloc_size << "/"
       << t.max_blob_size << "/" << t.prefer_deferred_size;
 }
+
+#ifdef WITH_BLUESTORE
 
 class DeferredWriteTest : public StoreTestFixture,
 		          public ::testing::WithParamInterface<deferred_test_t> {
@@ -7310,7 +7834,6 @@ TEST_P(DeferredWriteTest, NewData) {
   }
 }
 
-#if defined(WITH_BLUESTORE)
 INSTANTIATE_TEST_SUITE_P(
   BlueStore,
   DeferredWriteTest,
@@ -7330,6 +7853,7 @@ class DeferredReplayTest : public DeferredWriteTest {
 TEST_P(DeferredReplayTest, DeferredReplay) {
   const bool print = false;
   deferred_test_t t = GetParam();
+  SetVal(g_conf(), "bluestore_write_v2", "false");
   SetVal(g_conf(), "bdev_block_size", stringify(t.bdev_block_size).c_str());
   SetVal(g_conf(), "bluestore_min_alloc_size", stringify(t.min_alloc_size).c_str());
   SetVal(g_conf(), "bluestore_max_blob_size", stringify(t.max_blob_size).c_str());
@@ -7415,6 +7939,7 @@ TEST_P(DeferredReplayTest, DeferredReplay) {
 TEST_P(DeferredReplayTest, DeferredReplayInReadOnly) {
   const bool print = false;
   deferred_test_t t = GetParam();
+  SetVal(g_conf(), "bluestore_write_v2", "false");
   SetVal(g_conf(), "bdev_block_size", stringify(t.bdev_block_size).c_str());
   SetVal(g_conf(), "bluestore_min_alloc_size", stringify(t.min_alloc_size).c_str());
   SetVal(g_conf(), "bluestore_max_blob_size", stringify(t.max_blob_size).c_str());
@@ -8393,6 +8918,7 @@ TEST_P(StoreTestSpecificAUSize, DeferredOnBigOverwrite1) {
     return;
 
   size_t block_size = 4096;
+  SetVal(g_conf(), "bluestore_write_v2", "false");
   StartDeferred(block_size);
   SetVal(g_conf(), "bluestore_max_blob_size", "131072");
   SetVal(g_conf(), "bluestore_prefer_deferred_size", "65536");
@@ -8577,6 +9103,7 @@ TEST_P(StoreTestSpecificAUSize, DeferredOnBigOverwrite2) {
     return;
 
   size_t block_size = 4096;
+  SetVal(g_conf(), "bluestore_write_v2", "false");
   StartDeferred(block_size);
   SetVal(g_conf(), "bluestore_max_blob_size", "131072");
   SetVal(g_conf(), "bluestore_prefer_deferred_size", "65536");
@@ -8723,6 +9250,7 @@ TEST_P(StoreTestSpecificAUSize, DeferredOnBigOverwrite3) {
     return;
 
   size_t block_size = 4096;
+  SetVal(g_conf(), "bluestore_write_v2", "false");
   StartDeferred(block_size);
   SetVal(g_conf(), "bluestore_max_blob_size", "131072");
   SetVal(g_conf(), "bluestore_prefer_deferred_size", "65536");
@@ -8885,6 +9413,7 @@ TEST_P(StoreTestSpecificAUSize, DeferredOnBigOverwrite4) {
     return;
 
   size_t block_size = 4096;
+  SetVal(g_conf(), "bluestore_write_v2", "false");
   SetVal(g_conf(), "bluestore_block_db_create", "true");
   SetVal(g_conf(), "bluestore_block_db_size", stringify(1 << 30).c_str());
   StartDeferred(block_size);
@@ -8959,6 +9488,7 @@ TEST_P(StoreTestSpecificAUSize, DeferredOnBigOverwrite5) {
     return;
 
   size_t block_size = 4096;
+  SetVal(g_conf(), "bluestore_write_v2", "false");
   SetVal(g_conf(), "bluestore_block_db_create", "true");
   SetVal(g_conf(), "bluestore_block_db_size", stringify(1 << 30).c_str());
   StartDeferred(block_size);
@@ -9036,6 +9566,7 @@ TEST_P(StoreTestSpecificAUSize, DeferredDifferentChunks) {
   size_t large_object_size = 1 * 1024 * 1024;
   size_t prefer_deferred_size = 65536;
  
+  SetVal(g_conf(), "bluestore_write_v2", "false");
   SetVal(g_conf(), "bluestore_block_db_create", "true");
   SetVal(g_conf(), "bluestore_block_db_size", stringify(1 << 30).c_str());
 
@@ -9458,6 +9989,7 @@ TEST_P(StoreTestSpecificAUSize, BlobReuseOnSmallOverwrite) {
     return;
 
   size_t block_size = 4096;
+  SetVal(g_conf(), "bluestore_write_v2", "false");
   StartDeferred(block_size);
   SetVal(g_conf(), "bluestore_max_blob_size", "65536");
   g_conf().apply_changes(nullptr);
@@ -9618,10 +10150,10 @@ TEST_P(StoreTestSpecificAUSize, ReproBug56488Test) {
 
   if (string(GetParam()) != "bluestore")
     return;
-
   size_t alloc_size = 65536;
   size_t write_size = 4096;
-  SetVal(g_conf(), "bluestore_debug_enforce_settings", "hdd");
+  SetVal(g_conf(), "bluestore_write_v2", "false");
+  SetVal(g_conf(), "bluestore_debug_enforce_settings", "hybrid");
   SetVal(g_conf(), "bluestore_block_db_create", "true");
   SetVal(g_conf(), "bluestore_block_db_size", stringify(1 << 30).c_str());
 
@@ -9805,8 +10337,8 @@ TEST_P(StoreTestSpecificAUSize, garbageCollection) {
       ASSERT_EQ(r, 0);\
   }
 
+  SetVal(g_conf(), "bluestore_write_v2", "false");
   StartDeferred(65536);
-
   SetVal(g_conf(), "bluestore_compression_max_blob_size", "524288");
   SetVal(g_conf(), "bluestore_compression_min_blob_size", "262144");
   SetVal(g_conf(), "bluestore_max_blob_size", "524288");
@@ -10107,6 +10639,7 @@ TEST_P(StoreTestSpecificAUSize, BluestoreRepairTest) {
     bstore->mount();
     ghobject_t hoid4 = make_object("Object 4", pool);
     auto ch = store->open_collection(cid);
+    C_SaferCond c;
     {
       bufferlist bl;
       string s(0x1000, 'a');
@@ -10115,10 +10648,11 @@ TEST_P(StoreTestSpecificAUSize, BluestoreRepairTest) {
       for(size_t i = 0; i < 0x10; i++) {
               t.write(cid, hoid4, i * bl.length(), bl.length(), bl);
       }
-      r = queue_transaction(store, ch, std::move(t));
+      t.register_on_commit(&c);
+      queue_transaction(store, ch, std::move(t));
       ASSERT_EQ(r, 0);
     }
-    sleep(5);
+    c.wait();
     {
       bstore->inject_zombie_spanning_blob(cid, hoid4, 12345);
       bstore->inject_zombie_spanning_blob(cid, hoid4, 23456);
@@ -10223,21 +10757,23 @@ TEST_P(StoreTestSpecificAUSize, BluestoreBrokenZombieRepairTest) {
       ASSERT_EQ(r, 0);
     }
     cerr << "onode preparing" << std::endl;
+    C_SaferCond c[col_count];
     bufferlist bl;
     string s(0x1000, 'a');
     bl.append(s);
-
     for (size_t i = 0; i < col_count; i++) {
+      ObjectStore::Transaction t;
       for (size_t j = 0; j < obj_count; j++) {
-	ObjectStore::Transaction t;
 	t.write(*cid[i], hoid[i][j], bl.length(), bl.length(), bl);
-	r = queue_transaction(store, ch[i], std::move(t));
-	ASSERT_EQ(r, 0);
       }
+      t.register_on_commit(&c[i]);
+      r = queue_transaction(store, ch[i], std::move(t));
+      ASSERT_EQ(r, 0);
+    }
+    for (size_t i = 0; i < col_count; i++) {
+      c[i].wait();
     }
     cerr << "Zombie spanning blob injection" << std::endl;
-
-    sleep(5);
 
     for (size_t i = 0; i < col_count; i++) {
       for (size_t j = 0; j < obj_count; j++) {
@@ -10387,15 +10923,17 @@ TEST_P(StoreTestSpecificAUSize, BluestoreBrokenNoSharedBlobRepairTest) {
       ASSERT_EQ(r, 0);
     }
     {
+     C_SaferCond c;
       ObjectStore::Transaction t;
       t.clone(cid, hoid, hoid_cloned);
-      r = queue_transaction(store, ch, std::move(t));
+      t.register_on_commit(&c);
+      queue_transaction(store, ch, std::move(t));
       ASSERT_EQ(r, 0);
+      c.wait();
     }
   }
   // injecting an error and checking
   cerr << "injecting" << std::endl;
-  sleep(3); // need some time for the previous write to land
   bstore->inject_no_shared_blob_key();
   bstore->inject_stray_shared_blob_key(12345678);
 
@@ -10663,8 +11201,11 @@ TEST_P(StoreTest, BluestorePerPoolOmapFixOnMount)
     t.omap_setheader(cid, oid, h);
     t.touch(cid, oid2);
     t.omap_setheader(cid, oid2, h);
+    C_SaferCond c;
+    t.register_on_commit(&c);
     int r = queue_transaction(store, ch, std::move(t));
     ASSERT_EQ(r, 0);
+    c.wait();
   }
 
   // inject legacy omaps
@@ -10970,6 +11511,8 @@ TEST_P(StoreTest, mergeRegionTest) {
     ASSERT_EQ(final_len, static_cast<uint64_t>(r));
   }
 }
+
+#ifdef WITH_BLUESTORE
 
 TEST_P(MultiLabelTest, MultiSelectableOff) {
   SetVal(g_conf(), "bluestore_bdev_label_multi", "false");
@@ -11293,11 +11836,220 @@ TEST_P(MultiLabelTest, UpgradeToMultiLabelCollisionWithObjects) {
   ASSERT_EQ(label.meta["multi"], "yes");
 }
 
+TEST_P(CorruptedOnodesTest, Recover_TolerateMissingHeadShard)
+{
+  SetVal(g_conf(), "bluestore_debug_inject_allocation_from_file_failure", "0");
+  prepare_store();
+
+  mount();
+  BlueStore* bs = dynamic_cast<BlueStore*>(store.get());
+  ceph_assert(bs);
+  KeyValueDB* pdb = bs->get_kv();
+  KeyValueDB::Iterator it = pdb->get_iterator("O");
+  it->seek_to_first();
+  while (it->valid()) {
+    if (it->key().contains("my_special_object") &&
+    it->key().ends_with("o")) {
+      //delete main key for the object
+      auto trans = pdb->get_transaction();
+      trans->rm_single_key("O", it->key());
+      pdb->submit_transaction_sync(trans);
+      break;
+    }
+    it->next();
+  }
+  it.reset();
+  umount();
+
+  SetVal(g_conf(), "bluestore_debug_inject_allocation_from_file_failure", "1");
+  g_conf().apply_changes(nullptr);
+  cleanup_store();
+}
+
+TEST_P(CorruptedOnodesTest, Fsck_FixMissingHeadShard)
+{
+  SetVal(g_conf(), "bluestore_debug_inject_allocation_from_file_failure", "0");
+  prepare_store();
+
+  mount();
+  BlueStore* bs = dynamic_cast<BlueStore*>(store.get());
+  ceph_assert(bs);
+  KeyValueDB* pdb = bs->get_kv();
+  KeyValueDB::Iterator it = pdb->get_iterator("O");
+  it->seek_to_first();
+  while (it->valid()) {
+    if (it->key().contains("my_special_object") &&
+    it->key().ends_with("o")) {
+      //delete main key for the object
+      auto trans = pdb->get_transaction();
+      trans->rm_single_key("O", it->key());
+      pdb->submit_transaction_sync(trans);
+      break;
+    }
+    it->next();
+  }
+  it.reset();
+  umount();
+
+  ASSERT_GT(store->fsck(false), 8); // I observe 11, so 8 seems safe
+  ASSERT_EQ(store->repair(false), 0);
+  ASSERT_EQ(store->fsck(false), 0);
+
+  cleanup_store();
+}
+
+TEST_P(CorruptedOnodesTest, Fsck_FixExtraShard)
+{
+  SetVal(g_conf(), "bluestore_debug_inject_allocation_from_file_failure", "0");
+  prepare_store();
+  mount();
+  BlueStore* bs = dynamic_cast<BlueStore*>(store.get());
+  ceph_assert(bs);
+  KeyValueDB* pdb = bs->get_kv();
+  KeyValueDB::Iterator it = pdb->get_iterator("O");
+  it->seek_to_first();
+  while (it->valid()) {
+    if (it->key().contains("my_special_object") &&
+        it->key().ends_with("x")) {
+      //duplicate shard into offset +1
+      auto trans = pdb->get_transaction();
+      std::string new_key = it->key();
+      new_key[new_key.size() - 2] = '\001';
+      trans->set("O", new_key, it->value());
+      pdb->submit_transaction_sync(trans);
+      break;
+    }
+    it->next();
+  }
+  it.reset();
+  umount();
+
+  ASSERT_EQ(store->fsck(false), 1);
+  ASSERT_EQ(store->repair(false), 0);
+  ASSERT_EQ(store->fsck(false), 0);
+
+  cleanup_store();
+}
+
+TEST_P(CorruptedOnodesTest, Fsck_Fix3ExtraShards) {
+  SetVal(g_conf(), "bluestore_debug_inject_allocation_from_file_failure", "0");
+  prepare_store();
+
+  mount();
+  BlueStore* bs = dynamic_cast<BlueStore*>(store.get());
+  ceph_assert(bs);
+  KeyValueDB* pdb = bs->get_kv();
+  KeyValueDB::Iterator it = pdb->get_iterator("O");
+  it->seek_to_first();
+  while (it->valid()) {
+    if (it->key().contains("my_special_object") &&
+        it->key().ends_with("x")) {
+      //duplicate shard into offset +1
+      auto trans = pdb->get_transaction();
+      std::string new_key = it->key();
+      new_key[new_key.size() - 2] = '\001';
+      trans->set("O", new_key, it->value());
+      new_key[new_key.size() - 2] = '\002';
+      trans->set("O", new_key, it->value());
+      new_key[new_key.size() - 2] = '\003';
+      trans->set("O", new_key, it->value());
+      pdb->submit_transaction_sync(trans);
+      break;
+    }
+    it->next();
+  }
+  it.reset();
+  umount();
+
+  ASSERT_EQ(store->fsck(false), 3);
+  ASSERT_EQ(store->repair(false), 0);
+  ASSERT_EQ(store->fsck(false), 0);
+
+  cleanup_store();
+}
+
+TEST_P(UnsharingBlobsOnRemove, FullCloneAndErase) {
+  SetVal(g_conf(), "bluestore_debug_inject_allocation_from_file_failure", "0");
+  prepare_store();
+
+  mount();
+  ch = store->create_new_collection(cid);
+  ghobject_t hoid_head(hobject_t(
+    sobject_t("LoremIpsum", CEPH_NOSNAP), "", 0x12345678, poolid, ""));
+
+  write_object(hoid_head, 0x0, 0x10000);
+
+  ghobject_t hoid_snap_1 = hoid_head;
+  hoid_snap_1.hobj.snap = 1;
+
+  t.clone(cid, hoid_head, hoid_snap_1);
+  commit_transaction();
+
+  BlueStore::OnodeRef oo = get_onode(cid, hoid_head);
+  size_t shared_blob_count = count_shared_blobs(oo);
+  EXPECT_GE(shared_blob_count, 1);
+  size_t shared_blob_trackers = count_shared_blob_trackers();
+  EXPECT_GE(shared_blob_trackers, 1);
+
+  t.remove(cid, hoid_snap_1);
+  commit_transaction();
+
+  shared_blob_count = count_shared_blobs(oo);
+  EXPECT_EQ(shared_blob_count, 0);
+  shared_blob_trackers = count_shared_blob_trackers();
+  EXPECT_EQ(shared_blob_trackers, 0);
+  oo.reset();
+
+  umount();
+  cleanup_store();
+}
+
+TEST_P(UnsharingBlobsOnRemove, UnshareOnPartial) {
+  SetVal(g_conf(), "bluestore_debug_inject_allocation_from_file_failure", "0");
+  SetVal(g_conf(), "bluestore_min_alloc_size", "16384");
+  prepare_store();
+
+  mount();
+  ch = store->create_new_collection(cid);
+
+  ghobject_t hoid_head(hobject_t(
+    sobject_t("LoremIpsum", CEPH_NOSNAP), "", 0x12345678, poolid, ""));
+
+  write_object(hoid_head, 0x0, 0xe000);
+
+  ghobject_t hoid_snap_1 = hoid_head;
+  hoid_snap_1.hobj.snap = 1;
+
+  t.clone(cid, hoid_head, hoid_snap_1);
+  commit_transaction();
+
+  BlueStore::OnodeRef oo = get_onode(cid, hoid_head);
+  size_t shared_blob_count = count_shared_blobs(oo);
+  EXPECT_GE(shared_blob_count, 1);
+  size_t shared_blob_trackers = count_shared_blob_trackers();
+  EXPECT_GE(shared_blob_trackers, 1);
+
+  t.remove(cid, hoid_snap_1);
+  commit_transaction();
+
+  shared_blob_count = count_shared_blobs(oo);
+  EXPECT_EQ(shared_blob_count, 0);
+  shared_blob_trackers = count_shared_blob_trackers();
+  EXPECT_EQ(shared_blob_trackers, 0);
+  oo.reset();
+
+  umount();
+  cleanup_store();
+}
+
+#endif // WITH_BLUESTORE
+
 TEST_P(StoreTestSpecificAUSize, BluestoreEnforceHWSettingsHdd) {
   if (string(GetParam()) != "bluestore")
     return;
 
-  SetVal(g_conf(), "bluestore_debug_enforce_settings", "hdd");
+  SetVal(g_conf(), "bluestore_write_v2", "false");
+  SetVal(g_conf(), "bluestore_debug_enforce_settings", "hybrid");
   StartDeferred(0x1000);
 
   int r;
@@ -11330,6 +12082,7 @@ TEST_P(StoreTestSpecificAUSize, BluestoreEnforceHWSettingsSsd) {
   if (string(GetParam()) != "bluestore")
     return;
 
+  SetVal(g_conf(), "bluestore_write_v2", "false");
   SetVal(g_conf(), "bluestore_debug_enforce_settings", "ssd");
   StartDeferred(0x1000);
 
@@ -11364,6 +12117,7 @@ TEST_P(StoreTestSpecificAUSize, ReproNoBlobMultiTest) {
   if(string(GetParam()) != "bluestore")
     return;
 
+  SetVal(g_conf(), "bluestore_write_v2", "false");
   SetVal(g_conf(), "bluestore_block_db_create", "true");
   SetVal(g_conf(), "bluestore_block_db_size", "4294967296");
   SetVal(g_conf(), "bluestore_block_size", "12884901888");
@@ -11484,6 +12238,8 @@ TEST_P(StoreTestSpecificAUSize, SpilloverLegacyTest) {
   SetVal(g_conf(), "bluestore_block_db_create", "true");
   SetVal(g_conf(), "bluestore_block_db_size", "3221225472");
   SetVal(g_conf(), "bluestore_volume_selection_policy", "rocksdb_original");
+  SetVal(g_conf(), "bluestore_async_db_compaction", "false");
+
   // original RocksDB settings used before https://github.com/ceph/ceph/pull/47221/
   // which enable BlueFS spillover.
   SetVal(g_conf(), "bluestore_rocksdb_options",
@@ -11515,6 +12271,8 @@ TEST_P(StoreTestSpecificAUSize, SpilloverLegacyFixedByFitToFastTest) {
   SetVal(g_conf(), "bluestore_block_db_create", "true");
   SetVal(g_conf(), "bluestore_block_db_size", "3221225472");
   SetVal(g_conf(), "bluestore_volume_selection_policy", "fit_to_fast");
+  SetVal(g_conf(), "bluestore_async_db_compaction", "false");
+
   // original RocksDB settings used before https://github.com/ceph/ceph/pull/47221/
   // which enable BlueFS spillover.
   SetVal(g_conf(), "bluestore_rocksdb_options",
@@ -11649,7 +12407,7 @@ TEST_P(StoreTestSpecificAUSize, Ticket45195Repro) {
 
   SetVal(g_conf(), "bluestore_default_buffered_write", "true");
   SetVal(g_conf(), "bluestore_max_blob_size", "65536");
-  SetVal(g_conf(), "bluestore_debug_enforce_settings", "hdd");
+  SetVal(g_conf(), "bluestore_debug_enforce_settings", "hybrid");
   SetVal(g_conf(), "bluestore_fsck_on_mount", "false");
   g_conf().apply_changes(nullptr);
 
@@ -11965,11 +12723,85 @@ TEST_P(StoreTestOmapUpgrade, LargeLegacyToPG) {
   }
 }
 
+TEST_P(StoreTestSpecificAUSize, BlueFSReservedTest) {
+  if (string(GetParam()) != "bluestore")
+    return;
+
+  uint64_t db_size = 1ull << 32; // 4GiB
+  uint64_t wal_extra = 0x10000;
+  uint64_t wal_size = db_size + wal_extra; // 4GiB + 64K
+  SetVal(g_conf(), "bluestore_block_db_create", "true");
+  SetVal(g_conf(), "bluestore_block_db_size", stringify(db_size).c_str());
+  SetVal(g_conf(), "bluestore_block_wal_create", "true");
+  SetVal(g_conf(), "bluestore_block_wal_size", stringify(wal_size).c_str());
+
+  g_conf().apply_changes(nullptr);
+
+  StartDeferred(65536);
+  BlueStore* bstore = dynamic_cast<BlueStore*> (store.get());
+  ceph_assert(bstore);
+  BlueFS* fs = bstore->get_bluefs();
+
+  ASSERT_EQ(fs->get_full_reserved(BlueFS::BDEV_DB),
+            g_conf()->bluefs_alloc_size);
+
+  ASSERT_EQ(fs->get_full_reserved(BlueFS::BDEV_WAL),
+            g_conf()->bluefs_alloc_size + wal_extra);
+}
+
+
+TEST_P(StoreTest, BlueFS_truncate_remove_race) {
+  if (string(GetParam()) != "bluestore")
+    GTEST_SKIP();
+
+  BlueStore* bstore = dynamic_cast<BlueStore*> (store.get());
+  ceph_assert(bstore);
+  BlueFS& fs = *bstore->get_bluefs();
+  fs.unittest_inject_delay = []() { usleep(1000); };
+  static constexpr uint32_t batch_size = 20;
+  std::binary_semaphore go_remove(0);
+  std::binary_semaphore done_remove(0);
+
+  auto files_remover = [&]() {
+    for (uint32_t cnt = 0; cnt < batch_size; cnt++) {
+      go_remove.acquire();
+      std::string name = "test-file-" + std::to_string(cnt);
+      fs.unlink("dir", name);
+      fs.sync_metadata(false);
+      done_remove.release();
+    }
+  };
+
+  ASSERT_EQ(0, fs.mkdir("dir"));
+  std::thread remover_thread(files_remover);
+
+  for (uint32_t cnt = 0; cnt < batch_size; cnt++) {
+    std::string name = "test-file-" + std::to_string(cnt);
+    BlueFS::FileWriter *f = nullptr;
+    ASSERT_EQ(0, fs.open_for_write("dir", name, &f, false));
+    fs.preallocate(f->file, 0, 100000);
+    for (uint32_t i = 0; i < 10; i++) {
+      fs.append_try_flush(f, "x", 1);
+      fs.fsync(f);
+    }
+    go_remove.release();
+    fs.truncate(f, 10);
+    fs.close_writer(f);
+    done_remove.acquire();
+  }
+
+  remover_thread.join();
+  fs.unittest_inject_delay = nullptr;
+  EXPECT_EQ(store->umount(), 0);
+  EXPECT_EQ(store->mount(), 0);
+}
+
 #endif  // WITH_BLUESTORE
 
 int main(int argc, char **argv) {
+  std::map<string, string> defaults = {{"debug_rocksdb","0/0"}};
   auto args = argv_to_vec(argc, argv);
-  auto cct = global_init(NULL, args, CEPH_ENTITY_TYPE_CLIENT,
+  auto cct = global_init(&defaults, args, CEPH_ENTITY_TYPE_CLIENT,
 			 CODE_ENVIRONMENT_UTILITY,
 			 CINIT_FLAG_NO_DEFAULT_CONFIG_FILE);
   common_init_finish(g_ceph_context);
@@ -12001,7 +12833,7 @@ int main(int argc, char **argv) {
   g_ceph_context->_conf.set_val_or_die("bluestore_debug_randomize_serial_transaction",
 				 "10");
 
-  g_ceph_context->_conf.set_val_or_die("bluefs_check_volume_selector_on_umount", "true");
+  g_ceph_context->_conf.set_val_or_die("bluefs_check_volume_selector_on_mount", "true");
 
   g_ceph_context->_conf.set_val_or_die("bdev_debug_aio", "true");
   g_ceph_context->_conf.set_val_or_die("log_max_recent", "10000");

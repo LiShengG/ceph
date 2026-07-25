@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*- 
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*- 
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph - scalable distributed file system
  *
@@ -27,6 +28,7 @@
 #include "common/errno.h"
 #include "common/config.h"
 #include "common/Formatter.h"
+#include "common/strtol.h" // for strict_strtol()
 
 #include "common/ceph_argparse.h"
 #include "include/stringify.h"
@@ -227,6 +229,8 @@ void usage()
   cout << "   --show-mappings       show mappings\n";
   cout << "   --show-bad-mappings   show bad mappings\n";
   cout << "   --show-choose-tries   show choose tries histogram\n";
+  cout << "   --show-retry-exhaustion\n";
+  cout << "                         check for and report CRUSH retry exhaustion\n";
   cout << "   --output-name name\n";
   cout << "                         prepend the data file(s) generated during the\n";
   cout << "                         testing routine with name\n";
@@ -451,9 +455,11 @@ int main(int argc, const char **argv)
   vector<const char *> empty_args;
   auto cct = global_init(NULL, empty_args, CEPH_ENTITY_TYPE_CLIENT,
 			 CODE_ENVIRONMENT_UTILITY,
-			 CINIT_FLAG_NO_DEFAULT_CONFIG_FILE);
+			 CINIT_FLAG_NO_DEFAULT_CONFIG_FILE|
+			 CINIT_FLAG_NO_DAEMON_ACTIONS);
   // crushtool times out occasionally when quits. so do not
-  // release the g_ceph_context.
+  // release the g_ceph_context. This causes other problems
+  // see https://tracker.ceph.com/issues/71027
   cct->get();
   common_init_finish(g_ceph_context);
 
@@ -538,6 +544,9 @@ int main(int argc, const char **argv)
     } else if (ceph_argparse_flag(args, i, "--show_choose_tries", (char*)NULL)) {
       display = true;
       tester.set_output_choose_tries(true);
+    } else if (ceph_argparse_flag(args, i, "--show-retry-exhaustion", (char*)NULL)) {
+      display = true;
+      tester.set_show_retry_exhaustion(true);
     } else if (ceph_argparse_witharg(args, i, &val, "-c", "--compile", (char*)NULL)) {
       srcfn = val;
       compile = true;

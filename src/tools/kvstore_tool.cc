@@ -1,16 +1,22 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
 
 #include "kvstore_tool.h"
 
 #include <iostream>
 
+#include "common/config_proxy.h" // for class ConfigProxy
 #include "common/errno.h"
 #include "common/url_escape.h"
 #include "common/pretty_binary.h"
+#include "global/global_context.h" // for g_conf()
 #include "include/buffer.h"
-#include "kv/KeyValueDB.h"
+#include "include/types.h" // for struct byte_u_t
 #include "kv/KeyValueHistogram.h"
+
+#ifdef WITH_BLUESTORE
+#include "os/bluestore/BlueStore.h"
+#endif
 
 using namespace std;
 
@@ -28,13 +34,8 @@ StoreTool::StoreTool(const string& type,
   }
 
   if (type == "bluestore-kv") {
-#ifdef WITH_BLUESTORE
     if (load_bluestore(path, read_only, to_repair) != 0)
       exit(1);
-#else
-    cerr << "bluestore not compiled in" << std::endl;
-    exit(1);
-#endif
   } else {
     auto db_ptr = KeyValueDB::create(g_ceph_context, type, path);
     if (!to_repair) {
@@ -49,20 +50,40 @@ StoreTool::StoreTool(const string& type,
   }
 }
 
+
+#ifdef WITH_BLUESTORE
+void close_delete_bluestore(ObjectStore* store)
+{
+  auto bluestore = dynamic_cast<BlueStore*>(store);
+  ceph_assert(bluestore);
+  bluestore->close_db_environment();
+  delete bluestore;
+}
+
 int StoreTool::load_bluestore(const string& path, bool read_only, bool to_repair)
 {
-    auto bluestore = new BlueStore(g_ceph_context, path);
-    KeyValueDB *db_ptr;
-    int r = bluestore->open_db_environment(&db_ptr, read_only, to_repair);
-    if (r < 0) {
+  auto bluestore = new BlueStore(g_ceph_context, path);
+  KeyValueDB *db_ptr;
+  int r = bluestore->open_db_environment(&db_ptr, read_only, to_repair);
+  if (r < 0) {
      return -EINVAL;
-    }
-    db = decltype(db){db_ptr, Deleter(bluestore)};
-    return 0;
+  }
+  db = decltype(db){db_ptr, Deleter(bluestore, close_delete_bluestore)};
+  return 0;
 }
+#else
+
+int StoreTool::load_bluestore(const string& path, bool read_only, bool to_repair)
+{
+    cerr << "bluestore not compiled in" << std::endl;
+    return -1;
+}
+#endif // WITH_BLUESTORE
+
 
 uint32_t StoreTool::traverse(const string& prefix,
                              const bool do_crc,
+                             const bool pretty_binary_key,
                              const bool do_value_dump,
                              ostream *out)
 {
@@ -80,8 +101,13 @@ uint32_t StoreTool::traverse(const string& prefix,
     if (!prefix.empty() && (rk.first != prefix))
       break;
 
-    if (out)
-      *out << url_escape(rk.first) << "\t" << url_escape(rk.second);
+    if (out) {
+      if (pretty_binary_key) {
+        *out << url_escape(rk.first) << "\t" << pretty_binary_string(rk.second);
+      } else {
+        *out << url_escape(rk.first) << "\t" << url_escape(rk.second);
+      }
+    }
     if (do_crc) {
       bufferlist bl;
       bl.append(rk.first);
@@ -110,9 +136,9 @@ uint32_t StoreTool::traverse(const string& prefix,
 }
 
 void StoreTool::list(const string& prefix, const bool do_crc,
-                     const bool do_value_dump)
+                     const bool pretty_binary_key, const bool do_value_dump)
 {
-  traverse(prefix, do_crc, do_value_dump,& std::cout);
+  traverse(prefix, do_crc, pretty_binary_key, do_value_dump,& std::cout);
 }
 
 bool StoreTool::exists(const string& prefix)

@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*- 
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*- 
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph - scalable distributed file system
  *
@@ -12,9 +13,13 @@
  * 
  */
 
-#include "common/config.h"
 #include "CephxKeyServer.h"
+#include "common/ceph_json.h"
+#include "common/Clock.h" // for ceph_clock_now()
+#include "common/config.h"
 #include "common/dout.h"
+#include "common/Formatter.h"
+
 #include <sstream>
 
 #define dout_subsys ceph_subsys_auth
@@ -28,6 +33,50 @@ using std::stringstream;
 using ceph::bufferptr;
 using ceph::bufferlist;
 using ceph::Formatter;
+
+void KeyServerData::encode(ceph::buffer::list& bl) const {
+  __u8 struct_v = 1;
+  using ceph::encode;
+  encode(struct_v, bl);
+  encode(version, bl);
+  encode(rotating_ver, bl);
+  encode(secrets, bl);
+  encode(rotating_secrets, bl);
+}
+
+void KeyServerData::decode(ceph::buffer::list::const_iterator& bl) {
+  using ceph::decode;
+  __u8 struct_v;
+  decode(struct_v, bl);
+  decode(version, bl);
+  decode(rotating_ver, bl);
+  decode(secrets, bl);
+  decode(rotating_secrets, bl);
+}
+
+void KeyServerData::encode_rotating(ceph::buffer::list& bl) const {
+  using ceph::encode;
+  __u8 struct_v = 1;
+  encode(struct_v, bl);
+  encode(rotating_ver, bl);
+  encode(rotating_secrets, bl);
+}
+
+void KeyServerData::decode_rotating(ceph::buffer::list& rotating_bl) {
+  using ceph::decode;
+  auto iter = rotating_bl.cbegin();
+  __u8 struct_v;
+  decode(struct_v, iter);
+  decode(rotating_ver, iter);
+  decode(rotating_secrets, iter);
+}
+
+void KeyServerData::dump(ceph::Formatter *f) const {
+  f->dump_unsigned("version", version);
+  f->dump_unsigned("rotating_version", rotating_ver);
+  encode_json("secrets", secrets, f);
+  encode_json("rotating_secrets", rotating_secrets, f);
+}
 
 bool KeyServerData::get_service_secret(CephContext *cct, uint32_t service_id,
 				       CryptoKey& secret, uint64_t& secret_id,
@@ -133,6 +182,41 @@ bool KeyServerData::get_caps(CephContext *cct, const EntityName& name,
   return extra_secrets->get_caps(name, type, caps_info);
 }
 
+void KeyServerData::Incremental::encode(ceph::buffer::list& bl) const {
+  using ceph::encode;
+  __u8 struct_v = 1;
+  encode(struct_v, bl);
+  __u32 _op = (__u32)op;
+  encode(_op, bl);
+  if (op == AUTH_INC_SET_ROTATING) {
+    encode(rotating_bl, bl);
+  } else {
+    encode(name, bl);
+    encode(auth, bl);
+  }
+}
+
+void KeyServerData::Incremental::decode(ceph::buffer::list::const_iterator& bl) {
+  using ceph::decode;
+  __u8 struct_v;
+  decode(struct_v, bl);
+  __u32 _op;
+  decode(_op, bl);
+  op = (IncrementalOp)_op;
+  ceph_assert(op >= AUTH_INC_NOP && op <= AUTH_INC_SET_ROTATING);
+  if (op == AUTH_INC_SET_ROTATING) {
+    decode(rotating_bl, bl);
+  } else {
+    decode(name, bl);
+    decode(auth, bl);
+  }
+}
+
+void KeyServerData::Incremental::dump(ceph::Formatter *f) const {
+  f->dump_unsigned("op", op);
+  f->dump_object("name", name);
+  f->dump_object("auth", auth);
+}
 
 #undef dout_prefix
 #define dout_prefix *_dout << "cephx keyserver: "
@@ -262,9 +346,11 @@ void KeyServer::dump(Formatter *f) const
   f->dump_object("data", data);
 }
 
-void KeyServer::generate_test_instances(std::list<KeyServer*>& ls)
+std::list<KeyServer> KeyServer::generate_test_instances()
 {
-  ls.push_back(new KeyServer(nullptr, nullptr));
+  std::list<KeyServer> ls;
+  ls.emplace_back(nullptr, nullptr);
+  return ls;
 }
 
 bool KeyServer::generate_secret(CryptoKey& secret)
@@ -295,6 +381,17 @@ bool KeyServer::generate_secret(EntityName& name, CryptoKey& secret)
   data.add_auth(name, auth);
 
   return true;
+}
+
+void KeyServer::encode(ceph::buffer::list& bl) const {
+  using ceph::encode;
+  encode(data, bl);
+}
+
+void KeyServer::decode(ceph::buffer::list::const_iterator& bl) {
+  std::scoped_lock l{lock};
+  using ceph::decode;
+  decode(data, bl);
 }
 
 bool KeyServer::contains(const EntityName& name) const

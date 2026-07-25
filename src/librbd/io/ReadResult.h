@@ -1,5 +1,5 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
 
 #ifndef CEPH_LIBRBD_IO_READ_RESULT_H
 #define CEPH_LIBRBD_IO_READ_RESULT_H
@@ -11,7 +11,7 @@
 #include "librbd/io/Types.h"
 #include "osdc/Striper.h"
 #include <sys/uio.h>
-#include <boost/variant/variant.hpp>
+#include <variant>
 
 
 namespace librbd {
@@ -60,20 +60,18 @@ public:
       void finish(int r) override;
   };
 
-  ReadResult();
+  ReadResult() = default;
   ReadResult(char *buf, size_t buf_len);
   ReadResult(const struct iovec *iov, int iov_count);
   ReadResult(ceph::bufferlist *bl);
   ReadResult(Extents* extent_map, ceph::bufferlist* bl);
+  ReadResult(ReadExtents* read_extents);
 
   void set_image_extents(const Extents& image_extents);
 
   void assemble_result(CephContext *cct);
 
 private:
-  struct Empty {
-  };
-
   struct Linear {
     char *buf;
     size_t buf_len;
@@ -109,11 +107,21 @@ private:
     }
   };
 
-  typedef boost::variant<Empty,
-                         Linear,
-                         Vector,
-                         Bufferlist,
-                         SparseBufferlist> Buffer;
+  struct ChildObject {
+    ReadExtents* read_extents;
+    uint64_t overlap_bytes = 0;
+
+    ChildObject(ReadExtents* read_extents)
+      : read_extents(read_extents) {
+    }
+  };
+
+  typedef std::variant<std::monostate,
+		       Linear,
+		       Vector,
+		       Bufferlist,
+		       SparseBufferlist,
+		       ChildObject> Buffer;
   struct SetImageExtentsVisitor;
   struct AssembleResultVisitor;
 

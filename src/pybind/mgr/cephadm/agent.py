@@ -1,45 +1,32 @@
-try:
-    import cherrypy
-    from cherrypy._cpserver import Server
-except ImportError:
-    # to avoid sphinx build crash
-    class Server:  # type: ignore
-        pass
-
+import cherrypy
 import json
-import logging
 import socket
 import ssl
 import threading
 import time
 
-from orchestrator import DaemonDescriptionStatus
+from orchestrator import DaemonDescriptionStatus, OrchestratorError
 from orchestrator._interface import daemon_type_to_service
 from ceph.utils import datetime_now, http_req
 from ceph.deployment.inventory import Devices
-from ceph.deployment.service_spec import ServiceSpec, PlacementSpec
+from ceph.deployment.service_spec import ServiceSpec, PlacementSpec, CertificateSource
 from cephadm.services.cephadmservice import CephadmDaemonDeploySpec
 from mgr_util import test_port_allocation, PortAlreadyInUse
 from mgr_util import verify_tls_files
 import tempfile
+from cephadm.services.service_registry import service_registry
+from cephadm.services.cephadmservice import CephadmAgent
+from cephadm.tlsobject_types import TLSCredentials
+from cephadm.utils import get_node_proxy_status_value
 
 from urllib.error import HTTPError, URLError
-from typing import Any, Dict, List, Set, TYPE_CHECKING, Optional, MutableMapping, IO
+from typing import Any, Dict, List, Set, TYPE_CHECKING, Optional, MutableMapping, IO, Tuple
 
 if TYPE_CHECKING:
     from cephadm.module import CephadmOrchestrator
 
 
-def cherrypy_filter(record: logging.LogRecord) -> bool:
-    blocked = [
-        'TLSV1_ALERT_DECRYPT_ERROR'
-    ]
-    msg = record.getMessage()
-    return not any([m for m in blocked if m in msg])
-
-
-logging.getLogger('cherrypy.error').addFilter(cherrypy_filter)
-cherrypy.log.access_log.propagate = False
+CEPHADM_AGENT_CERT_DURATION = (365 * 5)
 
 
 class AgentEndpoint:
@@ -51,45 +38,64 @@ class AgentEndpoint:
         self.key_file: IO[bytes]
         self.cert_file: IO[bytes]
 
-    def configure_routes(self) -> None:
-        conf = {'/': {'tools.trailing_slash.on': False}}
+    def get_cherrypy_config(self) -> Dict:
+        config = {
+            '/': {
+                'tools.trailing_slash.on': False
+            }
+        }
+        return config
 
-        cherrypy.tree.mount(self.host_data, '/data', config=conf)
-        cherrypy.tree.mount(self.node_proxy_endpoint, '/node-proxy', config=conf)
+    def configure_routes(self, config: Dict) -> List[tuple]:
+        return [
+            (self.host_data, '/data', config),
+            (self.node_proxy_endpoint, '/node-proxy', config),
+        ]
 
-    def configure_tls(self, server: Server) -> None:
-        addr = self.mgr.get_mgr_ip()
-        host = self.mgr.get_hostname()
-        cert, key = self.mgr.cert_mgr.generate_cert(host, addr)
+    def configure_tls(self) -> Dict[str, str]:
+        self.mgr.cert_mgr.register_self_signed_cert_key_pair(CephadmAgent.TYPE)
+        tls_pair = self._get_agent_certificates()
         self.cert_file = tempfile.NamedTemporaryFile()
-        self.cert_file.write(cert.encode('utf-8'))
+        self.cert_file.write(tls_pair.cert.encode('utf-8'))
         self.cert_file.flush()  # cert_tmp must not be gc'ed
 
         self.key_file = tempfile.NamedTemporaryFile()
-        self.key_file.write(key.encode('utf-8'))
+        self.key_file.write(tls_pair.key.encode('utf-8'))
         self.key_file.flush()  # pkey_tmp must not be gc'ed
 
         verify_tls_files(self.cert_file.name, self.key_file.name)
-        server.ssl_certificate, server.ssl_private_key = self.cert_file.name, self.key_file.name
+        return {
+            'cert': self.cert_file.name,
+            'key': self.key_file.name,
+        }
+
+    def _get_agent_certificates(self) -> TLSCredentials:
+        host = self.mgr.get_hostname()
+        tls_creds = self.mgr.cert_mgr.get_self_signed_tls_credentials(CephadmAgent.TYPE, host)
+        if not tls_creds:
+            tls_creds = self.mgr.cert_mgr.generate_cert(host, self.mgr.get_mgr_ip(), duration_in_days=CEPHADM_AGENT_CERT_DURATION)
+            self.mgr.cert_mgr.save_self_signed_cert_key_pair(CephadmAgent.TYPE, tls_creds, host=host)
+        return tls_creds
 
     def find_free_port(self) -> None:
         max_port = self.server_port + 150
         while self.server_port <= max_port:
             try:
                 test_port_allocation(self.server_addr, self.server_port)
-                self.host_data.socket_port = self.server_port
                 self.mgr.log.debug(f'Cephadm agent endpoint using {self.server_port}')
                 return
             except PortAlreadyInUse:
                 self.server_port += 1
         self.mgr.log.error(f'Cephadm agent could not find free port in range {max_port - 150}-{max_port} and failed to start')
 
-    def configure(self) -> None:
-        self.host_data = HostData(self.mgr, self.server_port, self.server_addr)
-        self.configure_tls(self.host_data)
+    def configure(self) -> Tuple[Dict, Dict, List[tuple], tuple]:
+        self.host_data = HostData(self.mgr)
+        ssl_info = self.configure_tls()
         self.node_proxy_endpoint = NodeProxyEndpoint(self.mgr)
-        self.configure_routes()
+        config = self.get_cherrypy_config()
+        mount_specs = self.configure_routes(config)
         self.find_free_port()
+        return config, ssl_info, mount_specs, (self.server_addr, self.server_port)
 
 
 class NodeProxyEndpoint:
@@ -173,6 +179,12 @@ class NodeProxyEndpoint:
         except AttributeError:
             raise cherrypy.HTTPError(400, 'Malformed data received.')
 
+    def _get_health_value(self, member_data: Any) -> str:
+        return get_node_proxy_status_value(member_data, 'health', lower=True)
+
+    def _get_state_value(self, member_data: Any) -> str:
+        return get_node_proxy_status_value(member_data, 'state')
+
     # TODO(guits): refactor this
     # TODO(guits): use self.node_proxy.get_critical_from_host() ?
     def get_nok_members(self,
@@ -193,16 +205,18 @@ class NodeProxyEndpoint:
 
         for sys_id in data.keys():
             for member in data[sys_id].keys():
-                _status = data[sys_id][member]['status']['health'].lower()
-                if _status.lower() != 'ok':
-                    state = data[sys_id][member]['status']['state']
-                    _member = dict(
-                        sys_id=sys_id,
-                        member=member,
-                        status=_status,
-                        state=state
-                    )
-                    nok_members.append(_member)
+                member_data = data[sys_id][member]
+                if member in ('firmware', 'firmwares'):
+                    continue
+                _status = self._get_health_value(member_data)
+                if _status and _status != 'ok':
+                    state = self._get_state_value(member_data)
+                    nok_members.append({
+                        'sys_id': sys_id,
+                        'member': member,
+                        'status': _status,
+                        'state': state
+                    })
 
         return nok_members
 
@@ -396,7 +410,7 @@ class NodeProxyEndpoint:
         """
         try:
             results = self.mgr.node_proxy_cache.fullreport(**kw)
-        except KeyError:
+        except (KeyError, OrchestratorError):
             raise cherrypy.HTTPError(404, f"{kw.get('hostname')} not found.")
         return results
 
@@ -420,7 +434,7 @@ class NodeProxyEndpoint:
         """
         try:
             results = self.mgr.node_proxy_cache.criticals(**kw)
-        except KeyError:
+        except (KeyError, OrchestratorError):
             raise cherrypy.HTTPError(404, f"{kw.get('hostname')} not found.")
         return results
 
@@ -444,7 +458,7 @@ class NodeProxyEndpoint:
         """
         try:
             results = self.mgr.node_proxy_cache.summary(**kw)
-        except KeyError:
+        except (KeyError, OrchestratorError):
             raise cherrypy.HTTPError(404, f"{kw.get('hostname')} not found.")
         return results
 
@@ -469,7 +483,7 @@ class NodeProxyEndpoint:
         """
         try:
             results = self.mgr.node_proxy_cache.common('memory', **kw)
-        except KeyError:
+        except (KeyError, OrchestratorError):
             raise cherrypy.HTTPError(404, f"{kw.get('hostname')} not found.")
         return results
 
@@ -494,7 +508,7 @@ class NodeProxyEndpoint:
         """
         try:
             results = self.mgr.node_proxy_cache.common('network', **kw)
-        except KeyError:
+        except (KeyError, OrchestratorError):
             raise cherrypy.HTTPError(404, f"{kw.get('hostname')} not found.")
         return results
 
@@ -519,7 +533,7 @@ class NodeProxyEndpoint:
         """
         try:
             results = self.mgr.node_proxy_cache.common('processors', **kw)
-        except KeyError:
+        except (KeyError, OrchestratorError):
             raise cherrypy.HTTPError(404, f"{kw.get('hostname')} not found.")
         return results
 
@@ -544,7 +558,7 @@ class NodeProxyEndpoint:
         """
         try:
             results = self.mgr.node_proxy_cache.common('storage', **kw)
-        except KeyError:
+        except (KeyError, OrchestratorError):
             raise cherrypy.HTTPError(404, f"{kw.get('hostname')} not found.")
         return results
 
@@ -569,7 +583,7 @@ class NodeProxyEndpoint:
         """
         try:
             results = self.mgr.node_proxy_cache.common('power', **kw)
-        except KeyError:
+        except (KeyError, OrchestratorError):
             raise cherrypy.HTTPError(404, f"{kw.get('hostname')} not found.")
         return results
 
@@ -594,7 +608,27 @@ class NodeProxyEndpoint:
         """
         try:
             results = self.mgr.node_proxy_cache.common('fans', **kw)
-        except KeyError:
+        except (KeyError, OrchestratorError):
+            raise cherrypy.HTTPError(404, f"{kw.get('hostname')} not found.")
+        return results
+
+    @cherrypy.expose
+    @cherrypy.tools.allow(methods=['GET'])
+    @cherrypy.tools.json_out()
+    def temperatures(self, **kw: Any) -> Dict[str, Any]:
+        try:
+            results = self.mgr.node_proxy_cache.common('temperatures', **kw)
+        except (KeyError, OrchestratorError):
+            raise cherrypy.HTTPError(404, f"{kw.get('hostname')} not found.")
+        return results
+
+    @cherrypy.expose
+    @cherrypy.tools.allow(methods=['GET'])
+    @cherrypy.tools.json_out()
+    def fcm(self, **kw: Any) -> Dict[str, Any]:
+        try:
+            results = self.mgr.node_proxy_cache.common('fcm', **kw)
+        except (KeyError, OrchestratorError):
             raise cherrypy.HTTPError(404, f"{kw.get('hostname')} not found.")
         return results
 
@@ -602,11 +636,17 @@ class NodeProxyEndpoint:
     @cherrypy.tools.allow(methods=['GET'])
     @cherrypy.tools.json_out()
     def firmwares(self, **kw: Any) -> Dict[str, Any]:
+        return self.firmware(**kw)
+
+    @cherrypy.expose
+    @cherrypy.tools.allow(methods=['GET'])
+    @cherrypy.tools.json_out()
+    def firmware(self, **kw: Any) -> Dict[str, Any]:
         """
         Handles GET request to retrieve firmware information.
 
         This function is exposed to handle GET requests and fetches firmware data using
-        the 'firmwares' method from the NodeProxyCache class.
+        the 'firmware' method from the NodeProxyCache class.
 
         :param kw: Keyword arguments for the request.
         :type kw: dict
@@ -617,28 +657,17 @@ class NodeProxyEndpoint:
         :raises cherrypy.HTTPError 404: If the passed hostname is not found.
         """
         try:
-            results = self.mgr.node_proxy_cache.firmwares(**kw)
-        except KeyError:
+            results = self.mgr.node_proxy_cache.firmware(**kw)
+        except (KeyError, OrchestratorError):
             raise cherrypy.HTTPError(404, f"{kw.get('hostname')} not found.")
         return results
 
 
-class HostData(Server):
+class HostData:
     exposed = True
 
-    def __init__(self, mgr: "CephadmOrchestrator", port: int, host: str):
+    def __init__(self, mgr: "CephadmOrchestrator"):
         self.mgr = mgr
-        super().__init__()
-        self.socket_port = port
-        self.socket_host = host
-        self.subscribe()
-
-    def stop(self) -> None:
-        # we must call unsubscribe before stopping the server,
-        # otherwise the port is not released and we will get
-        # an exception when trying to restart it
-        self.unsubscribe()
-        super().stop()
 
     @cherrypy.tools.allow(methods=['POST'])
     @cherrypy.tools.json_in()
@@ -781,15 +810,15 @@ class AgentMessageThread(threading.Thread):
             root_cert_tmp.flush()
             root_cert_fname = root_cert_tmp.name
 
-            cert, key = self.mgr.cert_mgr.generate_cert(self.mgr.get_hostname(), self.mgr.get_mgr_ip())
+            tls_pair = self.mgr.cert_mgr.generate_cert(self.mgr.get_hostname(), self.mgr.get_mgr_ip(), duration_in_days=CEPHADM_AGENT_CERT_DURATION)
 
             cert_tmp = tempfile.NamedTemporaryFile()
-            cert_tmp.write(cert.encode('utf-8'))
+            cert_tmp.write(tls_pair.cert.encode('utf-8'))
             cert_tmp.flush()
             cert_fname = cert_tmp.name
 
             key_tmp = tempfile.NamedTemporaryFile()
-            key_tmp.write(key.encode('utf-8'))
+            key_tmp.write(tls_pair.key.encode('utf-8'))
             key_tmp.flush()
             key_fname = key_tmp.name
 
@@ -876,7 +905,7 @@ class CephadmAgentHelpers:
         if self.mgr.cache.is_host_draining(host):
             return False
         # if we haven't deployed an agent on the host yet, don't say an agent is down
-        if not self.mgr.cache.get_daemons_by_type('agent', host=host):
+        if not self.mgr.cache.get_daemons_by_type(CephadmAgent.TYPE, host=host):
             return False
         # if we don't have a timestamp, it's likely because of a mgr fail over.
         # just set the timestamp to now. However, if host was offline before, we
@@ -901,7 +930,7 @@ class CephadmAgentHelpers:
                 detail.append((f'Cephadm agent on host {agent} has not reported in '
                               f'{down_mult * self.mgr.agent_refresh_rate} seconds. Agent is assumed '
                                'down and host may be offline.'))
-            for dd in [d for d in self.mgr.cache.get_daemons_by_type('agent') if d.hostname in down_agent_hosts]:
+            for dd in [d for d in self.mgr.cache.get_daemons_by_type(CephadmAgent.TYPE) if d.hostname in down_agent_hosts]:
                 dd.status = DaemonDescriptionStatus.error
             self.mgr.set_health_warning(
                 'CEPHADM_AGENT_DOWN',
@@ -917,8 +946,10 @@ class CephadmAgentHelpers:
     # daemons, OR we can put this in its own function then mock the function
     def _apply_agent(self) -> None:
         spec = ServiceSpec(
-            service_type='agent',
-            placement=PlacementSpec(host_pattern='*')
+            service_type=CephadmAgent.TYPE,
+            placement=PlacementSpec(host_pattern='*'),
+            ssl=True,
+            certificate_source=CertificateSource.CEPHADM_SIGNED.value,
         )
         self.mgr.spec_store.save(spec)
 
@@ -929,17 +960,17 @@ class CephadmAgentHelpers:
             # when we turned the config option off, we need to redeploy them
             # we can tell they're in that state if we don't have a keyring for
             # them in the host cache
-            for agent in self.mgr.cache.get_daemons_by_service('agent'):
+            for agent in self.mgr.cache.get_daemons_by_service(CephadmAgent.TYPE):
                 if agent.hostname not in self.mgr.agent_cache.agent_keys:
                     self.mgr._schedule_daemon_action(agent.name(), 'redeploy')
-            if 'agent' not in self.mgr.spec_store:
+            if CephadmAgent.TYPE not in self.mgr.spec_store:
                 self.mgr.agent_helpers._apply_agent()
                 need_apply = True
         else:
-            if 'agent' in self.mgr.spec_store:
-                self.mgr.spec_store.rm('agent')
+            if CephadmAgent.TYPE in self.mgr.spec_store:
+                self.mgr.spec_store.rm(CephadmAgent.TYPE)
                 need_apply = True
-            if not self.mgr.cache.get_daemons_by_service('agent'):
+            if not self.mgr.cache.get_daemons_by_service(CephadmAgent.TYPE):
                 self.mgr.agent_cache.agent_counter = {}
                 self.mgr.agent_cache.agent_timestamp = {}
                 self.mgr.agent_cache.agent_keys = {}
@@ -958,7 +989,7 @@ class CephadmAgentHelpers:
         if self.mgr.agent_helpers._agent_down(host):
             down = True
         try:
-            agent = self.mgr.cache.get_daemons_by_type('agent', host=host)[0]
+            agent = self.mgr.cache.get_daemons_by_type(CephadmAgent.TYPE, host=host)[0]
             assert agent.daemon_id is not None
             assert agent.hostname is not None
         except Exception as e:
@@ -966,8 +997,8 @@ class CephadmAgentHelpers:
                 f'Could not retrieve agent on host {host} from daemon cache: {e}')
             return down
         try:
-            spec = self.mgr.spec_store.active_specs.get('agent', None)
-            deps = self.mgr._calc_daemon_deps(spec, 'agent', agent.daemon_id)
+            spec = self.mgr.spec_store.active_specs.get(CephadmAgent.TYPE, None)
+            deps = CephadmAgent.sorted_dependencies(self.mgr, spec, CephadmAgent.TYPE)
             last_deps, last_config = self.mgr.agent_cache.get_agent_last_config_deps(host)
             if not last_config or last_deps != deps:
                 # if root cert is the dep that changed, we must use ssh to reconfig
@@ -983,8 +1014,8 @@ class CephadmAgentHelpers:
                 # we need to know the agent port to try to reconfig w/ http
                 # otherwise there is no choice but a full ssh reconfig
                 if host in self.mgr.agent_cache.agent_ports and root_cert_match and not down:
-                    daemon_spec = self.mgr.cephadm_services[daemon_type_to_service(
-                        daemon_spec.daemon_type)].prepare_create(daemon_spec)
+                    daemon_spec = service_registry.get_service(daemon_type_to_service(
+                        daemon_spec.daemon_type)).prepare_create(daemon_spec)
                     self.mgr.agent_helpers._request_agent_acks(
                         hosts={daemon_spec.host},
                         increment=True,

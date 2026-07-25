@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
+
 #pragma once
 
 #include <chrono>
@@ -36,23 +37,6 @@ struct sched_conf_t {
 
   /// the desired interval between deep scrubs
   double deep_interval{0.0};
-
-  /**
-   * the maximum interval between shallow scrubs, as determined by either the
-   * OSD or the pool configuration. Empty if no limit is configured.
-   */
-  std::optional<double> max_shallow;
-
-  /**
-   * the maximum interval between deep scrubs.
-   * For deep scrubs - there is no equivalent of scrub_max_interval. Per the
-   * documentation, once deep_scrub_interval has passed, we are already
-   * "overdue", at least as far as the "ignore allowed load" window is
-   * concerned. \todo based on users complaints (and the fact that the
-   * interaction between the configuration parameters is clear to no one),
-   * this will be revised shortly.
-   */
-  double max_deep{0.0};
 
   /**
    * interval_randomize_ratio
@@ -221,28 +205,23 @@ class ScrubJob {
 
   /**
    * Given a proposed time for the next scrub, and the relevant
-   * configuration, adjust_schedule() determines the actual target time,
-   * the deadline, and the 'not_before' time for the scrub.
+   * configuration, adjust_schedule() determines the actual target time
+   * and the 'not_before' time for the scrub.
    * The new values are updated into the scrub-job.
    *
    * Specifically:
-   * - for high-priority scrubs: n.b. & deadline are set equal to the
+   * - for high-priority scrubs: the 'not_before' is set to the
    *   (untouched) proposed target time.
    * - for regular scrubs: the proposed time is adjusted (delayed) based
-   *   on the configuration; the deadline is set further out (if configured)
-   *   and the n.b. is reset to the target.
+   *   on the configuration; the n.b. is reset to the target.
    */
   void adjust_shallow_schedule(
     utime_t last_scrub,
-    const Scrub::sched_conf_t& app_conf,
-    utime_t scrub_clock_now,
-    delay_ready_t modify_ready_targets);
+    const Scrub::sched_conf_t& app_conf);
 
   void adjust_deep_schedule(
     utime_t last_deep,
-    const Scrub::sched_conf_t& app_conf,
-    utime_t scrub_clock_now,
-    delay_ready_t modify_ready_targets);
+    const Scrub::sched_conf_t& app_conf);
 
   /**
    * For the level specified, set the 'not-before' time to 'now+delay',
@@ -257,20 +236,6 @@ class ScrubJob {
       delay_cause_t delay_cause,
       utime_t scrub_clock_now);
 
- /**
-   * recalculate the scheduling parameters for the periodic scrub targets.
-   * Used whenever the "external state" of the PG changes, e.g. when made
-   * primary - or indeed when the configuration changes.
-   *
-   * Does not modify ripe targets.
-   * (why? for example, a 'scrub pg' command following a 'deepscrub pg'
-   * would otherwise push the deep scrub to the future).
-   */
-  void on_periods_change(
-      const sched_params_t& suggested,
-      const Scrub::sched_conf_t& aconf,
-      utime_t scrub_clock_now) {}
-
   /**
    * the operator requested a scrub (shallow, deep or repair).
    * Set the selected target to the requested urgency, adjusting scheduling
@@ -278,7 +243,16 @@ class ScrubJob {
    */
   void operator_forced(scrub_level_t s_or_d, scrub_type_t scrub_type);
 
-  void dump(ceph::Formatter* f) const;
+  /**
+   * calculate a time offset large enough, so that once the relevant
+   * last-scrub timestamp is forced back by this amount, the PG is
+   * eligible for a periodic scrub of the specified level.
+   * Used by the scrubber upon receiving a 'fake a scheduled scrub' request
+   * from the operator.
+   */
+  double guaranteed_offset(
+      scrub_level_t s_or_d,
+      const Scrub::sched_conf_t& app_conf);
 
   bool is_registered() const { return registered; }
 
@@ -298,16 +272,6 @@ class ScrubJob {
   std::ostream& gen_prefix(std::ostream& out, std::string_view fn) const;
   std::string log_msg_prefix;
 
-  // the comparison operator is used to sort the scrub jobs in the queue.
-  // Note that it would not be needed in the next iteration of this code, as
-  // the queue would *not* hold the full ScrubJob objects, but rather -
-  // SchedTarget(s).
-  std::partial_ordering operator<=>(const ScrubJob& rhs) const
-  {
-    return cmp_entries(
-      ceph_clock_now(), shallow_target.queued_element(),
-      deep_target.queued_element());
-  };
 
 
  /*
@@ -316,8 +280,6 @@ class ScrubJob {
  * Some types of scrubs are exempt from some or all of the preconditions and
  * limitations that apply to regular scrubs. The following table
  * details the specific set of exemptions per 'urgency' level:
- * (note: regular scrubs that are overdue are also allowed a specific
- * set of exemptions. Those will be covered elsewhere).
  *
  * The relevant limitations are:
  * - reservation: the scrub must reserve replicas;
@@ -326,6 +288,8 @@ class ScrubJob {
  *   if continued into the forbidden times, by having a longer sleep time;
  *   (note that this is only applicable to the wq scheduler).
  * - load: the scrub must not be initiated if the OSD is under heavy CPU load;
+ * - trims: the scrub must not be initiated if the OSD has too many snap-trim
+ *   jobs pending;
  * - noscrub: the scrub is aborted if the 'noscrub' flag (or the
  *  'nodeep-scrub' flag for deep scrubs) is set;
  * - randomization: the scrub's target time is extended by a random
@@ -345,14 +309,15 @@ class ScrubJob {
  *  | limitation |  must-  | after-repair |repairing| operator | must-repair |
  *  |            |  scrub  |(aft recovery)|(errors) | request  |             |
  *  +------------+---------+--------------+---------+----------+-------------+
- *  | reservation|    yes! |      no      |    no?  +     no   |      no     |
- *  | dow/time   |    yes  |     yes      |    no   +     no   |      no     |
- *  | ext-sleep  |    no   |      no      |    no   +     no   |      no     |
- *  | load       |    yes  |      no      |    no   +     no   |      no     |
- *  | noscrub    |    yes  |      no?     |    Yes  +     no   |      no     |
- *  | max-scrubs |    yes  |      yes     |    Yes  +     no   |      no     |
- *  | backoff    |    yes  |      no      |    no   +     no   |      no     |
- *  | recovery   |    yes  |      yes     |    Yes  +     no   |      no     |
+ *  | reservation|    yes  |      no      |    no   |     no   |      no     |
+ *  | dow/time   |    yes  |      yes     |    no   |     no   |      no     |
+ *  | ext-sleep  |    no   |      no      |    no   |     no   |      no     |
+ *  | load       |    yes  |      no      |    no   |     no   |      no     |
+ *  | trims      |    yes  |      yes     |    no   |     no   |      no     |
+ *  | noscrub    |    yes  |      no      |    no   |     no   |      no     |
+ *  | max-scrubs |    yes  |      yes     |    Yes  |     no   |      no     |
+ *  | backoff    |    yes  |      no      |    no   |     no   |      no     |
+ *  | recovery   |    yes  |      yes     |    Yes  |     no   |      no     |
  *  +------------+---------+--------------+---------+----------+-------------+
  */
 
@@ -363,7 +328,11 @@ class ScrubJob {
 
   static bool observes_allowed_hours(urgency_t urgency);
 
+  static bool observes_extended_sleep(urgency_t urgency);
+
   static bool observes_load_limit(urgency_t urgency);
+
+  static bool observes_trims_load(urgency_t urgency);
 
   static bool requires_reservation(urgency_t urgency);
 
@@ -380,6 +349,15 @@ class ScrubJob {
   static bool has_high_queue_priority(urgency_t urgency);
 
   static bool is_repair_implied(urgency_t urgency);
+
+  static bool is_autorepair_allowed(urgency_t urgency);
+
+  /**
+   * should we cancel the repair if the number of damaged objects
+   * exceeds the configured limit ('osd_scrub_auto_repair_num_errors')?
+   * This does not apply to any repair that was operator-initiated.
+   */
+  static bool is_repairs_count_limited(urgency_t urgency);
 };
 }  // namespace Scrub
 
@@ -434,9 +412,9 @@ struct formatter<Scrub::sched_conf_t> {
   {
     return fmt::format_to(
 	ctx.out(),
-	"periods:s:{}/{},d:{}/{},iv-ratio:{},deep-rand:{},on-inv:{}",
-	cf.shallow_interval, cf.max_shallow.value_or(-1.0), cf.deep_interval,
-	cf.max_deep, cf.interval_randomize_ratio, cf.deep_randomize_ratio,
+	"periods:s:{},d:{},iv-ratio:{},deep-rand:{},on-inv:{}",
+	cf.shallow_interval, cf.deep_interval,
+	cf.interval_randomize_ratio, cf.deep_randomize_ratio,
 	cf.mandatory_on_invalid);
   }
 };

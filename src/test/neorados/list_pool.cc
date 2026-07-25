@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph - scalable distributed file system
  *
@@ -136,7 +137,7 @@ int main(int argc, char** argv)
 
   try {
     ca::io_context_pool p(1);
-    auto r = R::RADOS::make_with_cct(cct.get(), p, ca::use_blocked);
+    auto r = R::RADOS::make_with_cct(cct, p, ca::use_blocked);
 
     auto pool_name = get_temp_pool_name("ceph_test_RADOS_list_pool"sv);
     r.create_pool(pool_name, std::nullopt, ca::use_blocked);

@@ -1,5 +1,5 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
 
 /*
  * Ceph - scalable distributed file system
@@ -38,7 +38,7 @@ SQLITE_EXTENSION_INIT1
 #include "include/rados/librados.hpp"
 
 #include "common/Clock.h"
-#include "common/Formatter.h"
+#include "common/JSONFormatter.h"
 #include "common/ceph_argparse.h"
 #include "common/ceph_mutex.h"
 #include "common/common_init.h"
@@ -46,10 +46,17 @@ SQLITE_EXTENSION_INIT1
 #include "common/debug.h"
 #include "common/errno.h"
 #include "common/perf_counters.h"
+#include "common/strtol.h" // for strict_strtoll()
 #include "common/version.h"
 
 #include "include/libcephsqlite.h"
 #include "SimpleRADOSStriper.h"
+
+#ifdef WITH_CRIMSON
+#include "crimson/common/perf_counters_collection.h"
+#else
+#include "common/perf_counters_collection.h"
+#endif
 
 #define dout_subsys ceph_subsys_cephsqlite
 #undef dout_prefix
@@ -82,6 +89,8 @@ enum {
 
 using cctptr = boost::intrusive_ptr<CephContext>;
 using rsptr = std::shared_ptr<librados::Rados>;
+
+static void cephsqlite_atexit();
 
 struct cephsqlite_appdata {
   ~cephsqlite_appdata() {
@@ -205,12 +214,18 @@ private:
       lderr(cct) << "cannot connect: " << cpp_strerror(rc) << dendl;
       return rc;
     }
+    /* This **must** occur after OpenSSL registers any atexit handlers (**sigh**). */
+    std::call_once(atexit_registered, []() {
+      std::atexit(cephsqlite_atexit);
+    });
     auto s = _cluster->get_addrs();
     ldout(cct, 5) << "completed connection to RADOS with address " << s << dendl;
     cluster = std::move(_cluster);
+
     return 0;
   }
 
+  std::once_flag atexit_registered;
   ceph::mutex cluster_mutex = ceph::make_mutex("libcephsqlite");;
   cctptr cct;
   rsptr cluster;
@@ -809,8 +824,8 @@ static void f_perf(sqlite3_context* ctx, int argc, sqlite3_value** argv)
   auto&& appd = getdata(vfs);
   JSONFormatter f(false);
   f.open_object_section("ceph_perf");
-  appd.logger->dump_formatted(&f, false, false);
-  appd.striper_logger->dump_formatted(&f, false, false);
+  appd.logger->dump_formatted(&f, false, select_labeled_t::unlabeled);
+  appd.striper_logger->dump_formatted(&f, false, select_labeled_t::unlabeled);
   f.close_section();
   {
     CachedStackStringStream css;
@@ -916,10 +931,6 @@ LIBCEPHSQLITE_API int sqlite3_cephsqlite_init(sqlite3* db, char** err, const sql
       free(vfs);
       return rc;
     }
-  }
-
-  if (int rc = std::atexit(cephsqlite_atexit); rc) {
-    return SQLITE_INTERNAL;
   }
 
   if (int rc = sqlite3_auto_extension((void(*)(void))autoreg); rc) {

@@ -1,5 +1,5 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
 
 #ifndef CEPH_RBD_MIRROR_IMAGE_REPLAYER_STATE_BUILDER_H
 #define CEPH_RBD_MIRROR_IMAGE_REPLAYER_STATE_BUILDER_H
@@ -75,6 +75,7 @@ public:
       Threads<ImageCtxT>* threads,
       InstanceWatcher<ImageCtxT>* instance_watcher,
       const std::string& local_mirror_uuid,
+      const std::string& local_mirror_peer_uuid,
       PoolMetaCache* pool_meta_cache,
       ReplayerListener* replayer_listener) = 0;
 

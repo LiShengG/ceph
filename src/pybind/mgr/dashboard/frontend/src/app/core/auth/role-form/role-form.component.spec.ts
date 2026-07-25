@@ -5,18 +5,17 @@ import { ReactiveFormsModule } from '@angular/forms';
 import { Router, Routes } from '@angular/router';
 import { RouterTestingModule } from '@angular/router/testing';
 
-import { ToastrModule } from 'ngx-toastr';
 import { of } from 'rxjs';
 
 import { RoleService } from '~/app/shared/api/role.service';
 import { ScopeService } from '~/app/shared/api/scope.service';
-import { LoadingPanelComponent } from '~/app/shared/components/loading-panel/loading-panel.component';
 import { CdFormGroup } from '~/app/shared/forms/cd-form-group';
 import { NotificationService } from '~/app/shared/services/notification.service';
 import { SharedModule } from '~/app/shared/shared.module';
 import { configureTestBed, FormHelper } from '~/testing/unit-test-helper';
 import { RoleFormComponent } from './role-form.component';
 import { RoleFormModel } from './role-form.model';
+import { USER } from '~/app/shared/constants/app.constants';
 
 describe('RoleFormComponent', () => {
   let component: RoleFormComponent;
@@ -27,24 +26,20 @@ describe('RoleFormComponent', () => {
   let router: Router;
   const setUrl = (url: string) => Object.defineProperty(router, 'url', { value: url });
 
-  @Component({ selector: 'cd-fake', template: '' })
+  @Component({ selector: 'cd-fake', template: '', standalone: false })
   class FakeComponent {}
 
   const routes: Routes = [{ path: 'roles', component: FakeComponent }];
 
-  configureTestBed(
-    {
-      imports: [
-        RouterTestingModule.withRoutes(routes),
-        HttpClientTestingModule,
-        ReactiveFormsModule,
-        ToastrModule.forRoot(),
-        SharedModule
-      ],
-      declarations: [RoleFormComponent, FakeComponent]
-    },
-    [LoadingPanelComponent]
-  );
+  configureTestBed({
+    imports: [
+      RouterTestingModule.withRoutes(routes),
+      HttpClientTestingModule,
+      ReactiveFormsModule,
+      SharedModule
+    ],
+    declarations: [RoleFormComponent, FakeComponent]
+  });
 
   beforeEach(() => {
     fixture = TestBed.createComponent(RoleFormComponent);
@@ -87,6 +82,10 @@ describe('RoleFormComponent', () => {
       expect(component.mode).toBeUndefined();
     });
 
+    it('should set submit action to Create Role', () => {
+      expect(component.submitAction).toBe('Create Role');
+    });
+
     it('should submit', () => {
       const role: RoleFormModel = {
         name: 'role1',
@@ -111,7 +110,7 @@ describe('RoleFormComponent', () => {
       description: 'Role 1',
       scopes_permissions: { osd: ['read', 'create'] }
     };
-    const scopes = ['osd', 'user'];
+    const scopes = ['osd', USER];
     beforeEach(() => {
       formHelper = new FormHelper(form);
       spyOn(roleService, 'get').and.callFake(() => of(role));
@@ -141,6 +140,10 @@ describe('RoleFormComponent', () => {
 
     it('should set mode', () => {
       expect(component.mode).toBe('editing');
+    });
+
+    it('should set submit action to Save changes', () => {
+      expect(component.submitAction).toBe('Save changes');
     });
 
     it('should submit', () => {

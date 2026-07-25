@@ -187,6 +187,31 @@ class MissingRequiredFieldError(KeyError, ResourceTypeError):
         return f'data object missing required field: {self.key}'
 
 
+class InvalidObjectTypeFieldError(ResourceTypeError):
+    """Exception raised when an object can not be converted from unstructured
+    data due to having an incorrect type in the unstructured data.
+    """
+
+    def __init__(self, key: str, expected: str = '', found: str = '') -> None:
+        self.key = key
+        self.expected = expected
+        self.found = found
+
+    def __str__(self) -> str:
+        msg = f'invalid type for field: {self.key}'
+        if self.expected:
+            msg += f': expected {self.expected}'
+        if self.found:
+            msg += f', found {self.found}'
+        return msg
+
+    @classmethod
+    def from_value(cls, key: str, value: Any, expected: str = '') -> Self:
+        tname = type(value).__name__
+        tname = 'string' if tname == 'str' else tname
+        return cls(key, expected=expected, found=tname)
+
+
 # ---- Internal Resource Types ----
 
 # Sentinel object for unset/missing value conditions.
@@ -223,6 +248,11 @@ class Field:
     default: Any = _unset
     quiet: bool = False  # customization value
     keep_none: bool = False  # customization value
+    # wrapper_type can be used to customize the output type of a scalar value.
+    # Typically this is used to assist YAML serialization.
+    # IMPORTANT: make sure the type produces valid YAML and JSON, ideally as
+    # subclass as a native type.
+    wrapper_type: Optional[Callable] = None
 
     def optional(self) -> bool:
         """Return true if the type of the field is Optional."""
@@ -385,20 +415,41 @@ class Resource:
             return _fs(value)
 
         if fld.takes(list):
-            subtype = fld.list_element_type()
-            return [
-                self._object_sub_from_simplified(subtype, v) for v in value
-            ]
+            return self._extract_list_field(fld, value)
         if fld.takes(dict):
-            ktype, vtype = fld.dict_element_types()
-            # keys must be simple types right now so we just
-            # cast it directly
-            return {
-                ktype(k): self._object_sub_from_simplified(vtype, v)
-                for k, v in value.items()
-            }
+            return self._extract_dict_field(fld, value)
 
         return inner_type(value)
+
+    @_xt
+    def _extract_list_field(self, fld: Field, value: Any) -> Any:
+        # reject iterable but insufficiently list-like types
+        if isinstance(value, (str, bytes)):
+            raise InvalidObjectTypeFieldError(
+                fld.name, expected='list', found='string'
+            )
+        if isinstance(value, dict):
+            raise InvalidObjectTypeFieldError(
+                fld.name, expected='list', found='object/mapping'
+            )
+        subtype = fld.list_element_type()
+        return [self._object_sub_from_simplified(subtype, v) for v in value]
+
+    @_xt
+    def _extract_dict_field(self, fld: Field, value: Any) -> Any:
+        try:
+            _items = value.items()
+        except AttributeError:
+            raise InvalidObjectTypeFieldError.from_value(
+                fld.name, value, expected='object/mapping'
+            )
+        ktype, vtype = fld.dict_element_types()
+        # keys must be simple types right now so we just
+        # cast it directly
+        return {
+            ktype(k): self._object_sub_from_simplified(vtype, v)
+            for k, v in _items
+        }
 
     @_xt
     def _object_sub_from_simplified(
@@ -462,11 +513,15 @@ class Resource:
             }
             return
 
+        if fld.wrapper_type:
+            _out = fld.wrapper_type
+        else:
+            _out = lambda v: v  # noqa: E731
         if isinstance(value, str):
-            data[fld.name] = str(value)
+            data[fld.name] = _out(str(value))
             return
         if isinstance(value, (int, float)):
-            data[fld.name] = value
+            data[fld.name] = _out(value)
             return
         raise ResourceTypeError(f'unexpected type for field {fld.name}')
 
@@ -498,6 +553,11 @@ class Resource:
         _customize = getattr(resource_cls, '_customize_resource', None)
         if _customize is not None:
             resource = _customize(resource)
+            if not resource:
+                raise ValueError(
+                    '_customize_resource must return a valid resource object,'
+                    f' not {resource!r}'
+                )
         return resource
 
 

@@ -4,11 +4,11 @@ import { BrowserAnimationsModule } from '@angular/platform-browser/animations';
 import { RouterTestingModule } from '@angular/router/testing';
 
 import { NgbNavModule } from '@ng-bootstrap/ng-bootstrap';
-import { ToastrModule } from 'ngx-toastr';
+
 import { of } from 'rxjs';
 
 import { PrometheusService } from '~/app/shared/api/prometheus.service';
-import { CriticalConfirmationModalComponent } from '~/app/shared/components/critical-confirmation-modal/critical-confirmation-modal.component';
+import { DeleteConfirmationModalComponent } from '~/app/shared/components/delete-confirmation-modal/delete-confirmation-modal.component';
 import { TableActionsComponent } from '~/app/shared/datatable/table-actions/table-actions.component';
 import { NotificationType } from '~/app/shared/enum/notification-type.enum';
 import { Permission } from '~/app/shared/models/permissions';
@@ -31,7 +31,6 @@ describe('SilenceListComponent', () => {
     imports: [
       BrowserAnimationsModule,
       SharedModule,
-      ToastrModule.forRoot(),
       RouterTestingModule,
       HttpClientTestingModule,
       NgbNavModule
@@ -53,6 +52,13 @@ describe('SilenceListComponent', () => {
   it('should create', () => {
     fixture.detectChanges();
     expect(component).toBeTruthy();
+  });
+
+  it('should create for read-only prometheus users', () => {
+    (authStorageService.getPermissions as jasmine.Spy).and.callFake(() => ({
+      prometheus: new Permission(['read'])
+    }));
+    expect(() => TestBed.createComponent(SilenceListComponent)).not.toThrow();
   });
 
   it('should test all TableActions combinations', () => {
@@ -143,7 +149,7 @@ describe('SilenceListComponent', () => {
 
     const expireSilence = () => {
       component.expireSilence();
-      const deletion: CriticalConfirmationModalComponent = component.modalRef.componentInstance;
+      const deletion: DeleteConfirmationModalComponent = component.modalRef.componentInstance;
       // deletion.modalRef = new BsModalRef();
       deletion.ngOnInit();
       deletion.callSubmitAction();

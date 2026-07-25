@@ -27,7 +27,7 @@ the following forms:
    ceph device ls-by-daemon <daemon>
    ceph device ls-by-host <host>
 
-To see information about the location of an specific device and about how the
+To see information about the location of a specific device and about how the
 device is being consumed, run a command of the following form:
 
 .. prompt:: bash $
@@ -57,10 +57,9 @@ information, run the following command:
 The ``[ident|fault]`` parameter determines which kind of light will blink.  By
 default, the `identification` light is used.
 
-.. note:: This command works only if the Cephadm or the Rook `orchestrator
-   <https://docs.ceph.com/docs/master/mgr/orchestrator/#orchestrator-cli-module>`_
-   module is enabled.  To see which orchestrator module is enabled, run the
-   following command:
+.. note:: This command works only if the Cephadm or the Rook
+   :ref:`orchestrator <orchestrator-cli-module>` module is enabled.  To see
+   which orchestrator module is enabled, run the following command:
 
    .. prompt:: bash $
 

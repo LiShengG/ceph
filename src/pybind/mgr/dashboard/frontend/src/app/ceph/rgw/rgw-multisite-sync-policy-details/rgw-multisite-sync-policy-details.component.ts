@@ -6,9 +6,8 @@ import { CdTableAction } from '~/app/shared/models/cd-table-action';
 import { CdTableColumn } from '~/app/shared/models/cd-table-column';
 import { CdTableSelection } from '~/app/shared/models/cd-table-selection';
 import { Permission } from '~/app/shared/models/permissions';
-import { ModalService } from '~/app/shared/services/modal.service';
 import { RgwMultisiteService } from '~/app/shared/api/rgw-multisite.service';
-import { CriticalConfirmationModalComponent } from '~/app/shared/components/critical-confirmation-modal/critical-confirmation-modal.component';
+import { DeleteConfirmationModalComponent } from '~/app/shared/components/delete-confirmation-modal/delete-confirmation-modal.component';
 import { FinishedTask } from '~/app/shared/models/finished-task';
 import { Observable, Subscriber, forkJoin as observableForkJoin } from 'rxjs';
 import { TaskWrapperService } from '~/app/shared/services/task-wrapper.service';
@@ -27,7 +26,8 @@ enum MultisiteResourceType {
 @Component({
   selector: 'cd-rgw-multisite-sync-policy-details',
   templateUrl: './rgw-multisite-sync-policy-details.component.html',
-  styleUrls: ['./rgw-multisite-sync-policy-details.component.scss']
+  styleUrls: ['./rgw-multisite-sync-policy-details.component.scss'],
+  standalone: false
 })
 export class RgwMultisiteSyncPolicyDetailsComponent implements OnChanges {
   @Input()
@@ -58,7 +58,7 @@ export class RgwMultisiteSyncPolicyDetailsComponent implements OnChanges {
 
   constructor(
     private actionLabels: ActionLabelsI18n,
-    private modalService: ModalService,
+    private modalService: ModalCdsService,
     private rgwMultisiteService: RgwMultisiteService,
     private taskWrapper: TaskWrapperService,
     private cdsModalService: ModalCdsService
@@ -225,9 +225,7 @@ export class RgwMultisiteSyncPolicyDetailsComponent implements OnChanges {
       action: action
     };
 
-    this.modalRef = this.modalService.show(RgwMultisiteSyncFlowModalComponent, initialState, {
-      size: 'lg'
-    });
+    this.modalRef = this.modalService.show(RgwMultisiteSyncFlowModalComponent, initialState);
 
     try {
       const res = await this.modalRef.result;
@@ -244,7 +242,7 @@ export class RgwMultisiteSyncPolicyDetailsComponent implements OnChanges {
       selection = this.dirFlowSelection;
     }
     const flowIds = selection.selected.map((flow: any) => flow.id);
-    this.cdsModalService.show(CriticalConfirmationModalComponent, {
+    this.cdsModalService.show(DeleteConfirmationModalComponent, {
       itemDescription: selection.hasSingleSelection ? $localize`Flow` : $localize`Flows`,
       itemNames: flowIds,
       bodyTemplate: this.deleteTpl,
@@ -294,9 +292,7 @@ export class RgwMultisiteSyncPolicyDetailsComponent implements OnChanges {
       action: action
     };
 
-    this.modalRef = this.modalService.show(RgwMultisiteSyncPipeModalComponent, initialState, {
-      size: 'lg'
-    });
+    this.modalRef = this.modalService.show(RgwMultisiteSyncPipeModalComponent, initialState);
 
     try {
       const res = await this.modalRef.result;
@@ -309,7 +305,7 @@ export class RgwMultisiteSyncPolicyDetailsComponent implements OnChanges {
   deletePipe() {
     this.resourceType = MultisiteResourceType.pipe;
     const pipeIds = this.pipeSelection.selected.map((pipe: any) => pipe.id);
-    this.cdsModalService.show(CriticalConfirmationModalComponent, {
+    this.cdsModalService.show(DeleteConfirmationModalComponent, {
       itemDescription: this.pipeSelection.hasSingleSelection ? $localize`Pipe` : $localize`Pipes`,
       itemNames: pipeIds,
       bodyTemplate: this.deleteTpl,

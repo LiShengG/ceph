@@ -1,5 +1,5 @@
-import pkgutil
-if not pkgutil.find_loader('setuptools'):
+import importlib.util
+if not importlib.util.find_spec('setuptools'):
     from distutils.core import setup
     from distutils.extension import Extension
 else:
@@ -141,16 +141,23 @@ def check_sanity():
         shutil.rmtree(tmp_dir)
 
 
+
 if 'BUILD_DOC' in os.environ or 'READTHEDOCS' in os.environ:
     ext_args = {}
     cython_constants = dict(BUILD_DOC=True)
-    cythonize_args = dict(compile_time_env=cython_constants)
+    cythonize_args = dict()
 elif check_sanity():
     ext_args = get_python_flags(['rados', 'rgw'])
     cython_constants = dict(BUILD_DOC=False)
-    include_path = [os.path.join(os.path.dirname(__file__), "..", "rados")]
-    cythonize_args = dict(compile_time_env=cython_constants,
-                          include_path=include_path)
+    # The processed .pyx is written to CYTHON_BUILD_DIR, away from the
+    # binding's own c_*.pxd, so add this source directory to include_path
+    # for cimports to resolve.
+    source_dir = os.path.dirname(os.path.abspath(__file__))
+    include_path = [
+        source_dir,
+        os.path.join(source_dir, "..", "rados"),
+    ]
+    cythonize_args = dict(include_path=include_path)
 else:
     sys.exit(1)
 
@@ -158,6 +165,7 @@ cmdclass = {}
 try:
     from Cython.Build import cythonize
     from Cython.Distutils import build_ext
+    from Cython import Tempita
 
     cmdclass = {'build_ext': build_ext}
 except ImportError:
@@ -172,7 +180,29 @@ except ImportError:
 
         source = "rgw.c"
 else:
-    source = "rgw.pyx"
+    # Process Tempita template
+    source_pyx = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "rgw.pyx"
+    )
+
+    # Read the template from source
+    with open(source_pyx) as f:
+        template_content = f.read()
+
+    # Process the template with cython_constants
+    processed = Tempita.sub(template_content, **cython_constants)
+
+    # Write the processed output to the build directory when invoked by
+    # CMake, which exports CYTHON_BUILD_DIR but runs setup.py from the
+    # source directory; fall back to the current working directory.
+    build_dir = os.environ.get("CYTHON_BUILD_DIR", os.getcwd())
+    output_pyx = os.path.join(build_dir, "rgw_processed.pyx")
+
+    with open(output_pyx, 'w') as f:
+        f.write(processed)
+
+    source = output_pyx
 
 # Disable cythonification if we're not really building anything
 if (len(sys.argv) >= 2 and
@@ -193,7 +223,7 @@ setup(
         "and file operations."
     ),
     url='https://github.com/ceph/ceph/tree/master/src/pybind/rgw',
-    license='LGPLv2+',
+    license='LGPL-2.0-or-later',
     platforms='Linux',
     ext_modules=cythonize(
         [
@@ -203,14 +233,11 @@ setup(
                 **ext_args
             )
         ],
-        compiler_directives={'language_level': sys.version_info.major},
-        build_dir=os.environ.get("CYTHON_BUILD_DIR", None),
         **cythonize_args
     ),
     classifiers=[
         'Intended Audience :: Developers',
         'Intended Audience :: System Administrators',
-        'License :: OSI Approved :: GNU Lesser General Public License v2 or later (LGPLv2+)',
         'Operating System :: POSIX :: Linux',
         'Programming Language :: Cython',
         'Programming Language :: Python :: 3',

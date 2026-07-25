@@ -200,6 +200,11 @@ class Cluster(multisite.Cluster):
             assert r == 0
         return s, r
 
+    def ceph_admin(self, args=None, **kwargs):
+        """ ceph command """
+        cluster_manager = self.ctx.managers[self.name]
+        return cluster_manager.raw_cluster_cmd(*args, **kwargs)
+
 class Gateway(multisite.Gateway):
     """ Controls a radosgw instance using its daemon """
     def __init__(self, role, remote, daemon, *args, **kwargs):
@@ -361,6 +366,8 @@ def create_zonegroup(cluster, gateways, period, config):
     if endpoints:
         # replace client names with their gateway endpoints
         config['endpoints'] = extract_gateway_endpoints(gateways, endpoints)
+    if not config.get('api_name'): # otherwise it will be set to an empty string
+        config['api_name'] = config['name']
     zonegroup = multisite.ZoneGroup(config['name'], period)
     # `zonegroup set` needs --default on command line, and 'is_master' in json
     args = is_default_arg(config)

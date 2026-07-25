@@ -22,12 +22,10 @@ import { IscsiBackstorePipe } from './iscsi-backstore.pipe';
 import { JoinPipe } from './join.pipe';
 import { LogPriorityPipe } from './log-priority.pipe';
 import { MapPipe } from './map.pipe';
-import { MdsSummaryPipe } from './mds-summary.pipe';
 import { MgrSummaryPipe } from './mgr-summary.pipe';
 import { MillisecondsPipe } from './milliseconds.pipe';
 import { NotAvailablePipe } from './not-available.pipe';
 import { OrdinalPipe } from './ordinal.pipe';
-import { OsdSummaryPipe } from './osd-summary.pipe';
 import { RbdConfigurationSourcePipe } from './rbd-configuration-source.pipe';
 import { RelativeDatePipe } from './relative-date.pipe';
 import { RoundPipe } from './round.pipe';
@@ -40,6 +38,12 @@ import { PathPipe } from './path.pipe';
 import { PluralizePipe } from './pluralize.pipe';
 import { XmlPipe } from './xml.pipe';
 import { MbpersecondPipe } from './mbpersecond.pipe';
+import { PipeFunctionPipe } from './pipe-function.pipe';
+import { DimlessBinaryPerMinutePipe } from './dimless-binary-per-minute.pipe';
+import { RedirectLinkResolverPipe } from './redirect-link-resolver.pipe';
+import { CephVersionPipe } from './ceph-version.pipe';
+import { OverviewStatusPipe } from './overview-status.pipe';
+import { OverviewGridColumnNumbersPipe } from './overview-grid-column-numbers.pipe';
 
 @NgModule({
   imports: [CommonModule],
@@ -76,13 +80,17 @@ import { MbpersecondPipe } from './mbpersecond.pipe';
     SearchHighlightPipe,
     HealthIconPipe,
     MgrSummaryPipe,
-    MdsSummaryPipe,
-    OsdSummaryPipe,
     OctalToHumanReadablePipe,
     PathPipe,
     PluralizePipe,
     XmlPipe,
-    MbpersecondPipe
+    MbpersecondPipe,
+    PipeFunctionPipe,
+    DimlessBinaryPerMinutePipe,
+    RedirectLinkResolverPipe,
+    CephVersionPipe,
+    OverviewStatusPipe,
+    OverviewGridColumnNumbersPipe
   ],
   exports: [
     ArrayPipe,
@@ -117,13 +125,17 @@ import { MbpersecondPipe } from './mbpersecond.pipe';
     SearchHighlightPipe,
     HealthIconPipe,
     MgrSummaryPipe,
-    MdsSummaryPipe,
-    OsdSummaryPipe,
     OctalToHumanReadablePipe,
     PathPipe,
     PluralizePipe,
     XmlPipe,
-    MbpersecondPipe
+    MbpersecondPipe,
+    PipeFunctionPipe,
+    DimlessBinaryPerMinutePipe,
+    RedirectLinkResolverPipe,
+    CephVersionPipe,
+    OverviewStatusPipe,
+    OverviewGridColumnNumbersPipe
   ],
   providers: [
     ArrayPipe,
@@ -153,10 +165,13 @@ import { MbpersecondPipe } from './mbpersecond.pipe';
     SanitizeHtmlPipe,
     HealthIconPipe,
     MgrSummaryPipe,
-    MdsSummaryPipe,
-    OsdSummaryPipe,
     OctalToHumanReadablePipe,
-    MbpersecondPipe
+    MbpersecondPipe,
+    DimlessBinaryPerMinutePipe,
+    RedirectLinkResolverPipe,
+    CephVersionPipe,
+    OverviewStatusPipe,
+    OverviewGridColumnNumbersPipe
   ]
 })
 export class PipesModule {}

@@ -6,7 +6,9 @@ import shutil
 import sys
 import yaml
 import sphinx.util
+import urllib.request
 
+logger = sphinx.util.logging.getLogger(__name__)
 
 top_level = \
     os.path.dirname(
@@ -38,10 +40,18 @@ def latest_stable_release():
 
 
 def is_release_eol(codename):
-    with open(os.path.join(top_level, 'doc/releases/releases.yml')) as input:
-        releases = yaml.safe_load(input)['releases']
-        return 'actual_eol' in releases.get(codename, {})
-
+    # Try fetching the latest status from the main branch first
+    try:
+        url = "https://raw.githubusercontent.com/ceph/ceph/main/doc/releases/releases.yml"
+        with urllib.request.urlopen(url, timeout=5) as response:
+            releases = yaml.safe_load(response)['releases']
+            return 'actual_eol' in releases.get(codename, {})
+    except Exception as e:
+        logger.warn(f"Failed to fetch releases.yml from main, falling back to local: {e}")
+        # Fallback to the local file if the network request fails
+        with open(os.path.join(top_level, 'doc/releases/releases.yml')) as input:
+            releases = yaml.safe_load(input)['releases']
+            return 'actual_eol' in releases.get(codename, {})
 
 # project information
 project = 'Ceph'
@@ -55,7 +65,6 @@ pygments_style = 'sphinx'
 html_theme = 'ceph'
 html_theme_options = {
     'logo_only': True,
-    'display_version': False,
     'prev_next_buttons_location': 'bottom',
     'style_external_links': False,
     'vcs_pageview_mode': 'edit',
@@ -76,7 +85,7 @@ html_show_sphinx = False
 html_static_path = ["_static"]
 html_sidebars = {
     '**': ['smarttoc.html', 'searchbox.html']
-    }
+}
 
 html_css_files = ['css/custom.css']
 
@@ -132,23 +141,29 @@ extensions = [
     'ceph_confval',
     'sphinxcontrib.mermaid',
     'sphinxcontrib.openapi',
-    'sphinxcontrib.seqdiag',
-    ]
+]
 
 ditaa = shutil.which("ditaa")
 if ditaa is not None:
     # in case we don't have binfmt_misc enabled or jar is not registered
-    ditaa_args = ['-jar', ditaa]
-    ditaa = 'java'
+    _jar_paths = [
+        '/usr/share/ditaa/lib/ditaa.jar',  # Gentoo
+        '/usr/share/ditaa/ditaa.jar',  # deb
+        '/usr/share/java/ditaa.jar',  # rpm
+    ]
+    _jar_paths = [p for p in _jar_paths if os.path.exists(p)]
+    if _jar_paths:
+        ditaa = 'java'
+        ditaa_args = ['-jar', _jar_paths[0]]
+    else:
+        # keep ditaa from shutil.which
+        ditaa_args = []
     extensions += ['sphinxcontrib.ditaa']
 else:
     extensions += ['plantweb.directive']
     plantweb_defaults = {
         'engine': 'ditaa'
     }
-
-if build_with_rtd:
-    extensions += ['sphinx_search.extension']
 
 # sphinx.ext.todo options
 todo_include_todos = True
@@ -241,10 +256,6 @@ for c in pybinds:
 # openapi
 openapi_logger = sphinx.util.logging.getLogger('sphinxcontrib.openapi.openapi30')
 openapi_logger.setLevel(logging.WARNING)
-
-# seqdiag
-seqdiag_antialias = True
-seqdiag_html_image_format = 'SVG'
 
 # ceph_confval
 ceph_confval_imports = glob.glob(os.path.join(top_level,

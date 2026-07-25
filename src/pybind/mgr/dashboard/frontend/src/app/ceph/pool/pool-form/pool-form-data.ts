@@ -1,7 +1,7 @@
 import { Validators } from '@angular/forms';
 
 import { SelectMessages } from '~/app/shared/components/select/select-messages.model';
-import { Pool } from '../pool';
+import { Pool, PoolType } from '../pool';
 
 export class PoolFormData {
   poolTypes: string[];
@@ -9,8 +9,14 @@ export class PoolFormData {
   crushInfo = false;
   applications: any;
 
+  readonly APP_LABELS: Record<string, string> = {
+    cephfs: $localize`File system (CephFS)`,
+    rbd: $localize`Block (RBD)`,
+    rgw: $localize`Object (RGW)`
+  };
+
   constructor() {
-    this.poolTypes = ['erasure', 'replicated'];
+    this.poolTypes = [PoolType.ERASURE, PoolType.REPLICATED];
     this.applications = {
       selected: [],
       default: ['cephfs', 'rbd', 'rgw'],
@@ -26,7 +32,7 @@ export class PoolFormData {
           pattern: $localize`Allowed characters '_a-zA-Z0-9'`,
           maxlength: $localize`Maximum length is 128 characters`
         },
-        filter: $localize`Filter or add applications'`,
+        filter: $localize`Filter or add applications`,
         add: $localize`Add application`
       })
     };

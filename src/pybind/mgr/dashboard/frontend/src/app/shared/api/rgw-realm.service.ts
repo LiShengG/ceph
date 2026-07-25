@@ -11,7 +11,10 @@ import { RgwDaemonService } from './rgw-daemon.service';
 export class RgwRealmService {
   private url = 'api/rgw/realm';
 
-  constructor(private http: HttpClient, public rgwDaemonService: RgwDaemonService) {}
+  constructor(
+    private http: HttpClient,
+    public rgwDaemonService: RgwDaemonService
+  ) {}
 
   create(realm: RgwRealm, defaultRealm: boolean) {
     let requestBody = {
@@ -30,8 +33,14 @@ export class RgwRealmService {
     return this.http.put(`${this.url}/${realm.name}`, requestBody);
   }
 
-  list(): Observable<object> {
-    return this.http.get<object>(`${this.url}`);
+  list(replicable?: boolean): Observable<object> {
+    let params = new HttpParams();
+    if (replicable) {
+      params = params.appendAll({
+        replicable: replicable.toString()
+      });
+    }
+    return this.http.get<object>(`${this.url}`, { params });
   }
 
   get(realm: RgwRealm): Observable<object> {
@@ -66,12 +75,19 @@ export class RgwRealmService {
     };
   }
 
-  importRealmToken(realm_token: string, zone_name: string, port: number, placementSpec: object) {
+  importRealmToken(
+    realm_token: string,
+    zone_name: string,
+    port: number,
+    placementSpec: object,
+    tier_type: string
+  ) {
     let requestBody = {
       realm_token: realm_token,
       zone_name: zone_name,
       port: port,
-      placement_spec: placementSpec
+      placement_spec: placementSpec,
+      tier_type: tier_type
     };
     return this.http.post(`${this.url}/import_realm_token`, requestBody);
   }

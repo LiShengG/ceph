@@ -8,8 +8,13 @@ set(libclient_srcs
   MetaSession.cc
   Trace.cc
   posix_acl.cc
-  Delegation.cc)
+  Delegation.cc
+  FSCrypt.cc)
 add_library(client STATIC ${libclient_srcs})
 target_link_libraries(client
   legacy-option-headers
-  osdc)
+  osdc
+  Boost::locale
+  ICU::uc
+  ICU::i18n
+  )

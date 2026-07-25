@@ -21,7 +21,8 @@ import { ModalCdsService } from '~/app/shared/services/modal-cds.service';
 @Component({
   selector: 'cd-mirroring',
   templateUrl: './overview.component.html',
-  styleUrls: ['./overview.component.scss']
+  styleUrls: ['./overview.component.scss'],
+  standalone: false
 })
 export class OverviewComponent implements OnInit, OnDestroy {
   rbdmirroringForm: CdFormGroup;
@@ -52,6 +53,7 @@ export class OverviewComponent implements OnInit, OnDestroy {
       name: $localize`Create Bootstrap Token`,
       canBePrimary: () => true,
       disable: () => false,
+      visible: () => this.permission.update,
       buttonKind: 'primary'
     };
     const importBootstrapAction: CdTableAction = {
@@ -60,6 +62,7 @@ export class OverviewComponent implements OnInit, OnDestroy {
       click: () => this.importBootstrapModal(),
       name: $localize`Import Bootstrap Token`,
       disable: () => false,
+      visible: () => this.permission.update,
       buttonKind: 'tertiary'
     };
     this.tableActions = [createBootstrapAction, importBootstrapAction];

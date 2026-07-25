@@ -1,21 +1,20 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
 
 #include <algorithm>
 #include <boost/tokenizer.hpp>
 #include <optional>
 #include <regex>
 #include "include/function2.hpp"
+#include "rgw_account.h"
 #include "rgw_iam_policy.h"
 #include "rgw_rest_pubsub.h"
-#include "rgw_pubsub_push.h"
 #include "rgw_pubsub.h"
 #include "rgw_op.h"
 #include "rgw_rest.h"
 #include "rgw_rest_s3.h"
 #include "rgw_arn.h"
 #include "rgw_auth_s3.h"
-#include "rgw_notify.h"
 #include "services/svc_zone.h"
 #include "common/dout.h"
 #include "rgw_url.h"
@@ -77,6 +76,17 @@ bool validate_and_update_endpoint_secret(rgw_pubsub_dest& dest, CephContext *cct
       return false;
     }
   }
+
+  // check for mTLS key password - also a secret that requires secure transport
+  auto ssl_key_password = args.get_optional("ssl-key-password");
+  if (ssl_key_password.has_value() && !ssl_key_password->empty()) {
+    dest.stored_secret = true;
+    if (!verify_transport_security(cct, *ri.env)) {
+      message = "Topic contains secrets that must be transmitted over a secure transport";
+      return false;
+    }
+  }
+
   return true;
 }
 
@@ -255,7 +265,10 @@ class RGWPSCreateTopicOp : public RGWOp {
 
   int get_params() {
     topic_name = s->info.args.get("Name");
-    if (!validate_topic_name(topic_name, s->err.message)) {
+    if (topic_name.empty() ||
+        (!s->get_cct()->_conf.get_val<bool>("rgw_relaxed_topic_names") &&
+        !validate_topic_name(topic_name, s->err.message))
+       ) {
       return -EINVAL;
     }
 
@@ -393,7 +406,7 @@ class RGWPSCreateTopicOp : public RGWOp {
     encode_xml("TopicArn", topic_arn.to_string(), f);
     f->close_section(); // CreateTopicResult
     f->open_object_section("ResponseMetadata");
-    encode_xml("RequestId", s->req_id, f); 
+    encode_xml("RequestId", s->trans_id, f);
     f->close_section(); // ResponseMetadata
     f->close_section(); // CreateTopicResponse
     rgw_flush_formatter_and_reset(s, f);
@@ -404,7 +417,7 @@ void RGWPSCreateTopicOp::execute(optional_yield y) {
   // master request will replicate the topic creation.
   if (should_forward_request_to_master(s, driver)) {
     op_ret = rgw_forward_request_to_master(
-        this, *s->penv.site, s->owner.id, &bl_post_body, nullptr, s->info, y);
+        this, *s->penv.site, s->owner.id, &bl_post_body, nullptr, s->info, s->err, y);
     if (op_ret < 0) {
       ldpp_dout(this, 4)
           << "CreateTopic forward_request_to_master returned ret = " << op_ret
@@ -413,23 +426,41 @@ void RGWPSCreateTopicOp::execute(optional_yield y) {
     }
   }
 
-  // don't add a persistent queue if we already have one
-  const bool already_persistent = topic && topic_needs_queue(topic->dest);
+  // if we already have an existing persistent queue - do nothing - resharding not supported
+  // if we don't have a persistent queue already, just make shards or a single based on dest's num_shards from config
+
+  const bool already_persistent = topic && topic_needs_queue(topic->dest); 
   if (!already_persistent && topic_needs_queue(dest)) {
     // initialize the persistent queue's location, using ':' as the namespace
     // delimiter because its inclusion in a TopicName would break ARNs
+    // new persistent topics to have shards - loading num_shards from config for sharding persistent bucket notifications
+    dest.num_shards = s->get_cct()->_conf.get_val<uint64_t>("rgw_bucket_persistent_notif_num_shards"); 
+    if(dest.num_shards == 0) {
+      dest.num_shards = 1;
+    }
     dest.persistent_queue = string_cat_reserve(
         get_account_or_tenant(s->owner.id), ":", topic_name);
-
-    op_ret = driver->add_persistent_topic(this, y, dest.persistent_queue);
-    if (op_ret < 0) {
-      ldpp_dout(this, 1) << "CreateTopic Action failed to create queue for "
-                            "persistent topics. error:"
-                         << op_ret << dendl;
-      return;
+    for(const auto& q: dest.get_shard_names()){
+      ldpp_dout(this, 20) << "CreateTopic Action creating persistent topic queue: " << q << dendl;
+      op_ret = driver->add_persistent_topic(this, y, q);
+      if (op_ret < 0) {
+        ldpp_dout(this, 1) << "CreateTopic Action failed to create queue/shards for "
+                              "persistent topics. error:"
+                          << op_ret << dendl;
+        return;
+      }
     }
+    ldpp_dout(this, 20) << "Successfully created " << dest.num_shards << " shards for topic: " << topic_name << dendl;
   } else if (already_persistent) {  // redundant call to CreateTopic
+    //no resharding of existing topics for persistent bucket notifications
     dest.persistent_queue = topic->dest.persistent_queue;
+    dest.num_shards = topic->dest.num_shards;
+    if(s->get_cct()->_conf.get_val<uint64_t>("rgw_bucket_persistent_notif_num_shards") != dest.num_shards) {
+      ldpp_dout(this, 20) << "CreateTopic Action called for topic with existing shards, but num_shards in config is different. "
+                            "Not resharding existing topic: " << topic_name << dendl;
+    } else {
+      ldpp_dout(this, 20) << "CreateTopic Action called for topic with existing. Not resharding existing topic: " << topic_name << dendl;
+    }
   }
   const RGWPubSub ps(driver, get_account_or_tenant(s->owner.id), *s->penv.site);
   op_ret = ps.create_topic(this, topic_name, dest, topic_arn.to_string(),
@@ -451,9 +482,13 @@ private:
 
 public:
   int verify_permission(optional_yield) override {
-    // check account permissions up front
-    if (s->auth.identity->get_account() &&
-        !verify_user_permission(this, s, {}, rgw::IAM::snsListTopics)) {
+    // account permissions are checked up front. for non-account users,
+    // execute() instead checks permissions against each topic
+    if (!s->auth.identity->get_account()) {
+      return 0;
+    }
+    const auto arn = rgw::account::root_arn(s->auth.identity->get_account()->id);
+    if (!verify_user_permission(this, s, arn, rgw::IAM::snsListTopics)) {
       return -ERR_AUTHORIZATION;
     }
 
@@ -485,7 +520,7 @@ public:
     encode_xml("Topics", result, f); 
     f->close_section(); // ListTopicsResult
     f->open_object_section("ResponseMetadata");
-    encode_xml("RequestId", s->req_id, f); 
+    encode_xml("RequestId", s->trans_id, f);
     f->close_section(); // ResponseMetadata
     if (!next_token.empty()) {
       encode_xml("NextToken", next_token, f);
@@ -560,7 +595,7 @@ class RGWPSGetTopicOp : public RGWOp {
     if (ret < 0) {
       return ret;
     }
-    const RGWPubSub ps(driver, get_account_or_tenant(s->owner.id), *s->penv.site);
+    const RGWPubSub ps(driver, topic_arn.account, *s->penv.site);
     ret = ps.get_topic(this, topic_name, result, y, nullptr);
     if (ret < 0) {
       ldpp_dout(this, 4) << "failed to get topic '" << topic_name << "', ret=" << ret << dendl;
@@ -610,7 +645,7 @@ class RGWPSGetTopicOp : public RGWOp {
     encode_xml("Topic", result, f); 
     f->close_section();
     f->open_object_section("ResponseMetadata");
-    encode_xml("RequestId", s->req_id, f); 
+    encode_xml("RequestId", s->trans_id, f);
     f->close_section();
     f->close_section();
     rgw_flush_formatter_and_reset(s, f);
@@ -646,7 +681,7 @@ class RGWPSGetTopicAttributesOp : public RGWOp {
     if (ret < 0) {
       return ret;
     }
-    const RGWPubSub ps(driver, get_account_or_tenant(s->owner.id), *s->penv.site);
+    const RGWPubSub ps(driver, topic_arn.account, *s->penv.site);
     ret = ps.get_topic(this, topic_name, result, y, nullptr);
     if (ret < 0) {
       ldpp_dout(this, 4) << "failed to get topic '" << topic_name << "', ret=" << ret << dendl;
@@ -696,7 +731,7 @@ class RGWPSGetTopicAttributesOp : public RGWOp {
     result.dump_xml_as_attributes(f);
     f->close_section(); // GetTopicAttributesResult
     f->open_object_section("ResponseMetadata");
-    encode_xml("RequestId", s->req_id, f); 
+    encode_xml("RequestId", s->trans_id, f);
     f->close_section(); // ResponseMetadata
     f->close_section(); // GetTopicAttributesResponse
     rgw_flush_formatter_and_reset(s, f);
@@ -789,7 +824,9 @@ class RGWPSSetTopicAttributesOp : public RGWOp {
       static constexpr std::initializer_list<const char*> args = {
           "verify-ssl",    "use-ssl",         "ca-location", "amqp-ack-level",
           "amqp-exchange", "kafka-ack-level", "mechanism",   "cloudevents",
-          "user-name",     "password"};
+          "user-name",     "password",
+          "ssl-certificate-location", "ssl-key-location", "ssl-key-password",
+          "sasl-kerberos-service-name", "sasl-kerberos-principal", "sasl-kerberos-keytab"};
       if (std::find(args.begin(), args.end(), attribute_name) != args.end()) {
         replace_str(attribute_name, s->info.args.get("AttributeValue"));
         return 0;
@@ -811,7 +848,7 @@ class RGWPSSetTopicAttributesOp : public RGWOp {
       return ret;
     }
 
-    const RGWPubSub ps(driver, get_account_or_tenant(s->owner.id), *s->penv.site);
+    const RGWPubSub ps(driver, topic_arn.account, *s->penv.site);
     ret = ps.get_topic(this, topic_name, result, y, nullptr);
     if (ret < 0) {
       ldpp_dout(this, 4) << "failed to get topic '" << topic_name
@@ -861,7 +898,7 @@ class RGWPSSetTopicAttributesOp : public RGWOp {
     const auto f = s->formatter;
     f->open_object_section_in_ns("SetTopicAttributesResponse", RGW_REST_SNS_XMLNS);
     f->open_object_section("ResponseMetadata");
-    encode_xml("RequestId", s->req_id, f);
+    encode_xml("RequestId", s->trans_id, f);
     f->close_section();  // ResponseMetadata
     f->close_section();  // SetTopicAttributesResponse
     rgw_flush_formatter_and_reset(s, f);
@@ -871,7 +908,7 @@ class RGWPSSetTopicAttributesOp : public RGWOp {
 void RGWPSSetTopicAttributesOp::execute(optional_yield y) {
   if (should_forward_request_to_master(s, driver)) {
     op_ret = rgw_forward_request_to_master(
-        this, *s->penv.site, s->owner.id, &bl_post_body, nullptr, s->info, y);
+        this, *s->penv.site, s->owner.id, &bl_post_body, nullptr, s->info, s->err, y);
     if (op_ret < 0) {
       ldpp_dout(this, 4)
           << "SetTopicAttributes forward_request_to_master returned ret = "
@@ -884,28 +921,38 @@ void RGWPSSetTopicAttributesOp::execute(optional_yield y) {
   if (!already_persistent && topic_needs_queue(dest)) {
     // initialize the persistent queue's location, using ':' as the namespace
     // delimiter because its inclusion in a TopicName would break ARNs
-    dest.persistent_queue = string_cat_reserve(
-        get_account_or_tenant(s->owner.id), ":", topic_name);
-
-    op_ret = driver->add_persistent_topic(this, y, dest.persistent_queue);
-    if (op_ret < 0) {
-      ldpp_dout(this, 4)
-          << "SetTopicAttributes Action failed to create queue for "
-             "persistent topics. error:"
-          << op_ret << dendl;
-      return;
+    dest.persistent_queue = string_cat_reserve(topic_arn.account, ":", topic_name);
+    dest.num_shards = s->get_cct()->_conf.get_val<uint64_t>("rgw_bucket_persistent_notif_num_shards");
+    if (dest.num_shards == 0) {
+      dest.num_shards = 1;
     }
+    for(const auto& q: dest.get_shard_names()){
+      op_ret = driver->add_persistent_topic(this, y, q);
+      if (op_ret < 0) {
+        ldpp_dout(this, 4)
+            << "SetTopicAttributes Action failed to create queue for "
+              "persistent topics. error:"
+            << op_ret << dendl;
+        return;
+      }
+    }
+    ldpp_dout(this, 20) << "Successfully created " << dest.num_shards <<" shards for topic: " << topic_name << dendl;
+
   } else if (already_persistent && !topic_needs_queue(dest)) {
     // changing the persistent topic to non-persistent.
-    op_ret = driver->remove_persistent_topic(this, y, result.dest.persistent_queue);
-    if (op_ret != -ENOENT && op_ret < 0) {
-      ldpp_dout(this, 4) << "SetTopicAttributes Action failed to remove queue "
-                            "for persistent topics. error:"
-                         << op_ret << dendl;
-      return;
+    for(const auto& q: result.dest.get_shard_names()) {
+      op_ret = driver->remove_persistent_topic(this, y, q);
+      if (op_ret != -ENOENT && op_ret < 0) {
+        ldpp_dout(this, 4) << "SetTopicAttributes Action failed to remove queue "
+                              "for persistent topics. error:"
+                          << op_ret << dendl;
+        return;
+      }
+      dest.num_shards = 0; // set to 0 to indicate no sharding
     }
+    ldpp_dout(this, 20) << "Successfully removed " << result.dest.num_shards << " shards for topic: " << topic_name << dendl;
   }
-  const RGWPubSub ps(driver, get_account_or_tenant(s->owner.id), *s->penv.site);
+  const RGWPubSub ps(driver, topic_arn.account, *s->penv.site);
   op_ret = ps.create_topic(this, topic_name, dest, topic_arn.to_string(),
                            opaque_data, topic_owner, policy_text, y);
   if (op_ret < 0) {
@@ -947,7 +994,7 @@ class RGWPSDeleteTopicOp : public RGWOp {
       return ret;
     }
 
-    const RGWPubSub ps(driver, get_account_or_tenant(s->owner.id), *s->penv.site);
+    const RGWPubSub ps(driver, topic_arn.account, *s->penv.site);
     rgw_pubsub_topic result;
     ret = ps.get_topic(this, topic_name, result, y, nullptr);
     if (ret == -ENOENT) {
@@ -1006,7 +1053,7 @@ class RGWPSDeleteTopicOp : public RGWOp {
     const auto f = s->formatter;
     f->open_object_section_in_ns("DeleteTopicResponse", RGW_REST_SNS_XMLNS);
     f->open_object_section("ResponseMetadata");
-    encode_xml("RequestId", s->req_id, f); 
+    encode_xml("RequestId", s->trans_id, f);
     f->close_section(); // ResponseMetadata
     f->close_section(); // DeleteTopicResponse
     rgw_flush_formatter_and_reset(s, f);
@@ -1016,7 +1063,7 @@ class RGWPSDeleteTopicOp : public RGWOp {
 void RGWPSDeleteTopicOp::execute(optional_yield y) {
   if (should_forward_request_to_master(s, driver)) {
     op_ret = rgw_forward_request_to_master(
-        this, *s->penv.site, s->owner.id, &bl_post_body, nullptr, s->info, y);
+        this, *s->penv.site, s->owner.id, &bl_post_body, nullptr, s->info, s->err, y);
 
     if (op_ret < 0) {
       ldpp_dout(this, 1)
@@ -1030,7 +1077,7 @@ void RGWPSDeleteTopicOp::execute(optional_yield y) {
     return;
   }
 
-  const RGWPubSub ps(driver, get_account_or_tenant(s->owner.id), *s->penv.site);
+  const RGWPubSub ps(driver, topic_arn.account, *s->penv.site);
   op_ret = ps.remove_topic(this, topic_name, y);
   if (op_ret < 0 && op_ret != -ENOENT) {
     ldpp_dout(this, 4) << "failed to remove topic '" << topic_name << ", ret=" << op_ret << dendl;
@@ -1190,6 +1237,7 @@ public:
   }
 
   const char* name() const override { return "pubsub_notification_create_s3"; }
+  std::string canonical_name() const override { return fmt::format("REST.{}.NOTIFICATION", s->info.method); }
   RGWOpType get_type() override { return RGW_OP_PUBSUB_NOTIF_CREATE; }
   uint32_t op_mask() override { return RGW_OP_TYPE_WRITE; }
 
@@ -1269,7 +1317,7 @@ int RGWPSCreateNotifOp::verify_permission(optional_yield y) {
 void RGWPSCreateNotifOp::execute(optional_yield y) {
   if (should_forward_request_to_master(s, driver)) {
     op_ret = rgw_forward_request_to_master(
-        this, *s->penv.site, s->owner.id, &data, nullptr, s->info, y);
+        this, *s->penv.site, s->owner.id, &data, nullptr, s->info, s->err, y);
     if (op_ret < 0) {
       ldpp_dout(this, 4) << "CreateBucketNotification "
                             "forward_request_to_master returned ret = "
@@ -1445,6 +1493,7 @@ class RGWPSDeleteNotifOp : public RGWDefaultResponseOp {
   }
   
   const char* name() const override { return "pubsub_notification_delete_s3"; }
+  std::string canonical_name() const override { return fmt::format("REST.{}.NOTIFICATION", s->info.method); }
   RGWOpType get_type() override { return RGW_OP_PUBSUB_NOTIF_DELETE; }
   uint32_t op_mask() override { return RGW_OP_TYPE_DELETE; }
 
@@ -1472,7 +1521,7 @@ void RGWPSDeleteNotifOp::execute(optional_yield y) {
   if (should_forward_request_to_master(s, driver)) {
     bufferlist indata;
     op_ret = rgw_forward_request_to_master(
-        this, *s->penv.site, s->owner.id, &indata, nullptr, s->info, y);
+        this, *s->penv.site, s->owner.id, &indata, nullptr, s->info, s->err, y);
     if (op_ret < 0) {
       ldpp_dout(this, 4) << "DeleteBucketNotification "
                             "forward_request_to_master returned error ret= "
@@ -1549,6 +1598,7 @@ public:
   }
 
   const char* name() const override { return "pubsub_notifications_get_s3"; }
+  std::string canonical_name() const override { return fmt::format("REST.{}.NOTIFICATION", s->info.method); }
   RGWOpType get_type() override { return RGW_OP_PUBSUB_NOTIF_LIST; }
   uint32_t op_mask() override { return RGW_OP_TYPE_READ; }
 

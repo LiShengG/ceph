@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*- 
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*- 
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph - scalable distributed file system
  *
@@ -16,15 +17,19 @@
 #ifndef CEPH_MON_ELECTOR_H
 #define CEPH_MON_ELECTOR_H
 
+#include <cstdint>
 #include <map>
+#include <set>
+#include <string>
 
+#include "common/Formatter.h"
 #include "include/types.h"
-#include "include/Context.h"
 #include "mon/MonOpRequest.h"
 #include "mon/mon_types.h"
 #include "mon/ElectionLogic.h"
 #include "mon/ConnectionTracker.h"
 
+class Context;
 class Monitor;
 
 
@@ -39,6 +44,10 @@ class Elector : public ElectionOwner, RankProvider {
    * @defgroup Elector_h_class Elector
    * @{
    */
+
+  private:
+    std::set<int> pending_pings;  // Monitors waiting for quorum features to be established
+
   ElectionLogic logic;
   // connectivity validation and scoring
   ConnectionTracker peer_tracker;
@@ -375,6 +384,9 @@ class Elector : public ElectionOwner, RankProvider {
   * https://tracker.ceph.com/issues/58049
   */
   bool peer_tracker_is_clean();
+
+  std::set<std::pair<unsigned, unsigned>> get_netsplit_peer_tracker(std::set<unsigned> &mons_down);
+
   /**
    * Forget everything about our peers. :(
    */
@@ -406,6 +418,11 @@ class Elector : public ElectionOwner, RankProvider {
     disallowed_leaders = dl;
     return true;
   }
+  /**
+   * process all pending pings when quorum is established
+   *
+   */
+  void process_pending_pings();
   void dump_connection_scores(Formatter *f) {
     f->open_object_section("connection scores");
     peer_tracker.dump(f);

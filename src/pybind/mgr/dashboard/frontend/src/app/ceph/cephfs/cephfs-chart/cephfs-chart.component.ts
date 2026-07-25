@@ -3,13 +3,15 @@ import { Component, ElementRef, Input, OnChanges, OnInit, ViewChild } from '@ang
 import _ from 'lodash';
 import moment from 'moment';
 import 'chartjs-adapter-moment';
+import { Chart, registerables } from 'chart.js';
 
 import { ChartTooltip } from '~/app/shared/models/chart-tooltip';
 
 @Component({
   selector: 'cd-cephfs-chart',
   templateUrl: './cephfs-chart.component.html',
-  styleUrls: ['./cephfs-chart.component.scss']
+  styleUrls: ['./cephfs-chart.component.scss'],
+  standalone: false
 })
 export class CephfsChartComponent implements OnChanges, OnInit {
   @ViewChild('chartCanvas', { static: true })
@@ -101,6 +103,10 @@ export class CephfsChartComponent implements OnChanges, OnInit {
     },
     chartType: 'line'
   };
+
+  constructor() {
+    Chart.register(...registerables);
+  }
 
   ngOnInit() {
     if (_.isUndefined(this.mdsCounter)) {

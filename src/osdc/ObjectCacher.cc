@@ -1,5 +1,5 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
 
 #include <limits.h>
 
@@ -10,6 +10,14 @@
 #include "common/perf_counters.h"
 
 #include "include/ceph_assert.h"
+
+#include <unordered_map>
+
+#ifdef WITH_CRIMSON
+#include "crimson/common/perf_counters_collection.h"
+#else
+#include "common/perf_counters_collection.h"
+#endif
 
 #define MAX_FLUSH_UNDER_LOCK 20  ///< max bh's we start writeback on
 #define BUFFER_MEMORY_WEIGHT CEPH_PAGE_SHIFT  // memory usage of BufferHead, count in (1<<n)
@@ -80,14 +88,16 @@ class ObjectCacher::C_RetryRead : public Context {
   ObjectSet *oset;
   Context *onfinish;
   ZTracer::Trace trace;
+  std::vector<ObjHole> holes;
 public:
   C_RetryRead(ObjectCacher *_oc, OSDRead *r, ObjectSet *os, Context *c,
-	      const ZTracer::Trace &trace)
-    : oc(_oc), rd(r), oset(os), onfinish(c), trace(trace) {
+	      const ZTracer::Trace &trace,
+              std::vector<ObjHole> h)
+    : oc(_oc), rd(r), oset(os), onfinish(c), trace(trace), holes(h) {
   }
   void finish(int r) override {
     if (r >= 0) {
-      r = oc->_readx(rd, oset, onfinish, false, &trace);
+      r = oc->_readx(rd, oset, onfinish, false, &trace, &holes);
     }
 
     if (r == 0) {
@@ -1276,13 +1286,14 @@ void ObjectCacher::bh_write_commit(int64_t poolid, sobject_t oid,
     finish_contexts(cct, ls, r);
 }
 
-void ObjectCacher::flush(ZTracer::Trace *trace, loff_t amount)
+void ObjectCacher::flush(ZTracer::Trace *trace, loff_t amount, int max_bhs)
 {
   ceph_assert(trace != nullptr);
   ceph_assert(ceph_mutex_is_locked(lock));
   ceph::real_time cutoff = ceph::real_clock::now();
 
-  ldout(cct, 10) << "flush " << amount << dendl;
+  ldout(cct, 10) << "flush " << amount
+                 << " bytes, max bufferheads " << max_bhs << dendl;
 
   /*
    * NOTE: we aren't actually pulling things off the LRU here, just
@@ -1291,21 +1302,23 @@ void ObjectCacher::flush(ZTracer::Trace *trace, loff_t amount)
    * lru_dirty.lru_get_next_expire() again.
    */
   int64_t left = amount;
-  while (amount == 0 || left > 0) {
+  int left_bhs = max_bhs;
+  while ((amount == 0 && max_bhs == 0) || left > 0 || left_bhs > 0) {
     BufferHead *bh = static_cast<BufferHead*>(
       bh_lru_dirty.lru_get_next_expire());
     if (!bh) break;
     if (bh->last_write > cutoff) break;
 
     if (scattered_write) {
-      bh_write_adjacencies(bh, cutoff, amount > 0 ? &left : NULL, NULL);
+      bh_write_adjacencies(bh, cutoff, amount > 0 ? &left : NULL,
+                           max_bhs > 0 ? &left_bhs : NULL);
     } else {
       left -= bh->length();
+      left_bhs--;
       bh_write(bh, *trace);
     }
   }
 }
-
 
 void ObjectCacher::trim()
 {
@@ -1383,7 +1396,8 @@ bool ObjectCacher::is_cached(ObjectSet *oset, vector<ObjectExtent>& extents,
  * returns 0 if doing async read
  */
 int ObjectCacher::readx(OSDRead *rd, ObjectSet *oset, Context *onfinish,
-			ZTracer::Trace *parent_trace)
+			ZTracer::Trace *parent_trace,
+                        std::vector<ObjHole> *holes)
 {
   ZTracer::Trace trace;
   if (parent_trace != nullptr) {
@@ -1391,7 +1405,14 @@ int ObjectCacher::readx(OSDRead *rd, ObjectSet *oset, Context *onfinish,
     trace.event("start");
   }
 
-  int r =_readx(rd, oset, onfinish, true, &trace);
+  int r;
+  if (holes == nullptr) {
+      std::vector<ObjHole> holes2;
+      r =_readx(rd, oset, onfinish, true, &trace, &holes2);
+  } else {
+      r =_readx(rd, oset, onfinish, true, &trace, holes);
+  }
+
   if (r < 0) {
     trace.event("finish");
   }
@@ -1399,7 +1420,8 @@ int ObjectCacher::readx(OSDRead *rd, ObjectSet *oset, Context *onfinish,
 }
 
 int ObjectCacher::_readx(OSDRead *rd, ObjectSet *oset, Context *onfinish,
-			 bool external_call, ZTracer::Trace *trace)
+			 bool external_call, ZTracer::Trace *trace,
+                         std::vector<ObjHole> *holes)
 {
   ceph_assert(trace != nullptr);
   ceph_assert(ceph_mutex_is_locked(lock));
@@ -1464,7 +1486,7 @@ int ObjectCacher::_readx(OSDRead *rd, ObjectSet *oset, Context *onfinish,
 	  ldout(cct, 10) << "readx  waiting on tid " << o->last_write_tid
 			 << " on " << *o << dendl;
 	  o->waitfor_commit[o->last_write_tid].push_back(
-	    new C_RetryRead(this,rd, oset, onfinish, *trace));
+	    new C_RetryRead(this,rd, oset, onfinish, *trace, *holes));
 	  // FIXME: perfcounter!
 	  return 0;
 	}
@@ -1522,7 +1544,7 @@ int ObjectCacher::_readx(OSDRead *rd, ObjectSet *oset, Context *onfinish,
 			   << (std::max(rx_bytes, max_size) - max_size)
 			   << " read bytes" << dendl;
 	    waitfor_read.push_back(new C_RetryRead(this, rd, oset, onfinish,
-						   *trace));
+						   *trace, *holes));
 	  }
 
 	  bh_remove(o, bh_it->second);
@@ -1541,7 +1563,7 @@ int ObjectCacher::_readx(OSDRead *rd, ObjectSet *oset, Context *onfinish,
 	ldout(cct, 10) << "readx missed, waiting on " << *last->second
 	  << " off " << last->first << dendl;
 	last->second->waitfor_read[last->first].push_back(
-	  new C_RetryRead(this, rd, oset, onfinish, *trace) );
+	  new C_RetryRead(this, rd, oset, onfinish, *trace, *holes) );
 
       }
 
@@ -1554,7 +1576,7 @@ int ObjectCacher::_readx(OSDRead *rd, ObjectSet *oset, Context *onfinish,
 	  ldout(cct, 10) << "readx missed, waiting on " << *bh_it->second
 			 << " off " << bh_it->first << dendl;
 	  bh_it->second->waitfor_read[bh_it->first].push_back(
-	    new C_RetryRead(this, rd, oset, onfinish, *trace) );
+	    new C_RetryRead(this, rd, oset, onfinish, *trace, *holes) );
 	}
 	bytes_not_in_cache += bh_it->second->length();
 	success = false;
@@ -1620,6 +1642,9 @@ int ObjectCacher::_readx(OSDRead *rd, ObjectSet *oset, Context *onfinish,
 	  // may get multiple bh's at this stripe_map position
 	  if (bh->is_zero()) {
 	    stripe_map[f_it->first].append_zero(len);
+            if (holes) {
+              holes->push_back(std::make_pair(opos, len));
+            }
 	  } else {
 	    bit.substr_of(bh->bl,
 		opos - bh->start(),
@@ -1944,6 +1969,7 @@ int ObjectCacher::_wait_for_write(OSDWrite *wr, uint64_t len, ObjectSet *oset,
 void ObjectCacher::flusher_entry()
 {
   ldout(cct, 10) << "flusher start" << dendl;
+  int target_dirty_bh = target_dirty >> BUFFER_MEMORY_WEIGHT;
   std::unique_lock l{lock};
   while (!flusher_stop) {
     loff_t all = get_stat_tx() + get_stat_rx() + get_stat_clean() +
@@ -1957,7 +1983,6 @@ void ObjectCacher::flusher_entry()
 		   << target_dirty << " target, "
 		   << max_dirty << " max)"
 		   << dendl;
-    loff_t actual = get_stat_dirty() + get_stat_dirty_waiting();
 
     ZTracer::Trace trace;
     if (cct->_conf->osdc_blkin_trace_all) {
@@ -1965,12 +1990,20 @@ void ObjectCacher::flusher_entry()
       trace.event("start");
     }
 
+    loff_t actual = get_stat_dirty() + get_stat_dirty_waiting();
+    int actual_bhs = dirty_or_tx_bh.size() + get_stat_nr_dirty_waiters();
     if (actual > 0 && (uint64_t) actual > target_dirty) {
       // flush some dirty pages
       ldout(cct, 10) << "flusher " << get_stat_dirty() << " dirty + "
 		     << get_stat_dirty_waiting() << " dirty_waiting > target "
 		     << target_dirty << ", flushing some dirty bhs" << dendl;
       flush(&trace, actual - target_dirty);
+    } else if (actual_bhs > target_dirty_bh) {
+      ldout(cct, 10) << "flusher " << dirty_or_tx_bh.size() << " dirty/tx bh + "
+                     << get_stat_nr_dirty_waiters() << " dirty_waiters > "
+                     << "target dirty bh " << target_dirty_bh
+                     << ", flushing some dirty bhs" << dendl;
+      flush(&trace, 0, actual_bhs - target_dirty_bh);
     } else {
       // check tail of lru for old dirty items
       ceph::real_time cutoff = ceph::real_clock::now();
@@ -2463,12 +2496,11 @@ uint64_t ObjectCacher::release_all()
   ldout(cct, 10) << "release_all" << dendl;
   uint64_t unclean = 0;
 
-  vector<ceph::unordered_map<sobject_t, Object*> >::iterator i
-    = objects.begin();
+  auto i = objects.begin();
   while (i != objects.end()) {
-    ceph::unordered_map<sobject_t, Object*>::iterator p = i->begin();
+    auto p = i->begin();
     while (p != i->end()) {
-      ceph::unordered_map<sobject_t, Object*>::iterator n = p;
+      auto n = p;
       ++n;
 
       Object *ob = p->second;
@@ -2603,14 +2635,8 @@ void ObjectCacher::verify_stats() const
 
   loff_t clean = 0, zero = 0, dirty = 0, rx = 0, tx = 0, missing = 0,
     error = 0;
-  for (vector<ceph::unordered_map<sobject_t, Object*> >::const_iterator i
-	 = objects.begin();
-       i != objects.end();
-       ++i) {
-    for (ceph::unordered_map<sobject_t, Object*>::const_iterator p
-	   = i->begin();
-	 p != i->end();
-	 ++p) {
+  for (auto i = objects.cbegin(); i != objects.cend(); ++i) {
+    for (auto p = i->cbegin(); p != i->cend(); ++p) {
       Object *ob = p->second;
       for (map<loff_t, BufferHead*>::const_iterator q = ob->data.begin();
 	   q != ob->data.end();

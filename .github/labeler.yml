@@ -55,6 +55,7 @@ mgr:
   - src/pybind/mgr/ceph_module.pyi
   - src/pybind/mgr/mgr_module.py
   - src/pybind/mgr/mgr_util.py
+  - src/pybind/mgr/cherrypy_mgr.py
   - src/pybind/mgr/object_format.py
   - src/pybind/mgr/requirements.txt
   - src/pybind/mgr/tox.ini
@@ -297,6 +298,7 @@ rgw:
   - src/test/librgw_*
   - src/test/rgw/**
   - src/test/test_rgw*
+  - doc/radosgw
 
 ceph-volume:
   - src/ceph-volume/**
@@ -345,3 +347,6 @@ script:
   - src/script/**
   - admin/**
   - doc/scripts/**
+
+config-change:
+  - src/common/options/**

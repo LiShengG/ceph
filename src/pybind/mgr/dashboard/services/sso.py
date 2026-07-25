@@ -2,23 +2,31 @@
 # pylint: disable=too-many-return-statements,too-many-branches
 
 import errno
+import importlib
 import json
 import logging
 import os
 import threading
 import warnings
-from typing import Dict
+from typing import Dict, Optional
 from urllib import parse
 
-from mgr_module import CLIWriteCommand, HandleCommandResult
+from mgr_module import HandleCommandResult
 
 from .. import mgr
 # Saml2 and OAuth2 needed to be recognized by .__subclasses__()
 # pylint: disable=unused-import
+from ..cli import DBCLICommand
 from ..services.auth import AuthType, BaseAuth, OAuth2, Saml2  # noqa
 from ..tools import prepare_url_prefix
 
-logger = logging.getLogger('sso')
+logger = logging.getLogger(__name__)
+
+try:
+    jmespath = importlib.import_module('jmespath')
+    JMESPathError = getattr(jmespath.exceptions, "JMESPathError")
+except ModuleNotFoundError:
+    logger.error("Module 'jmespath' is not installed.")
 
 try:
     from onelogin.saml2.errors import OneLogin_Saml2_Error as Saml2Error
@@ -87,9 +95,31 @@ def load_sso_db():
     mgr.SSO_DB = SsoDB.load()  # type: ignore
 
 
-@CLIWriteCommand("dashboard sso enable oauth2")
-def enable_sso(_):
+@DBCLICommand.Write("dashboard sso enable oauth2")
+def enable_sso(_, roles_path: Optional[str] = None):
+    if mgr.get_module_option_ex('orchestrator', 'orchestrator') == 'cephadm':
+        from orchestrator import DaemonDescriptionStatus
+
+        from .orchestrator import OrchClient
+        orch = OrchClient.instance()
+        if orch.available():
+            daemons = orch.services.list_daemons(daemon_type='oauth2-proxy')
+            oauth2_proxy_running = any(
+                d.status == DaemonDescriptionStatus.running for d in daemons
+            )
+            if not oauth2_proxy_running:
+                return HandleCommandResult(
+                    retval=-errno.EPERM,
+                    stderr='OAuth2 SSO prerequisite not met: '
+                           'oauth2-proxy service must be deployed and running.'
+                )
     mgr.SSO_DB.protocol = AuthType.OAUTH2
+    if jmespath and roles_path:
+        try:
+            jmespath.compile(roles_path)
+            mgr.SSO_DB.config.roles_path = roles_path
+        except (JMESPathError, SyntaxError):
+            return HandleCommandResult(stdout='Syntax invalid for "roles_path"')
     mgr.SSO_DB.save()
     mgr.set_module_option('sso_oauth2', True)
     return HandleCommandResult(stdout='SSO is "enabled" with "OAuth2" protocol.')
@@ -146,14 +176,20 @@ def handle_sso_command(cmd):
                              'dashboard sso setup saml2']:
         return -errno.ENOSYS, '', ''
 
-    if not python_saml_imported:
-        return -errno.EPERM, '', 'Required library not found: `python3-saml`'
+    if cmd['prefix'] == 'dashboard sso status':
+        if not mgr.SSO_DB.protocol == AuthType.LOCAL:
+            return 0, f'SSO is "enabled" with "{mgr.SSO_DB.protocol.name}" protocol.', ''
+
+        return 0, 'SSO is "disabled".', ''
 
     if cmd['prefix'] == 'dashboard sso disable':
         mgr.SSO_DB.protocol = AuthType.LOCAL
         mgr.SSO_DB.save()
         mgr.set_module_option('sso_oauth2', False)
         return 0, 'SSO is "disabled".', ''
+
+    if not python_saml_imported:
+        return -errno.EPERM, '', 'Required library not found: `python3-saml`'
 
     if cmd['prefix'] == 'dashboard sso enable saml2':
         configured = _is_sso_configured()
@@ -163,12 +199,6 @@ def handle_sso_command(cmd):
             return 0, 'SSO is "enabled" with "saml2" protocol.', ''
         return -errno.EPERM, '', 'Single Sign-On is not configured: ' \
             'use `ceph dashboard sso setup saml2`'
-
-    if cmd['prefix'] == 'dashboard sso status':
-        if not mgr.SSO_DB.protocol == AuthType.LOCAL:
-            return 0, f'SSO is "enabled" with "{mgr.SSO_DB.protocol}" protocol.', ''
-
-        return 0, 'SSO is "disabled".', ''
 
     if cmd['prefix'] == 'dashboard sso show saml2':
         return 0, json.dumps(mgr.SSO_DB.config.to_dict()), ''

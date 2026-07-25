@@ -1,9 +1,11 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
 
 #include <iostream>
 #include "LogOperation.h"
 #include "librbd/cache/pwl/Types.h"
+#include "common/debug.h"
+#include "common/perf_counters.h"
 
 #define dout_subsys ceph_subsys_rbd_pwl
 #undef dout_prefix
@@ -266,8 +268,7 @@ WriteLogOperationSet::~WriteLogOperationSet() { }
 
 std::ostream &operator<<(std::ostream &os,
                          const WriteLogOperationSet &s) {
-  os << "cell=" << (void*)s.cell
-     << ", extent_ops_appending=" << s.extent_ops_appending
+  os << "extent_ops_appending=" << s.extent_ops_appending
      << ", extent_ops_persist=" << s.extent_ops_persist;
   return os;
 }

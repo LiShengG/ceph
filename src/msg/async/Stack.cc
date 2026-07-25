@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph - scalable distributed file system
  *
@@ -14,8 +15,7 @@
  *
  */
 
-#include <mutex>
-
+#include "Stack.h"
 #include "include/compat.h"
 #include "common/Cond.h"
 #include "common/errno.h"
@@ -66,7 +66,9 @@ std::shared_ptr<NetworkStack> NetworkStack::create(CephContext *c,
   std::shared_ptr<NetworkStack> stack = nullptr;
 
   if (t == "posix")
-    stack.reset(new PosixNetworkStack(c));
+    stack.reset(new PosixNetworkStack(c, false));
+  else if (t == "smc")
+    stack.reset(new PosixNetworkStack(c, true));
 #ifdef HAVE_RDMA
   else if (t == "rdma")
     stack.reset(new RDMAStack(c));

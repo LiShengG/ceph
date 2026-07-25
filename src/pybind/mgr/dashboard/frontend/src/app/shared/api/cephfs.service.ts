@@ -7,6 +7,7 @@ import { Observable } from 'rxjs';
 import { cdEncode } from '../decorators/cd-encode';
 import { CephfsDir, CephfsQuotas } from '../models/cephfs-directory-models';
 import { shareReplay } from 'rxjs/operators';
+import { Daemon } from '../models/cephfs.model';
 
 @cdEncode
 @Injectable({
@@ -79,10 +80,15 @@ export class CephfsService {
     });
   }
 
-  create(name: string, serviceSpec: object) {
+  create(name: string, serviceSpec: object, dataPool = '', metadataPool = '') {
     return this.http.post(
       this.baseURL,
-      { name: name, service_spec: serviceSpec },
+      {
+        name: name,
+        service_spec: serviceSpec,
+        data_pool: dataPool,
+        metadata_pool: metadataPool
+      },
       {
         observe: 'response'
       }
@@ -109,12 +115,20 @@ export class CephfsService {
     });
   }
 
-  setAuth(fsName: string, clientId: number, caps: string[], rootSquash: boolean) {
+  setAuth(fsName: string, clientId: string | number, caps: string[], rootSquash: boolean) {
     return this.http.put(`${this.baseURL}/auth`, {
       fs_name: fsName,
       client_id: `client.${clientId}`,
       caps: caps,
       root_squash: rootSquash
     });
+  }
+
+  getUsedPools(): Observable<number[]> {
+    return this.http.get<number[]>(`${this.baseUiURL}/used-pools`);
+  }
+
+  listDaemonStatus(): Observable<Daemon[]> {
+    return this.http.get<Daemon[]>(`${this.baseURL}/mirror/daemon-status`);
   }
 }

@@ -9,7 +9,7 @@ import { ErasureCodeProfileService } from '~/app/shared/api/erasure-code-profile
 import { PoolService } from '~/app/shared/api/pool.service';
 import { ListWithDetails } from '~/app/shared/classes/list-with-details.class';
 import { TableStatusViewCache } from '~/app/shared/classes/table-status-view-cache';
-import { CriticalConfirmationModalComponent } from '~/app/shared/components/critical-confirmation-modal/critical-confirmation-modal.component';
+import { DeleteConfirmationModalComponent } from '~/app/shared/components/delete-confirmation-modal/delete-confirmation-modal.component';
 import { ActionLabelsI18n, URLVerbs } from '~/app/shared/constants/app.constants';
 import { TableComponent } from '~/app/shared/datatable/table/table.component';
 import { CellTemplate } from '~/app/shared/enum/cell-template.enum';
@@ -27,9 +27,10 @@ import { AuthStorageService } from '~/app/shared/services/auth-storage.service';
 import { TaskListService } from '~/app/shared/services/task-list.service';
 import { TaskWrapperService } from '~/app/shared/services/task-wrapper.service';
 import { URLBuilderService } from '~/app/shared/services/url-builder.service';
-import { Pool } from '../pool';
+import { Pool, PoolType } from '../pool';
 import { PoolStat, PoolStats } from '../pool-stat';
 import { ModalCdsService } from '~/app/shared/services/modal-cds.service';
+import { DeletionImpact } from '~/app/shared/enum/delete-confirmation-modal-impact.enum';
 
 const BASE_URL = 'pool';
 
@@ -40,7 +41,8 @@ const BASE_URL = 'pool';
     TaskListService,
     { provide: URLBuilderService, useValue: new URLBuilderService(BASE_URL) }
   ],
-  styleUrls: ['./pool-list.component.scss']
+  styleUrls: ['./pool-list.component.scss'],
+  standalone: false
 })
 export class PoolListComponent extends ListWithDetails implements OnInit {
   @ViewChild(TableComponent)
@@ -111,6 +113,14 @@ export class PoolListComponent extends ListWithDetails implements OnInit {
           this.monAllowPoolDelete = monSection.value === 'true' ? true : false;
         }
       });
+    } else if (this.permissions.pool?.read) {
+      /*
+     `monAllowPoolDelete` will always be `false`,
+      because no read permissions for reading config settings.
+      Hence enabling by default for pool based roles which allow CRUD.
+      @TODO: Fix once permissions of config-opt are sorted.
+    */
+      this.monAllowPoolDelete = true;
     }
   }
 
@@ -127,18 +137,18 @@ export class PoolListComponent extends ListWithDetails implements OnInit {
       {
         prop: 'data_protection',
         name: $localize`Data Protection`,
-        cellTransformation: CellTemplate.badge,
+        cellTransformation: CellTemplate.tag,
         customTemplateConfig: {
-          class: 'badge-background-gray'
+          class: 'tag-background-gray'
         },
         flexGrow: 1.3
       },
       {
         prop: 'application_metadata',
         name: $localize`Applications`,
-        cellTransformation: CellTemplate.badge,
+        cellTransformation: CellTemplate.tag,
         customTemplateConfig: {
-          class: 'badge-background-primary'
+          class: 'tag-background-primary'
         },
         flexGrow: 1.5
       },
@@ -223,7 +233,8 @@ export class PoolListComponent extends ListWithDetails implements OnInit {
 
   deletePoolModal() {
     const name = this.selection.first().pool_name;
-    this.modalService.show(CriticalConfirmationModalComponent, {
+    this.modalService.show(DeleteConfirmationModalComponent, {
+      impact: DeletionImpact.high,
       itemDescription: 'Pool',
       itemNames: [name],
       submitActionObservable: () =>
@@ -263,6 +274,11 @@ export class PoolListComponent extends ListWithDetails implements OnInit {
       'wr'
     ];
     const emptyStat: PoolStat = { latest: 0, rate: 0, rates: [] };
+    const applicationLabels: Record<string, string> = {
+      cephfs: $localize`File system`,
+      rbd: $localize`Block`,
+      rgw: $localize`Object`
+    };
 
     _.forEach(pools, (pool: Pool) => {
       pool['pg_status'] = this.transformPgStatus(pool['pg_status']);
@@ -285,13 +301,17 @@ export class PoolListComponent extends ListWithDetails implements OnInit {
       });
       pool.cdIsBinary = true;
 
-      if (pool['type'] === 'erasure') {
+      if (pool['type'] === PoolType.ERASURE) {
         const erasureCodeProfile = pool['erasure_code_profile'];
         pool['data_protection'] = this.getErasureCodeProfile(erasureCodeProfile);
       }
-      if (pool['type'] === 'replicated') {
+      if (pool['type'] === PoolType.REPLICATED) {
         pool['data_protection'] = `replica: ×${pool['size']}`;
       }
+
+      pool['application_metadata'] = (pool.application_metadata || []).map(
+        (application: string) => applicationLabels[application] || application
+      );
     });
 
     return pools;

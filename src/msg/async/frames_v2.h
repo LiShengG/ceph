@@ -1,11 +1,18 @@
 #ifndef _MSG_ASYNC_FRAMES_V2_
 #define _MSG_ASYNC_FRAMES_V2_
 
-#include "include/types.h"
+#include "include/buffer.h"
+#include "include/byteorder.h" // for ceph_le*
+#include "include/ceph_features.h" // for CEPH_FEATUREMASK_*
+#include "include/intarith.h" // for p2roundup()
+#include "include/types.h" // for sha256_digest_t
 #include "common/Clock.h"
 #include "crypto_onwire.h"
 #include "compression_onwire.h"
+#include "msg/msg_types.h" // for entity_addr_t, entity_addrvec_t
 #include <array>
+#include <cstddef>
+#include <cstdint>
 #include <iosfwd>
 #include <utility>
 
@@ -174,10 +181,10 @@ static constexpr uint32_t FRAME_PREAMBLE_WITH_INLINE_SIZE =
 #define FRAME_LATE_STATUS_RESERVED_FALSE  0xe0
 #define FRAME_LATE_STATUS_RESERVED_MASK   0xf0
 
-// For msgr 2.1, FRAME_EARLY_X flags are sent as part of epilogue.
+// For msgr 2.1, FRAME_EARLY_X flags are sent as part of the prologue.
 //
-// This flag indicates whether frame segments have been compressed by 
-// sender, and used in segments' disassemblig phase. 
+// This flag indicates whether frame segments have been compressed by
+// sender, and used in segments' disassemblig phase.
 #define FRAME_EARLY_DATA_COMPRESSED       0X1
 
 struct FrameError : std::runtime_error {

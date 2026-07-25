@@ -1,5 +1,5 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
 
 #pragma once
 
@@ -70,18 +70,28 @@ static void copy_from_local(
   assert(tgt->node == from_src->node);
   assert(to_src->node == from_src->node);
 
+  auto end = to_src->get_right_ptr_end();
+  auto key_end = to_src->get_node_key_ptr();
+  auto key_len = from_src->get_node_key_ptr() - tgt->get_node_key_ptr();
+
   auto to_copy = from_src->get_right_ptr_end() - to_src->get_right_ptr_end();
-  assert(to_copy > 0);
+  assert(to_copy >= 0);
   int adjust_offset = tgt > from_src? -len : len;
   memmove(to_src->get_right_ptr_end() + adjust_offset,
           to_src->get_right_ptr_end(),
           to_copy);
 
+  if (from_src > tgt) {   //keep same content for rm_key and rm_keyrange in case replay has crc error
+    memset(end, 0, len);
+  }
   for ( auto ite = from_src; ite < to_src; ite++) {
       ite->update_offset(-adjust_offset);
   }
   memmove(tgt->get_node_key_ptr(), from_src->get_node_key_ptr(),
           to_src->get_node_key_ptr() - from_src->get_node_key_ptr());
+  if (from_src > tgt) {
+    memset(key_end - key_len, 0, key_len);
+  }
 }
 
 struct delta_inner_t {
@@ -91,13 +101,13 @@ struct delta_inner_t {
     REMOVE,
   } op;
   std::string key;
-  laddr_t addr;
+  laddr_block_offset_t block_offset;
 
   DENC(delta_inner_t, v, p) {
     DENC_START(1, 1, p);
     denc(v.op, p);
     denc(v.key, p);
-    denc(v.addr, p);
+    denc(v.block_offset, p);
     DENC_FINISH(p);
   }
 
@@ -105,7 +115,7 @@ struct delta_inner_t {
   bool operator==(const delta_inner_t &rhs) const {
     return op == rhs.op &&
            key == rhs.key &&
-           addr == rhs.addr;
+           block_offset == rhs.block_offset;
   }
 };
 }
@@ -148,22 +158,22 @@ public:
   }
   void insert(
     const std::string &key,
-    laddr_t addr) {
+    laddr_block_offset_t block_offset) {
     buffer.push_back(
       delta_inner_t{
         delta_inner_t::op_t::INSERT,
         key,
-        addr
+        block_offset
       });
   }
   void update(
     const std::string &key,
-    laddr_t addr) {
+    laddr_block_offset_t block_offset) {
     buffer.push_back(
       delta_inner_t{
 	delta_inner_t::op_t::UPDATE,
 	key,
-	addr
+	block_offset
       });
   }
   void remove(const std::string &key) {
@@ -171,7 +181,7 @@ public:
       delta_inner_t{
 	delta_inner_t::op_t::REMOVE,
 	key,
-	L_ADDR_NULL
+	LADDR_BLOCK_OFFSET_NULL
       });
   }
 
@@ -440,7 +450,7 @@ public:
     }
 
   public:
-    uint16_t get_index() const {
+    uint16_t get_offset() const {
       return index;
     }
 
@@ -450,8 +460,8 @@ public:
 	get_node_key().key_len);
     }
 
-    laddr_t get_val() const {
-      return get_node_key().laddr;
+    laddr_block_offset_t get_val() const {
+      return get_node_key().block_offset;
     }
 
     bool contains(std::string_view key) const {
@@ -470,28 +480,28 @@ public:
 public:
   void journal_inner_insert(
     const_iterator _iter,
-    const laddr_t laddr,
+    const laddr_block_offset_t block_offset,
     const std::string &key,
     delta_inner_buffer_t *recorder) {
     auto iter = iterator(this, _iter.index);
     if (recorder) {
       recorder->insert(
 	key,
-	laddr);
+	block_offset);
     }
-    inner_insert(iter, key, laddr);
+    inner_insert(iter, key, block_offset);
   }
 
   void journal_inner_update(
     const_iterator _iter,
-    const laddr_t laddr,
+    const laddr_block_offset_t block_offset,
     delta_inner_buffer_t *recorder) {
     auto iter = iterator(this, _iter.index);
     auto key = iter->get_key();
     if (recorder) {
-      recorder->update(key, laddr);
+      recorder->update(key, block_offset);
     }
-    inner_update(iter, laddr);
+    inner_update(iter, block_offset);
   }
 
   void journal_inner_remove(
@@ -504,7 +514,7 @@ public:
     inner_remove(iter);
   }
 
-  StringKVInnerNodeLayout() : buf(nullptr) {}
+  StringKVInnerNodeLayout(char *buf) : buf(buf) {}
 
   void set_layout_buf(char *_buf) {
     assert(buf == nullptr);
@@ -597,13 +607,8 @@ public:
   }
 
   const_iterator find_string_key(std::string_view str) const {
-    auto ret = iter_begin();
-    for (; ret != iter_end(); ++ret) {
-     std::string s = ret->get_key();
-      if (s == str)
-        break;
-    }
-    return ret;
+    auto it = string_lower_bound(str);
+    return (it != iter_cend() && it.get_key() == str) ? it : iter_cend();
   }
 
   iterator find_string_key(std::string_view str) {
@@ -740,21 +745,14 @@ public:
     set_meta(omap_node_meta_t::merge_from(left.get_meta(), right.get_meta()));
   }
 
-  /**
-   * balance_into_new_nodes
-   *
-   * Takes the contents of left and right and copies them into
-   * replacement_left and replacement_right such that
-   * the size of replacement_left just >= 1/2 of (left + right)
-   */
-  static std::string balance_into_new_nodes(
+  static std::optional<uint32_t> get_balance_pivot_idx(
     const StringKVInnerNodeLayout &left,
-    const StringKVInnerNodeLayout &right,
-    StringKVInnerNodeLayout &replacement_left,
-    StringKVInnerNodeLayout &replacement_right)
+    const StringKVInnerNodeLayout &right)
   {
-    uint32_t left_size = omap_inner_key_t(left.get_node_key_ptr()[left.get_size()-1]).key_off;
-    uint32_t right_size = omap_inner_key_t(right.get_node_key_ptr()[right.get_size()-1]).key_off;
+    uint32_t left_size = omap_inner_key_t(
+      left.get_node_key_ptr()[left.get_size()-1]).key_off;
+    uint32_t right_size = omap_inner_key_t(
+      right.get_node_key_ptr()[right.get_size()-1]).key_off;
     uint32_t total = left_size + right_size;
     uint32_t pivot_size = total / 2;
     uint32_t pivot_idx = 0;
@@ -764,7 +762,7 @@ public:
         auto node_key = ite->get_node_key();
         size += node_key.key_len;
         if (size >= pivot_size){
-          pivot_idx = ite.get_index();
+          pivot_idx = ite.get_offset();
           break;
         }
       }
@@ -775,11 +773,35 @@ public:
         auto node_key = ite->get_node_key();
         size += node_key.key_len;
         if (size >= more_size){
-          pivot_idx = ite.get_index() + left.get_size();
+          pivot_idx = ite.get_offset() + left.get_size();
           break;
         }
       }
     }
+    return pivot_idx == left.get_size()
+      ? std::nullopt
+      : std::make_optional<uint32_t>(pivot_idx);
+  }
+
+  /**
+   * balance_into_new_nodes
+   *
+   * Takes the contents of left and right and copies them into
+   * replacement_left and replacement_right such that
+   * the size of replacement_left just >= 1/2 of (left + right)
+   */
+  static std::string balance_into_new_nodes(
+    const StringKVInnerNodeLayout &left,
+    const StringKVInnerNodeLayout &right,
+    uint32_t pivot_idx,
+    StringKVInnerNodeLayout &replacement_left,
+    StringKVInnerNodeLayout &replacement_right)
+  {
+    ceph_assert(!(left.below_min() && right.below_min()));
+    uint32_t left_size = omap_inner_key_t(left.get_node_key_ptr()[left.get_size()-1]).key_off;
+    uint32_t right_size = omap_inner_key_t(right.get_node_key_ptr()[right.get_size()-1]).key_off;
+    uint32_t total = left_size + right_size;
+    uint32_t pivot_size = total / 2;
 
     auto replacement_pivot = pivot_idx >= left.get_size() ?
       right.iter_idx(pivot_idx - left.get_size())->get_key() :
@@ -834,7 +856,7 @@ private:
   void inner_insert(
     iterator iter,
     const std::string &key,
-    laddr_t val) {
+    laddr_block_offset_t val) {
     if (iter != iter_begin()) {
       assert((iter - 1)->get_key() < key);
     }
@@ -849,7 +871,7 @@ private:
 
     omap_inner_key_t nkey;
     nkey.key_len = key.size();
-    nkey.laddr = val;
+    nkey.block_offset = val;
     if (iter != iter_begin()) {
       auto pkey = (iter - 1).get_node_key();
       nkey.key_off = nkey.key_len + pkey.key_off;
@@ -864,10 +886,10 @@ private:
 
   void inner_update(
     iterator iter,
-    laddr_t addr) {
+    laddr_block_offset_t block_offset) {
     assert(iter != iter_end());
     auto node_key = iter->get_node_key();
-    node_key.laddr = addr;
+    node_key.block_offset = block_offset;
     iter->set_node_key(node_key);
   }
 
@@ -915,6 +937,7 @@ private:
  */
 class StringKVLeafNodeLayout {
   char *buf = nullptr;
+  extent_len_t len = 0;
 
   using L = absl::container_internal::Layout<ceph_le32, omap_node_meta_le_t, omap_leaf_key_le_t>;
   static constexpr L layout{1, 1, 1}; // = L::Partial(1, 1, 1);
@@ -1014,7 +1037,7 @@ public:
       return get_node_key().key_off;
     }
     auto get_node_val_ptr() const {
-      auto tail = node->buf + OMAP_LEAF_BLOCK_SIZE;
+      auto tail = node->buf + node->len;
       if (*this == node->iter_end())
         return tail;
       else {
@@ -1029,7 +1052,7 @@ public:
         return (*this - 1)->get_node_val_offset();
     }
     auto get_right_ptr_end() const {
-      return node->buf + OMAP_LEAF_BLOCK_SIZE - get_right_offset_end();
+      return node->buf + node->len - get_right_offset_end();
     }
 
     void update_offset(int offset) {
@@ -1057,7 +1080,7 @@ public:
     }
 
   public:
-    uint16_t get_index() const {
+    uint16_t get_offset() const {
       return index;
     }
 
@@ -1124,13 +1147,30 @@ public:
     }
     leaf_remove(iter);
   }
+  void journal_leaf_remove_range(
+    const_iterator _fiter,
+    const_iterator _liter,
+    delta_leaf_buffer_t *recorder) {
+    assert(_fiter != iter_end());
+    assert(_fiter != _liter);
+    auto fiter = iterator(this, _fiter.index);
+    auto liter = iterator(this, _liter.index);
+    if (recorder) {
+      for(auto iter = fiter; iter != liter; iter++) {
+        recorder->remove(iter->get_key());
+      }
+    }
+    leaf_remove_range(fiter, liter);
+  }
 
   StringKVLeafNodeLayout() : buf(nullptr) {}
 
-  void set_layout_buf(char *_buf) {
+  void set_layout_buf(char *_buf, extent_len_t _len) {
+    assert(_len > 0);
     assert(buf == nullptr);
     assert(_buf != nullptr);
     buf = _buf;
+    len = _len;
   }
 
   const_iterator iter_begin() const {
@@ -1164,20 +1204,14 @@ public:
   }
 
   const_iterator string_lower_bound(std::string_view str) const {
-    uint16_t start = 0, end = get_size();
-    while (start != end) {
-      unsigned mid = (start + end) / 2;
-      const_iterator iter(this, mid);
-      std::string s = iter->get_key();
-      if (s < str) {
-        start = ++mid;
-      } else if (s > str) {
-        end = mid;
-      } else {
-        return iter;
-      }
-    }
-    return const_iterator(this, start);
+    auto it = std::lower_bound(boost::make_counting_iterator<uint16_t>(0),
+                               boost::make_counting_iterator<uint16_t>(get_size()),
+                               str,
+                               [this](uint16_t i, std::string_view str) {
+                                 const_iterator iter(this, i);
+                                 return iter->get_key() < str;
+                               });
+    return const_iterator(this, *it);
   }
 
   iterator string_lower_bound(std::string_view str) {
@@ -1186,13 +1220,14 @@ public:
   }
 
   const_iterator string_upper_bound(std::string_view str) const {
-    auto ret = iter_begin();
-    for (; ret != iter_end(); ++ret) {
-      std::string s = ret->get_key();
-      if (s > str)
-        break;
-    }
-    return ret;
+    auto it = std::upper_bound(boost::make_counting_iterator<uint16_t>(0),
+                               boost::make_counting_iterator<uint16_t>(get_size()),
+                               str,
+                               [this](std::string_view str, uint16_t i) {
+                                 const_iterator iter(this, i);
+                                 return str < iter->get_key();
+                               });
+    return const_iterator(this, *it);
   }
 
   iterator string_upper_bound(std::string_view str) {
@@ -1201,14 +1236,10 @@ public:
   }
 
   const_iterator find_string_key(std::string_view str) const {
-    auto ret = iter_begin();
-    for (; ret != iter_end(); ++ret) {
-      std::string s = ret->get_key();
-      if (s == str)
-        break;
-    }
-    return ret;
+    auto it = string_lower_bound(str);
+    return (it != iter_end() && it.get_key() == str) ? it : iter_end();
   }
+
   iterator find_string_key(std::string_view str) {
     const auto &tref = *this;
     return iterator(this, tref.find_string_key(str).index);
@@ -1274,9 +1305,14 @@ public:
   }
 
   uint32_t capacity() const {
-    return OMAP_LEAF_BLOCK_SIZE
+    return len
       - (reinterpret_cast<char*>(layout.template Pointer<2>(buf))
       - reinterpret_cast<char*>(layout.template Pointer<0>(buf)));
+  }
+
+  auto get_len() const {
+    assert(len > 0);
+    return len;
   }
 
   bool is_overflow(size_t ksize, size_t vsize) const {
@@ -1357,21 +1393,14 @@ public:
     set_meta(omap_node_meta_t::merge_from(left.get_meta(), right.get_meta()));
   }
 
-  /**
-   * balance_into_new_nodes
-   *
-   * Takes the contents of left and right and copies them into
-   * replacement_left and replacement_right such that
-   * the size of replacement_left side just >= 1/2 of the total size (left + right).
-   */
-  static std::string balance_into_new_nodes(
+  static std::optional<uint32_t> get_balance_pivot_idx(
     const StringKVLeafNodeLayout &left,
-    const StringKVLeafNodeLayout &right,
-    StringKVLeafNodeLayout &replacement_left,
-    StringKVLeafNodeLayout &replacement_right)
+    const StringKVLeafNodeLayout &right)
   {
-    uint32_t left_size = omap_leaf_key_t(left.get_node_key_ptr()[left.get_size()-1]).key_off;
-    uint32_t right_size = omap_leaf_key_t(right.get_node_key_ptr()[right.get_size()-1]).key_off;
+    uint32_t left_size = omap_leaf_key_t(
+      left.get_node_key_ptr()[left.get_size()-1]).key_off;
+    uint32_t right_size = omap_leaf_key_t(
+      right.get_node_key_ptr()[right.get_size()-1]).key_off;
     uint32_t total = left_size + right_size;
     uint32_t pivot_size = total / 2;
     uint32_t pivot_idx = 0;
@@ -1381,7 +1410,7 @@ public:
         auto node_key = ite->get_node_key();
         size += node_key.key_len + node_key.val_len;
         if (size >= pivot_size){
-          pivot_idx = ite.get_index();
+          pivot_idx = ite.get_offset();
           break;
         }
       }
@@ -1392,11 +1421,34 @@ public:
         auto node_key = ite->get_node_key();
         size += node_key.key_len + node_key.val_len;
         if (size >= more_size){
-          pivot_idx = ite.get_index() + left.get_size();
+          pivot_idx = ite.get_offset() + left.get_size();
           break;
         }
       }
     }
+    return pivot_idx == left.get_size()
+      ? std::nullopt
+      : std::make_optional<uint32_t>(pivot_idx);
+  }
+
+  /**
+   * balance_into_new_nodes
+   *
+   * Takes the contents of left and right and copies them into
+   * replacement_left and replacement_right such that
+   * the size of replacement_left side just >= 1/2 of the total size (left + right).
+   */
+  static std::string balance_into_new_nodes(
+    const StringKVLeafNodeLayout &left,
+    const StringKVLeafNodeLayout &right,
+    uint32_t pivot_idx,
+    StringKVLeafNodeLayout &replacement_left,
+    StringKVLeafNodeLayout &replacement_right)
+  {
+    uint32_t left_size = omap_leaf_key_t(left.get_node_key_ptr()[left.get_size()-1]).key_off;
+    uint32_t right_size = omap_leaf_key_t(right.get_node_key_ptr()[right.get_size()-1]).key_off;
+    uint32_t total = left_size + right_size;
+    uint32_t pivot_size = total / 2;
 
     auto replacement_pivot = pivot_idx >= left.get_size() ?
       right.iter_idx(pivot_idx - left.get_size())->get_key() :
@@ -1490,13 +1542,21 @@ private:
 
   void leaf_remove(iterator iter) {
     assert(iter != iter_end());
-    if ((iter + 1) != iter_end()) {
-      omap_leaf_key_t key = iter->get_node_key();
-      copy_from_local(key.key_len + key.val_len, iter, iter + 1, iter_end());
-    }
+
+    omap_leaf_key_t key = iter->get_node_key();
+    copy_from_local(key.key_len + key.val_len, iter, iter + 1, iter_end());
+
     set_size(get_size() - 1);
   }
+  void leaf_remove_range(iterator fiter, iterator liter) {
+    assert(fiter != iter_end());
 
+    auto adjust_len = fiter->get_right_ptr_end() - liter->get_right_ptr_end();
+    copy_from_local(adjust_len, fiter, liter, iter_end());
+
+
+    set_size(get_size() - (liter - fiter));
+  }
   /**
    * get_key_ptr
    *
@@ -1514,13 +1574,13 @@ private:
 inline void delta_inner_t::replay(StringKVInnerNodeLayout &l) {
   switch (op) {
     case op_t::INSERT: {
-      l.inner_insert(l.string_lower_bound(key), key, addr);
+      l.inner_insert(l.string_lower_bound(key), key, block_offset);
       break;
     }
     case op_t::UPDATE: {
       auto iter = l.find_string_key(key);
       assert(iter != l.iter_end());
-      l.inner_update(iter, addr);
+      l.inner_update(iter, block_offset);
       break;
     }
     case op_t::REMOVE: {

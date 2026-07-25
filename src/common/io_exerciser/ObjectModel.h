@@ -1,6 +1,13 @@
 #pragma once
 
 #include "Model.h"
+#include "include/buffer.h"
+#include "include/interval_set.h"
+#include "include/random.h"
+
+#include <string>
+#include <vector>
+#include <random>
 
 /* Overview
  *
@@ -14,40 +21,43 @@
  */
 
 namespace ceph {
-  namespace io_exerciser {
-    /* Model of an object to track its data contents */
+namespace io_exerciser {
+/* Model of an object to track its data contents */
 
-    class ObjectModel : public Model {
-    private:
-      bool created;
-      std::vector<int> contents;
-      ceph::util::random_number_generator<int> rng =
-        ceph::util::random_number_generator<int>();
+class ObjectModel : public Model {
+ private:
+  bool primary_created;
+  bool secondary_created;
+  std::vector<int> primary_contents;
+  std::vector<int> secondary_contents;
+  std::mt19937_64 rng;
 
-      // Track read and write I/Os that can be submitted in
-      // parallel to detect violations:
-      //
-      // * Read may not overlap with a parallel write
-      // * Write may not overlap with a parallel read or write
-      // * Create / remove may not be in parallel with read or write
-      //
-      // Fix broken test cases by adding barrier ops to restrict
-      // I/O exercisers from issuing conflicting ops in parallel
-      interval_set<uint64_t> reads;
-      interval_set<uint64_t> writes;
-    public:
-      ObjectModel(const std::string& oid, uint64_t block_size, int seed);
-      
-      int get_seed(uint64_t offset) const;
-      std::vector<int> get_seed_offsets(int seed) const;
+  // Track read and write I/Os that can be submitted in
+  // parallel to detect violations:
+  //
+  // * Read may not overlap with a parallel write
+  // * Write may not overlap with a parallel read or write
+  // * Create / remove may not be in parallel with read or write
+  //
+  // Fix broken test cases by adding barrier ops to restrict
+  // I/O exercisers from issuing conflicting ops in parallel
+  interval_set<uint64_t> reads;
+  interval_set<uint64_t> writes;
 
-      std::string to_string(int mask = -1) const;
+ public:
+  ObjectModel(const std::string& primary_oid, const std::string& secondary_oid,
+              uint64_t block_size, int seed, bool delete_objects = true);
 
-      bool readyForIoOp(IoOp& op);
-      void applyIoOp(IoOp& op);
-      
-      void encode(ceph::buffer::list& bl) const;
-      void decode(ceph::buffer::list::const_iterator& bl);
-    };
-  }
-}
+  int get_seed(uint64_t offset) const;
+  std::vector<int> get_seed_offsets(int seed) const;
+
+  std::string to_string(int mask = -1) const;
+
+  bool readyForIoOp(IoOp& op);
+  void applyIoOp(IoOp& op);
+
+  void encode(ceph::buffer::list& bl) const;
+  void decode(ceph::buffer::list::const_iterator& bl);
+};
+}  // namespace io_exerciser
+}  // namespace ceph

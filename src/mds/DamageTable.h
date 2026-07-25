@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph - scalable distributed file system
  *
@@ -16,10 +17,18 @@
 #ifndef DAMAGE_TABLE_H_
 #define DAMAGE_TABLE_H_
 
+#include "mdstypes.h"
+
+#include <map>
+#include <memory>
+#include <string>
 #include <string_view>
 
-#include "mdstypes.h"
-#include "include/random.h"
+#include "include/cephfs/types.h" // for mds_rank_t
+#include "include/frag.h"
+#include "include/fs_types.h" // for inodeno_t
+#include "include/object.h" // for snapid_t
+#include "include/utime.h"
 
 class CDir;
 class CInode;
@@ -38,11 +47,7 @@ typedef enum
 class DamageEntry
 {
   public:
-    DamageEntry()
-    {
-      id = ceph::util::generate_random_number<damage_entry_id_t>(0, 0xffffffff);
-      reported_at = ceph_clock_now();
-    }
+    DamageEntry();
 
     virtual ~DamageEntry();
 

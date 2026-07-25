@@ -1,10 +1,11 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab ft=cpp
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab ft=cpp
 
 #include <algorithm>
 #include <boost/algorithm/string/predicate.hpp>
 #include <map>
 #include <iterator>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -12,6 +13,7 @@
 #include "common/armor.h"
 #include "common/utf8.h"
 #include "common/split.h"
+#include "include/timegm.h"
 #include "rgw_rest_s3.h"
 #include "rgw_auth_s3.h"
 #include "rgw_common.h"
@@ -471,6 +473,7 @@ static inline int parse_v4_auth_header(const req_info& info,               /* in
 bool is_non_s3_op(RGWOpType op_type)
 {
   switch (op_type) {
+  case RGW_STS_GET_CALLER_IDENTITY:
   case RGW_STS_GET_SESSION_TOKEN:
   case RGW_STS_ASSUME_ROLE:
   case RGW_STS_ASSUME_ROLE_WEB_IDENTITY:
@@ -498,6 +501,7 @@ bool is_non_s3_op(RGWOpType op_type)
   case RGW_OP_GET_OIDC_PROVIDER:
   case RGW_OP_LIST_OIDC_PROVIDERS:
   case RGW_OP_ADD_CLIENTID_TO_OIDC_PROVIDER:
+  case RGW_OP_REMOVE_CLIENTID_FROM_OIDC_PROVIDER:
   case RGW_OP_UPDATE_OIDC_PROVIDER_THUMBPRINT:
   case RGW_OP_PUBSUB_TOPIC_CREATE:
   case RGW_OP_PUBSUB_TOPICS_LIST:
@@ -508,6 +512,7 @@ bool is_non_s3_op(RGWOpType op_type)
   case RGW_OP_LIST_ROLE_TAGS:
   case RGW_OP_UNTAG_ROLE:
   case RGW_OP_UPDATE_ROLE:
+  case RGW_OP_GET_ACCOUNT_SUMMARY:
 
   case RGW_OP_CREATE_USER:
   case RGW_OP_GET_USER:
@@ -1002,7 +1007,7 @@ get_v4_signature(const std::string_view& credential_scope,
   using srv_signature_t = AWSEngine::VersionAbstractor::server_signature_t;
   srv_signature_t signature(srv_signature_t::initialized_later(),
                             digest.SIZE * 2);
-  buf_to_hex(digest.v, digest.SIZE, signature.begin());
+  buf_to_hex(std::span{digest.v, digest.SIZE}, signature.begin());
 
   ldpp_dout(dpp, 10) << "generated signature = " << signature << dendl;
 
@@ -1020,12 +1025,13 @@ get_v2_signature(CephContext* const cct,
 
   const auto digest = calc_hmac_sha1(secret_key, string_to_sign);
 
-  /* 64 is really enough */;
-  char buf[64];
-  const int ret = ceph_armor(std::begin(buf),
-                             std::begin(buf) + 64,
-                             reinterpret_cast<const char *>(digest.v),
-                             reinterpret_cast<const char *>(digest.v + digest.SIZE));
+  /* Sized for signature */;
+  char buf[AWSEngine::VersionAbstractor::SIGNATURE_MAX_SIZE];
+  const int ret = ceph_armor(
+      std::begin(buf),
+      std::begin(buf) + AWSEngine::VersionAbstractor::SIGNATURE_MAX_SIZE,
+      reinterpret_cast<const char*>(digest.v),
+      reinterpret_cast<const char*>(digest.v + digest.SIZE));
   if (ret < 0) {
     ldout(cct, 10) << "ceph_armor failed" << dendl;
     throw ret;
@@ -1072,7 +1078,7 @@ AWSv4ComplMulti::ChunkMeta::create_next(CephContext* const cct,
   if (data_length == 0 && data_field_end == metabuf) {
     ldout(cct, 20) << "AWSv4ComplMulti: cannot parse the data size"
                    << dendl;
-    throw rgw::io::Exception(EINVAL, std::system_category());
+    /* this case is no longer treated as an exception */
   }
 
   if (expect_chunk_signature) {
@@ -1478,9 +1484,7 @@ void AWSv4ComplMulti::modify_request_state(const DoutPrefixProvider* dpp, req_st
   const char* const decoded_length = \
     s_rw->info.env->get("HTTP_X_AMZ_DECODED_CONTENT_LENGTH");
 
-  if (!decoded_length) {
-    throw -EINVAL;
-  } else {
+  if (decoded_length) {
     /* XXXX oh my, we forget the original content length */
     s_rw->length = decoded_length;
     s_rw->content_length = parse_content_length(decoded_length);
@@ -1740,5 +1744,39 @@ std::string get_canonical_method(const DoutPrefixProvider *dpp, RGWOpType op_typ
   }
 
   return info.method;
+}
+
+void get_aws_version_and_auth_type(const req_state* s, string& aws_version, string& auth_type)
+{
+  const char* http_auth = s->info.env->get("HTTP_AUTHORIZATION");
+  if (http_auth && http_auth[0]) {
+    auth_type = "AuthHeader";
+    /* Authorization in Header */
+    if (!strncmp(http_auth, AWS4_HMAC_SHA256_STR,
+                 strlen(AWS4_HMAC_SHA256_STR))) {
+      /* AWS v4 */
+      aws_version = "SigV4";
+    } else if (!strncmp(http_auth, "AWS ", 4)) {
+      /* AWS v2 */
+      aws_version = "SigV2";
+    }
+  } else {
+    // Expires is characteristic of the older Signature Version 2,
+    //  while X-Amz-Expires is used in Signature Version 4 (SigV4)
+    if (!s->info.args.get("x-amz-expires").empty() ||
+        !s->info.args.get("Expires").empty()) {
+      auth_type = "QueryString";
+      if (s->info.args.get("x-amz-algorithm") == AWS4_HMAC_SHA256_STR) {
+      /* AWS v4 */
+	aws_version = "SigV4";
+      } else if (!s->info.args.get("AWSAccessKeyId").empty()) {
+      /* AWS v2 */
+	aws_version = "SigV2";
+      }
+    } else {
+      // Unauthenticated
+      auth_type.clear();
+    }
+  }
 }
 } // namespace rgw::auth::s3

@@ -1,6 +1,14 @@
 #pragma once
 
 #include "ObjectModel.h"
+#include "common/io_exerciser/IoSequence.h"
+#include "erasure-code/consistency/ConsistencyChecker.h"
+#include "librados/AioCompletionImpl.h"
+#include "common/ceph_mutex.h"
+
+#include <random>
+
+namespace boost::asio { class io_context; }
 
 /* Overview
  *
@@ -10,71 +18,70 @@
  *   in the object. Uses DataBuffer to create and validate
  *   data buffers. When there are not barrier I/Os this may
  *   issue multiple async I/Os in parallel.
- * 
+ *
  */
 
 namespace ceph {
-  namespace io_exerciser {
-    namespace data_generation {
-      class DataGenerator;
-    }
-    
-    class RadosIo: public Model {
-    protected:
-      librados::Rados& rados;
-      boost::asio::io_context& asio;
-      std::unique_ptr<ObjectModel> om;
-      std::unique_ptr<ceph::io_exerciser::data_generation::DataGenerator> db;
-      std::string pool;
-      int threads;
-      ceph::mutex& lock;
-      ceph::condition_variable& cond;
-      librados::IoCtx io;
-      int outstanding_io;
-
-      void start_io();
-      void finish_io();
-      void wait_for_io(int count);
-      
-    public:
-      RadosIo(librados::Rados& rados,
-              boost::asio::io_context& asio,
-              const std::string& pool,
-              const std::string& oid,
-              uint64_t block_size,
-              int seed,
-              int threads,
-              ceph::mutex& lock,
-              ceph::condition_variable& cond);
-
-      ~RadosIo();
-
-      void allow_ec_overwrites(bool allow);
-
-      class AsyncOpInfo {
-      public:
-        librados::ObjectReadOperation rop;
-        librados::ObjectWriteOperation wop;
-        ceph::buffer::list bl1;
-        ceph::buffer::list bl2;
-        ceph::buffer::list bl3;
-        uint64_t offset1;
-        uint64_t length1;
-        uint64_t offset2;
-        uint64_t length2;
-        uint64_t offset3;
-        uint64_t length3;
-
-        AsyncOpInfo(uint64_t offset1 = 0, uint64_t length1 = 0,
-                uint64_t offset2 = 0, uint64_t length2 = 0,
-                uint64_t offset3 = 0, uint64_t length3 = 0 );
-        ~AsyncOpInfo() = default;
-      };
-
-      // Must be called with lock held
-      bool readyForIoOp(IoOp& op);
-      
-      void applyIoOp(IoOp& op);
-    };
-  }
+namespace io_exerciser {
+namespace data_generation {
+class DataGenerator;
+enum class GenerationType;
 }
+
+class RadosIo : public Model {
+ protected:
+  librados::Rados& rados;
+  boost::asio::io_context& asio;
+  std::unique_ptr<ObjectModel> om;
+  std::unique_ptr<ceph::io_exerciser::data_generation::DataGenerator> db;
+  std::unique_ptr<ceph::consistency::ConsistencyChecker> cc;
+  std::string pool;
+  int threads;
+  ceph::mutex& lock;
+  ceph::condition_variable& cond;
+  librados::IoCtx io;
+  int outstanding_io;
+  std::shared_ptr<ceph::io_exerciser::IoSequence> seq;
+  std::mt19937_64 rng;
+  int balanced_read_percentage;
+
+  void start_io();
+  void finish_io();
+  void wait_for_io(int count);
+
+ public:
+  RadosIo(librados::Rados& rados, boost::asio::io_context& asio,
+          const std::string& pool, const std::string& primary_oid, const std::string& secondary_oid,
+          uint64_t block_size, int seed, int threads, ceph::mutex& lock,
+          ceph::condition_variable& cond, bool is_replicated_pool,
+          bool ec_optimizations, int balanced_read_percentage,
+          ceph::io_exerciser::data_generation::GenerationType data_generation_type,
+          std::shared_ptr<ceph::io_exerciser::IoSequence> seq = nullptr, bool delete_objects = true);
+
+  ~RadosIo();
+
+  void allow_ec_overwrites(bool allow);
+  void allow_ec_optimizations();
+
+  template <int N>
+  class AsyncOpInfo {
+   public:
+    std::array<ceph::bufferlist, N> bufferlist;
+    std::array<uint64_t, N> offset;
+    std::array<uint64_t, N> length;
+
+    AsyncOpInfo(const std::array<uint64_t, N>& offset = {},
+                const std::array<uint64_t, N>& length = {});
+    ~AsyncOpInfo() = default;
+  };
+
+  // Must be called with lock held
+  bool readyForIoOp(IoOp& op);
+  void applyIoOp(IoOp& op);
+
+ private:
+  void applyReadWriteOp(IoOp& op);
+  void applyInjectOp(IoOp& op);
+};
+}  // namespace io_exerciser
+}  // namespace ceph

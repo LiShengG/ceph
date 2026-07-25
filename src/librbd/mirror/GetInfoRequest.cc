@@ -1,5 +1,5 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
 
 #include "librbd/mirror/GetInfoRequest.h"
 #include "common/dout.h"
@@ -9,6 +9,8 @@
 #include "librbd/ImageState.h"
 #include "librbd/Journal.h"
 #include "librbd/Utils.h"
+
+#include <shared_mutex> // for std::shared_lock
 
 #define dout_subsys ceph_subsys_rbd
 #undef dout_prefix
@@ -272,8 +274,14 @@ void GetInfoRequest<I>::calc_promotion_state(
         *m_primary_mirror_uuid = mirror_ns->primary_mirror_uuid;
         break;
       case cls::rbd::MIRROR_SNAPSHOT_STATE_PRIMARY_DEMOTED:
-      case cls::rbd::MIRROR_SNAPSHOT_STATE_NON_PRIMARY_DEMOTED:
         *m_promotion_state = PROMOTION_STATE_ORPHAN;
+        break;
+      case cls::rbd::MIRROR_SNAPSHOT_STATE_NON_PRIMARY_DEMOTED:
+        if (mirror_ns->complete) {
+          *m_promotion_state = PROMOTION_STATE_ORPHAN;
+        } else {
+          *m_promotion_state = PROMOTION_STATE_NON_PRIMARY;
+        }
         break;
       }
       break;

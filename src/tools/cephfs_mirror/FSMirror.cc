@@ -1,5 +1,5 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
 
 #include "common/admin_socket.h"
 #include "common/ceph_argparse.h"
@@ -9,6 +9,7 @@
 #include "common/errno.h"
 #include "common/WorkQueue.h"
 #include "common/perf_counters.h"
+#include "common/perf_counters_collection.h"
 #include "common/perf_counters_key.h"
 #include "include/stringify.h"
 #include "msg/Messenger.h"
@@ -389,8 +390,8 @@ void FSMirror::handle_acquire_directory(string_view dir_path) {
   }
 }
 
-void FSMirror::handle_release_directory(string_view dir_path) {
-  dout(5) << ": dir_path=" << dir_path << dendl;
+void FSMirror::handle_release_directory(string_view dir_path, bool purging) {
+  dout(5) << ": dir_path=" << dir_path << ", purging=" << purging << dendl;
 
   {
     std::scoped_lock locker(m_lock);
@@ -401,7 +402,7 @@ void FSMirror::handle_release_directory(string_view dir_path) {
                                                    m_directories.size());
       for (auto &[peer, peer_replayer] : m_peer_replayers) {
         dout(10) << ": peer=" << peer << dendl;
-        peer_replayer->remove_directory(dir_path);
+        peer_replayer->remove_directory(dir_path, purging);
       }
     }
     if (m_perf_counters) {
@@ -420,7 +421,8 @@ void FSMirror::add_peer(const Peer &peer) {
   }
 
   auto replayer = std::make_unique<PeerReplayer>(
-    m_cct, this, m_cluster, m_filesystem, peer, m_directories, m_mount, m_service_daemon);
+    m_cct, this, m_cluster, m_filesystem, peer, m_directories,
+    std::make_shared<librados::IoCtx>(m_ioctx), m_mount, m_service_daemon);
   int r = init_replayer(replayer.get());
   if (r < 0) {
     m_service_daemon->add_or_update_peer_attribute(m_filesystem.fscid, peer,

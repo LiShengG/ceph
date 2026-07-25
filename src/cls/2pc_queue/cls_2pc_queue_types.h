@@ -1,8 +1,16 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
+
 #pragma once
 
+#include "common/ceph_time.h" // for ceph::coarse_real_time
+#include "common/Formatter.h"
+#include "include/encoding.h"
 #include "include/types.h"
+#include "include/rados/cls_traits.hpp"
+#include "cls_2pc_queue_const.h"
+
+#include <unordered_map>
 
 struct cls_2pc_reservation
 {
@@ -40,28 +48,38 @@ struct cls_2pc_reservation
     f->dump_stream("timestamp") << timestamp;
   }
 
-  static void generate_test_instances(std::list<cls_2pc_reservation*>& ls) {
-    ls.push_back(new cls_2pc_reservation);
-    ls.back()->size = 0;
-    ls.push_back(new cls_2pc_reservation);
-    ls.back()->size = 123;
-    ls.back()->timestamp = ceph::coarse_real_clock::zero();
+  static std::list<cls_2pc_reservation> generate_test_instances() {
+    std::list<cls_2pc_reservation> ls;
+    ls.emplace_back();
+    ls.back().size = 0;
+    ls.emplace_back();
+    ls.back().size = 123;
+    ls.back().timestamp = ceph::coarse_real_clock::zero();
+    return ls;
   }
 };
 WRITE_CLASS_ENCODER(cls_2pc_reservation)
 
-using cls_2pc_reservations = ceph::unordered_map<cls_2pc_reservation::id_t, cls_2pc_reservation>;
+using cls_2pc_reservations = std::unordered_map<cls_2pc_reservation::id_t, cls_2pc_reservation>;
 
 struct cls_2pc_urgent_data
 {
-  uint64_t reserved_size{0};   // pending reservations size in bytes
-  cls_2pc_reservation::id_t last_id{cls_2pc_reservation::NO_ID}; // last allocated id
-  cls_2pc_reservations reservations; // reservation list (keyed by id)
+  uint64_t reserved_size{0};
+  // pending reservations size in bytes
+  // For version >= 3: this counter is accurate and can be used directly
+  // For version < 3: ignore this value and compute from reservations (fixes
+  // historical drift)
+  cls_2pc_reservation::id_t last_id{cls_2pc_reservation::NO_ID};
+  // last allocated id
+  cls_2pc_reservations reservations;  // reservation list (keyed by id)
   bool has_xattrs{false};
   uint32_t committed_entries{0}; // how many entries have been committed so far
+  // Transient field (not persisted) - stores the version from which this was
+  // decoded
+  uint8_t decoded_struct_v{3};
 
   void encode(ceph::buffer::list& bl) const {
-    ENCODE_START(2, 1, bl);
+    ENCODE_START(3, 1, bl);
     encode(reserved_size, bl);
     encode(last_id, bl);
     encode(reservations, bl);
@@ -71,7 +89,7 @@ struct cls_2pc_urgent_data
   }
 
   void decode(ceph::buffer::list::const_iterator& bl) {
-    DECODE_START(2, bl);
+    DECODE_START(3, bl);
     decode(reserved_size, bl);
     decode(last_id, bl);
     decode(reservations, bl);
@@ -79,6 +97,7 @@ struct cls_2pc_urgent_data
     if (struct_v >= 2) {
       decode(committed_entries, bl);
     }
+    decoded_struct_v = struct_v;
     DECODE_FINISH(bl);
   }
 
@@ -96,13 +115,34 @@ struct cls_2pc_urgent_data
     f->dump_bool("has_xattrs", has_xattrs);
   }
 
-  static void generate_test_instances(std::list<cls_2pc_urgent_data*>& ls) {
-    ls.push_back(new cls_2pc_urgent_data);
-    ls.push_back(new cls_2pc_urgent_data);
-    ls.back()->reserved_size = 123;
-    ls.back()->last_id = 456;
-    ls.back()->reservations.emplace(789, cls_2pc_reservation(1, ceph::coarse_real_clock::zero(), 2));
-    ls.back()->has_xattrs = true;
+  static std::list<cls_2pc_urgent_data> generate_test_instances() {
+    std::list<cls_2pc_urgent_data> ls;
+    ls.emplace_back();
+    ls.emplace_back();
+    ls.back().reserved_size = 123;
+    ls.back().last_id = 456;
+    ls.back().reservations.emplace(789, cls_2pc_reservation(1, ceph::coarse_real_clock::zero(), 2));
+    ls.back().has_xattrs = true;
+    return ls;
   }
 };
 WRITE_CLASS_ENCODER(cls_2pc_urgent_data)
+
+namespace cls::tpc_queue {
+struct ClassId {
+  static constexpr auto name = "2pc_queue";
+};
+namespace method {
+constexpr auto init = ClsMethod<RdWrTag, ClassId>(TPC_QUEUE_INIT);
+constexpr auto get_capacity = ClsMethod<RdTag, ClassId>(TPC_QUEUE_GET_CAPACITY);
+constexpr auto get_topic_stats = ClsMethod<RdTag, ClassId>(TPC_QUEUE_GET_TOPIC_STATS);
+constexpr auto reserve = ClsMethod<RdWrTag, ClassId>(TPC_QUEUE_RESERVE);
+constexpr auto commit = ClsMethod<RdWrTag, ClassId>(TPC_QUEUE_COMMIT);
+constexpr auto abort = ClsMethod<RdWrTag, ClassId>(TPC_QUEUE_ABORT);
+constexpr auto list_reservations = ClsMethod<RdTag, ClassId>(TPC_QUEUE_LIST_RESERVATIONS);
+constexpr auto list_entries = ClsMethod<RdTag, ClassId>(TPC_QUEUE_LIST_ENTRIES);
+constexpr auto remove_entries = ClsMethod<RdWrTag, ClassId>(TPC_QUEUE_REMOVE_ENTRIES);
+constexpr auto expire_reservations = ClsMethod<RdWrTag, ClassId>(TPC_QUEUE_EXPIRE_RESERVATIONS);
+}
+}
+

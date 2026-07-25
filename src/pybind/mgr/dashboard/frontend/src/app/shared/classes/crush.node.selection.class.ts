@@ -3,8 +3,10 @@ import { AbstractControl } from '@angular/forms';
 import _ from 'lodash';
 
 import { CrushNode } from '../models/crush-node';
+import { CrushFailureDomains } from '../models/erasure-code-profile';
+import { CdForm } from '../forms/cd-form';
 
-export class CrushNodeSelectionClass {
+export class CrushNodeSelectionClass extends CdForm {
   private nodes: CrushNode[] = [];
   private idTree: { [id: number]: CrushNode } = {};
   private allDevices: string[] = [];
@@ -138,7 +140,13 @@ export class CrushNodeSelectionClass {
       this.idTree[node.id] = node;
     });
     this.buckets = _.sortBy(
-      nodes.filter((n) => n.children),
+      nodes
+        .filter((n: CrushNode) => n.children)
+        .map((bucket: CrushNode) => ({
+          ...bucket,
+          content: bucket.name,
+          selected: bucket.type === 'root'
+        })),
       'name'
     );
     this.controls = {
@@ -187,7 +195,7 @@ export class CrushNodeSelectionClass {
   }
 
   private getIncludedCustomValue(control: AbstractControl, includedIn: string[]) {
-    return control.dirty && includedIn.includes(control.value) ? control.value : '';
+    return includedIn.includes(control.value) ? control.value : '';
   }
 
   private setMostCommonDomain(failureControl: AbstractControl): string {
@@ -207,19 +215,26 @@ export class CrushNodeSelectionClass {
   }
 
   private updateDevices(failureDomain: string = this.controls.failure.value) {
-    const subNodes = _.flatten(
-      this.failureDomains[failureDomain].map((node) =>
-        CrushNodeSelectionClass.getSubNodes(node, this.idTree)
-      )
-    );
-    this.allDevices = subNodes.filter((n) => n.device_class).map((n) => n.device_class);
-    this.devices = _.uniq(this.allDevices).sort();
-    const device =
-      this.devices.length === 1
-        ? this.devices[0]
-        : this.getIncludedCustomValue(this.controls.device, this.devices);
-    if (this.autoDeviceUpdate) this.silentSet(this.controls.device, device);
-    this.onDeviceChange(device);
+    if (failureDomain === CrushFailureDomains.Host) {
+      this.allDevices = this.failureDomains[failureDomain]
+        .filter((fD) => fD.type)
+        .map((fD) => fD.type);
+      this.onDeviceChange('');
+    } else {
+      const subNodes = _.flatten(
+        this.failureDomains[failureDomain].map((node) =>
+          CrushNodeSelectionClass.getSubNodes(node, this.idTree)
+        )
+      );
+      this.allDevices = subNodes.filter((n) => n.device_class).map((n) => n.device_class);
+      this.devices = _.uniq(this.allDevices).sort();
+      const device =
+        this.devices.length === 1
+          ? this.devices[0]
+          : this.getIncludedCustomValue(this.controls.device, this.devices);
+      if (this.autoDeviceUpdate) this.silentSet(this.controls.device, device);
+      this.onDeviceChange(device);
+    }
   }
 
   private onDeviceChange(deviceType: string = this.controls.device.value) {

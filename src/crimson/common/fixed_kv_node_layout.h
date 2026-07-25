@@ -1,5 +1,5 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
 
 #pragma once
 
@@ -296,7 +296,6 @@ public:
     void copy_out(char *out, size_t len) {
       assert(len == get_bytes());
       ::memcpy(out, reinterpret_cast<const void *>(buffer.data()), get_bytes());
-      buffer.clear();
     }
     void copy_in(const char *out, size_t len) {
       assert(empty());
@@ -307,6 +306,15 @@ public:
     }
     bool operator==(const delta_buffer_t &rhs) const {
       return buffer == rhs.buffer;
+    }
+    void clear() {
+      buffer.clear();
+    }
+    template <typename Func>
+    void for_each(Func &&f) {
+      for (auto &i : buffer) {
+        std::invoke(std::forward<Func>(f), i);
+      }
     }
   };
 
@@ -365,7 +373,6 @@ public:
   virtual ~FixedKVNodeLayout() = default;
 
   void set_layout_buf(char *_buf) {
-    assert(buf == nullptr);
     assert(_buf != nullptr);
     buf = _buf;
   }
@@ -558,26 +565,35 @@ public:
     set_meta(Meta::merge_from(left.get_meta(), right.get_meta()));
   }
 
+  static uint32_t get_balance_pivot_idx(
+    const FixedKVNodeLayout &left,
+    const FixedKVNodeLayout &right)
+  {
+    auto l_size = left.get_size();
+    auto r_size = right.get_size();
+    auto total = l_size + r_size;
+    auto pivot_idx = total / 2;
+    assert(pivot_idx > std::min(l_size, r_size)
+      && pivot_idx < std::max(l_size, r_size));
+    return pivot_idx;
+  }
+
   /**
    * balance_into_new_nodes
    *
    * Takes the contents of left and right and copies them into
-   * replacement_left and replacement_right such that in the
-   * event that the number of elements is odd the extra goes to
-   * the left side iff prefer_left.
+   * replacement_left and replacement_right such that the size
+   * of both are balanced.
    */
   static K balance_into_new_nodes(
     const FixedKVNodeLayout &left,
     const FixedKVNodeLayout &right,
-    bool prefer_left,
+    uint32_t pivot_idx,
     FixedKVNodeLayout &replacement_left,
     FixedKVNodeLayout &replacement_right)
   {
+    assert(pivot_idx != left.get_size() && pivot_idx != right.get_size());
     auto total = left.get_size() + right.get_size();
-    auto pivot_idx = (left.get_size() + right.get_size()) / 2;
-    if (total % 2 && prefer_left) {
-      pivot_idx++;
-    }
     auto replacement_pivot = pivot_idx >= left.get_size() ?
       right.iter_idx(pivot_idx - left.get_size())->get_key() :
       left.iter_idx(pivot_idx)->get_key();

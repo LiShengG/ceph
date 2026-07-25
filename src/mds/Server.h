@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*- 
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*- 
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph - scalable distributed file system
  *
@@ -15,35 +16,73 @@
 #ifndef CEPH_MDS_SERVER_H
 #define CEPH_MDS_SERVER_H
 
+#include "Mutation.h"
+#include "mds/mdstypes.h" // for xattr_map
+
+#include <common/DecayCounter.h>
+#include "common/ref.h" // for cref_t
+
+#include "include/common_fwd.h"
+#include "include/Context.h" // for C_GatherBase
+#include "include/mempool.h"
+
+#include "messages/MClientReclaimReply.h"
+
+#ifdef WITH_CRIMSON
+#include "crimson/common/perf_counters_collection.h"
+#else
+#include "common/perf_counters_collection.h"
+#endif
+
+#include "LogSegmentRef.h"
+
+#include <boost/intrusive_ptr.hpp>
+
+#include <map>
+#include <memory>
+#include <set>
 #include <string_view>
+#include <vector>
 
 using namespace std::literals::string_view_literals;
 
-#include <common/DecayCounter.h>
-
-#include "include/common_fwd.h"
-
-#include "messages/MClientReconnect.h"
-#include "messages/MClientReply.h"
-#include "messages/MClientRequest.h"
-#include "messages/MClientSession.h"
-#include "messages/MClientSnap.h"
-#include "messages/MClientReclaim.h"
-#include "messages/MClientReclaimReply.h"
-#include "messages/MLock.h"
-
-#include "CInode.h"
-#include "MDSRank.h"
-#include "Mutation.h"
-#include "MDSContext.h"
-
+class CDentry;
+class CDir;
+class CInode;
 class OSDMap;
 class LogEvent;
 class EMetaBlob;
 class EUpdate;
+class LogSegment;
+class MDCache;
 class MDLog;
+class MDSContext;
+class C_MDSInternalNoop;
+using MDSGather = C_GatherBase<MDSContext, C_MDSInternalNoop>;
+using MDSGatherBuilder = C_GatherBuilderBase<MDSContext, MDSGather>;
+class MDSLogContextBase;
+class MDSRank;
+class Session;
 struct SnapInfo;
+struct SnapRealm;
+class Message;
 class MetricsHandler;
+class MClientReconnect;
+class MClientReply;
+class MClientRequest;
+class MClientSession;
+class MClientSnap;
+class MClientReclaim;
+class MLock;
+class MMDSPeerRequest;
+class filepath;
+
+template<template<typename> class Allocator> struct inode_t;
+using mempool_inode = inode_t<mempool::mds_co::pool_allocator>;
+using inode_const_ptr = std::shared_ptr<const mempool_inode>;
+using mempool_xattr_map = xattr_map<mempool::mds_co::pool_allocator>; // FIXME bufferptr not in mempool
+using xattr_map_ptr = std::shared_ptr<mempool_xattr_map>;
+using xattr_map_const_ptr = std::shared_ptr<const mempool_xattr_map>;
 
 enum {
   l_mdss_first = 1000,
@@ -73,6 +112,7 @@ enum {
   l_mdss_req_snapdiff_latency,
   l_mdss_req_rmdir_latency,
   l_mdss_req_rmsnap_latency,
+  l_mdss_req_snap_md_op_latency,
   l_mdss_req_rmxattr_latency,
   l_mdss_req_setattr_latency,
   l_mdss_req_setdirlayout_latency,
@@ -82,10 +122,16 @@ enum {
   l_mdss_req_symlink_latency,
   l_mdss_req_unlink_latency,
   l_mdss_cap_revoke_eviction,
+  l_mdss_cache_trim_throttle,
+  l_mdss_session_recall_throttle,
+  l_mdss_session_recall_throttle2o,
+  l_mdss_global_recall_throttle,
   l_mdss_cap_acquisition_throttle,
   l_mdss_req_getvxattr_latency,
+  l_mdss_req_file_blockdiff_latency,
   l_mdss_last,
 };
+
 
 class Server {
 public:
@@ -101,11 +147,7 @@ public:
   };
 
   explicit Server(MDSRank *m, MetricsHandler *metrics_handler);
-  ~Server() {
-    g_ceph_context->get_perfcounters_collection()->remove(logger);
-    delete logger;
-    delete reconnect_done;
-  }
+  ~Server();
 
   void create_logger();
 
@@ -125,7 +167,7 @@ public:
   void handle_client_session(const cref_t<MClientSession> &m);
   void _session_logged(Session *session, uint64_t state_seq, bool open, version_t pv,
 		       const interval_set<inodeno_t>& inos_to_free, version_t piv,
-		       const interval_set<inodeno_t>& inos_to_purge, LogSegment *ls);
+		       const interval_set<inodeno_t>& inos_to_purge, LogSegmentRef const& ls);
   version_t prepare_force_open_sessions(std::map<client_t,entity_inst_t> &cm,
 					std::map<client_t,client_metadata_t>& cmm,
 					std::map<client_t,std::pair<Session*,uint64_t> >& smap);
@@ -197,6 +239,8 @@ public:
   void _try_open_ino(const MDRequestRef& mdr, int r, inodeno_t ino);
   CInode* rdlock_path_pin_ref(const MDRequestRef& mdr, bool want_auth,
 			      bool no_want_auth=false);
+  CInode* rdlock_path_pin_ref(const MDRequestRef& mdr, const filepath& refpath, bool want_auth,
+			      bool no_want_auth=false);
   CDentry* rdlock_path_xlock_dentry(const MDRequestRef& mdr, bool create,
 				    bool okexist=false, bool authexist=false,
 				    bool want_layout=false);
@@ -216,7 +260,8 @@ public:
   void handle_client_file_readlock(const MDRequestRef& mdr);
 
   bool xlock_policylock(const MDRequestRef& mdr, CInode *in,
-			bool want_layout=false, bool xlock_snaplock=false);
+			bool want_layout=false, bool xlock_snaplock=false,
+                        MutationImpl::LockOpVec lov={});
   CInode* try_get_auth_inode(const MDRequestRef& mdr, inodeno_t ino);
   void handle_client_setattr(const MDRequestRef& mdr);
   void handle_client_setlayout(const MDRequestRef& mdr);
@@ -243,6 +288,8 @@ public:
   
   // check layout
   bool is_valid_layout(file_layout_t *layout);
+
+  bool can_handle_charmap(const MDRequestRef& mdr, CDentry* dn);
 
   // open
   void handle_client_open(const MDRequestRef& mdr);
@@ -277,6 +324,7 @@ public:
   void handle_client_unlink(const MDRequestRef& mdr);
   bool _dir_is_nonempty_unlocked(const MDRequestRef& mdr, CInode *rmdiri);
   bool _dir_is_nonempty(const MDRequestRef& mdr, CInode *rmdiri);
+  bool _dir_has_snaps(const MDRequestRef& mdr, CInode *diri);
   void _unlink_local(const MDRequestRef& mdr, CDentry *dn, CDentry *straydn);
   void _unlink_local_finish(const MDRequestRef& mdr,
 			    CDentry *dn, CDentry *straydn,
@@ -300,8 +348,12 @@ public:
   void handle_client_rmsnap(const MDRequestRef& mdr);
   void _rmsnap_finish(const MDRequestRef& mdr, CInode *diri, snapid_t snapid);
   void handle_client_renamesnap(const MDRequestRef& mdr);
-  void _renamesnap_finish(const MDRequestRef& mdr, CInode *diri, snapid_t snapid);
+  void handle_client_snap_md_op(const MDRequestRef& mdr);
+  void _snap_mutate_generic_finish(const MDRequestRef& mdr, CInode *diri, snapid_t snapid);
   void handle_client_readdir_snapdiff(const MDRequestRef& mdr);
+  void handle_client_file_blockdiff(const MDRequestRef& mdr);
+  void handle_file_blockdiff_finish(const MDRequestRef& mdr, CInode *in, const BlockDiff &block_diff,
+				    int r);
 
   // helpers
   bool _rename_prepare_witness(const MDRequestRef& mdr, mds_rank_t who, std::set<mds_rank_t> &witnesse,
@@ -398,15 +450,15 @@ private:
     // reject xattr request (set or remove), zero to proceed. handlers
     // may parse xattr value for verification if needed and have an
     // option to store custom data in XattrOp::xinfo.
-    int (Server::*validate)(CInode *cur, const InodeStoreBase::xattr_map_const_ptr xattrs,
+    int (Server::*validate)(CInode *cur, const xattr_map_const_ptr xattrs,
                             XattrOp *xattr_op);
 
     // set xattr for an inode in xattr_map
-    void (Server::*setxattr)(CInode *cur, InodeStoreBase::xattr_map_ptr xattrs,
+    void (Server::*setxattr)(CInode *cur, xattr_map_ptr xattrs,
                              const XattrOp &xattr_op);
 
     // remove xattr for an inode from xattr_map
-    void (Server::*removexattr)(CInode *cur, InodeStoreBase::xattr_map_ptr xattrs,
+    void (Server::*removexattr)(CInode *cur, xattr_map_ptr xattrs,
                                 const XattrOp &xattr_op);
   };
 
@@ -416,28 +468,28 @@ private:
   const XattrHandler* get_xattr_or_default_handler(std::string_view xattr_name);
 
   // generic variant to set/remove xattr in/from xattr_map
-  int xattr_validate(CInode *cur, const InodeStoreBase::xattr_map_const_ptr xattrs,
+  int xattr_validate(CInode *cur, const xattr_map_const_ptr xattrs,
                      const std::string &xattr_name, int op, int flags);
-  void xattr_set(InodeStoreBase::xattr_map_ptr xattrs, const std::string &xattr_name,
+  void xattr_set(xattr_map_ptr xattrs, const std::string &xattr_name,
                  const bufferlist &xattr_value);
-  void xattr_rm(InodeStoreBase::xattr_map_ptr xattrs, const std::string &xattr_name);
+  void xattr_rm(xattr_map_ptr xattrs, const std::string &xattr_name);
 
   // default xattr handlers
-  int default_xattr_validate(CInode *cur, const InodeStoreBase::xattr_map_const_ptr xattrs,
+  int default_xattr_validate(CInode *cur, const xattr_map_const_ptr xattrs,
                              XattrOp *xattr_op);
-  void default_setxattr_handler(CInode *cur, InodeStoreBase::xattr_map_ptr xattrs,
+  void default_setxattr_handler(CInode *cur, xattr_map_ptr xattrs,
                                 const XattrOp &xattr_op);
-  void default_removexattr_handler(CInode *cur, InodeStoreBase::xattr_map_ptr xattrs,
+  void default_removexattr_handler(CInode *cur, xattr_map_ptr xattrs,
                                    const XattrOp &xattr_op);
 
   // mirror info xattr handler
   int parse_mirror_info_xattr(const std::string &name, const std::string &value,
                               std::string &cluster_id, std::string &fs_id);
-  int mirror_info_xattr_validate(CInode *cur, const InodeStoreBase::xattr_map_const_ptr xattrs,
+  int mirror_info_xattr_validate(CInode *cur, const xattr_map_const_ptr xattrs,
                                  XattrOp *xattr_op);
-  void mirror_info_setxattr_handler(CInode *cur, InodeStoreBase::xattr_map_ptr xattrs,
+  void mirror_info_setxattr_handler(CInode *cur, xattr_map_ptr xattrs,
                                     const XattrOp &xattr_op);
-  void mirror_info_removexattr_handler(CInode *cur, InodeStoreBase::xattr_map_ptr xattrs,
+  void mirror_info_removexattr_handler(CInode *cur, xattr_map_ptr xattrs,
                                        const XattrOp &xattr_op);
 
   static bool is_ceph_vxattr(std::string_view xattr_name) {
@@ -448,22 +500,33 @@ private:
            xattr_name == "ceph.dir.subvolume" ||
            xattr_name == "ceph.dir.pin" ||
            xattr_name == "ceph.dir.pin.random" ||
-           xattr_name == "ceph.dir.pin.distributed";
+           xattr_name == "ceph.dir.pin.distributed" ||
+           xattr_name == "ceph.dir.charmap"sv ||
+           xattr_name == "ceph.dir.normalization"sv ||
+           xattr_name == "ceph.dir.encoding"sv ||
+           xattr_name == "ceph.dir.casesensitive"sv ||
+           xattr_name == "ceph.dir.subvolume.snaps.visible"sv;
   }
 
   static bool is_ceph_dir_vxattr(std::string_view xattr_name) {
-    return (xattr_name == "ceph.dir.layout" ||
-	    xattr_name == "ceph.dir.layout.json" ||
-	    xattr_name == "ceph.dir.layout.object_size" ||
-	    xattr_name == "ceph.dir.layout.stripe_unit" ||
-	    xattr_name == "ceph.dir.layout.stripe_count" ||
-	    xattr_name == "ceph.dir.layout.pool" ||
-	    xattr_name == "ceph.dir.layout.pool_name" ||
-	    xattr_name == "ceph.dir.layout.pool_id" ||
-	    xattr_name == "ceph.dir.layout.pool_namespace" ||
-	    xattr_name == "ceph.dir.pin" ||
-	    xattr_name == "ceph.dir.pin.random" ||
-	    xattr_name == "ceph.dir.pin.distributed");
+    return xattr_name == "ceph.dir.layout" ||
+	   xattr_name == "ceph.dir.layout.json" ||
+	   xattr_name == "ceph.dir.layout.object_size" ||
+	   xattr_name == "ceph.dir.layout.stripe_unit" ||
+	   xattr_name == "ceph.dir.layout.stripe_count" ||
+	   xattr_name == "ceph.dir.layout.pool" ||
+	   xattr_name == "ceph.dir.layout.pool_name" ||
+	   xattr_name == "ceph.dir.layout.pool_id" ||
+	   xattr_name == "ceph.dir.layout.pool_namespace" ||
+	   xattr_name == "ceph.dir.pin" ||
+	   xattr_name == "ceph.dir.pin.random" ||
+	   xattr_name == "ceph.dir.pin.distributed" ||
+	   xattr_name == "ceph.dir.charmap"sv ||
+	   xattr_name == "ceph.dir.normalization"sv ||
+	   xattr_name == "ceph.dir.encoding"sv ||
+	   xattr_name == "ceph.dir.casesensitive"sv ||
+	   xattr_name == "ceph.dir.subvolume"sv ||
+     xattr_name == "ceph.dir.subvolume.snaps.visible"sv;
   }
 
   static bool is_ceph_file_vxattr(std::string_view xattr_name) {
@@ -527,7 +590,7 @@ private:
   MDLog *mdlog;
   PerfCounters *logger = nullptr;
 
-  // OSDMap full status, used to generate CEPHFS_ENOSPC on some operations
+  // OSDMap full status, used to generate ENOSPC on some operations
   bool is_full = false;
 
   // State for while in reconnect
@@ -544,6 +607,7 @@ private:
   feature_bitset_t supported_metric_spec;
   feature_bitset_t required_client_features;
 
+  bool mds_allow_async_dirops = true;
   bool forward_all_requests_to_auth = false;
   bool replay_unsafe_with_closed_session = false;
   double cap_revoke_eviction_timeout = 0;
@@ -553,6 +617,7 @@ private:
   unsigned delegate_inos_pct = 0;
   uint64_t dir_max_entries = 0;
   int64_t bal_fragment_size_max = 0;
+  bool allow_batched_ops = true;
 
   double inject_rename_corrupt_dentry_first = 0.0;
 

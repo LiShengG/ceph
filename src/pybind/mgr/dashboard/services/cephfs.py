@@ -9,13 +9,16 @@ import cephfs
 
 from .. import mgr
 
-logger = logging.getLogger('cephfs')
+logger = logging.getLogger(__name__)
 
 
 class CephFS(object):
     @classmethod
-    def list_filesystems(cls):
+    def list_filesystems(cls, all_info=False):
         fsmap = mgr.get("fs_map")
+
+        if all_info:
+            return fsmap['filesystems']
         return [{'id': fs['id'], 'name': fs['mdsmap']['fs_name']}
                 for fs in fsmap['filesystems']]
 

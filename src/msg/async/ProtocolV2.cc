@@ -1,5 +1,5 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
 
 #include <type_traits>
 
@@ -12,6 +12,7 @@
 #include "include/random.h"
 #include "auth/AuthClient.h"
 #include "auth/AuthServer.h"
+#include "auth/AuthSessionHandler.h" // for struct DecryptionError
 
 #define dout_subsys ceph_subsys_ms
 #undef dout_prefix
@@ -23,7 +24,11 @@ std::ostream &ProtocolV2::_conn_prefix(std::ostream *_dout) {
 		<< " " << ceph_con_mode_name(auth_meta->con_mode)
 		<< " :" << connection->port
                 << " s=" << get_state_name(state) << " pgs=" << peer_global_seq
-                << " cs=" << connect_seq << " l=" << connection->policy.lossy
+                << " gs=" << global_seq << " cs=" << connect_seq
+                << " l=" << connection->policy.lossy
+                << " c_cookie=" << client_cookie
+                << " s_cookie=" << server_cookie
+                << " reconnecting=" << reconnecting
                 << " rev1=" << HAVE_MSGR2_FEATURE(peer_supported_features,
                                                   REVISION_1)
                 << " crypto rx=" << session_stream_handlers.rx.get()
@@ -251,11 +256,11 @@ void ProtocolV2::reset_recv_state() {
     // `write_event()` unlocks it just before calling `write_message()`.
     // `submit_to()` here is NOT blocking.
     connection->center->submit_to(connection->center->get_id(), [this] {
-      ldout(cct, 5) << "reset_recv_state (warped) reseting crypto and compression handlers"
-                    << dendl;
       // Possibly unnecessary. See the comment in `deactivate_existing`.
       std::lock_guard<std::mutex> l(connection->lock);
       std::lock_guard<std::mutex> wl(connection->write_lock);
+      ldout(cct, 5) << "reset_recv_state (warped) reseting crypto and compression handlers"
+                    << dendl;
       reset_security();
       reset_compression();
     }, /* always_async = */true);
@@ -460,7 +465,7 @@ void ProtocolV2::send_message(Message *m) {
     m->trace.event("async enqueueing message");
     out_queue[m->get_priority()].emplace_back(
       out_queue_entry_t{is_prepared, m});
-    ldout(cct, 15) << __func__ << " inline write is denied, reschedule m=" << m
+    ldout(cct, 15) << __func__ << " message queued for async transmission m=" << m
                    << dendl;
     if (((!replacing && can_write) || state == STANDBY) && !write_in_progress) {
       write_in_progress = true;
@@ -764,6 +769,40 @@ void ProtocolV2::write_event() {
 
 bool ProtocolV2::is_queued() {
   return !out_queue.empty() || connection->is_queued();
+}
+
+void ProtocolV2::dump(Formatter *f) {
+  f->open_object_section("v2");
+  f->dump_string("state", get_state_name(state));
+  if (auth_meta) {
+    f->dump_string("con_mode", ceph_con_mode_name(auth_meta->con_mode));
+  }
+  f->dump_bool("rev1", HAVE_MSGR2_FEATURE(peer_supported_features, REVISION_1));
+  f->dump_unsigned("connect_seq", connect_seq);
+  f->dump_unsigned("peer_global_seq", peer_global_seq);
+
+  f->open_object_section("crypto");
+  f->dump_string(
+      "rx", session_stream_handlers.rx
+                ? session_stream_handlers.rx->cipher_name()
+                : "PLAIN");
+  f->dump_string(
+      "tx", session_stream_handlers.tx
+                ? session_stream_handlers.tx->cipher_name()
+                : "PLAIN");
+  f->close_section();  // crypto
+
+  f->open_object_section("compression");
+  f->dump_string(
+      "rx", session_compression_handlers.rx
+                ? session_compression_handlers.rx->compressor_name()
+                : "UNCOMPRESSED");
+  f->dump_string(
+      "tx", session_compression_handlers.tx
+                ? session_compression_handlers.tx->compressor_name()
+                : "UNCOMPRESSED");
+  f->close_section();  // compression
+  f->close_section();  // v2
 }
 
 CtPtr ProtocolV2::read(CONTINUATION_RXBPTR_TYPE<ProtocolV2> &next,
@@ -1860,6 +1899,7 @@ CtPtr ProtocolV2::handle_auth_done(ceph::bufferlist &payload)
 }
 
 CtPtr ProtocolV2::finish_client_auth() {
+  ldout(cct, 20) << __func__ << dendl;
   if (HAVE_MSGR2_FEATURE(peer_supported_features, COMPRESSION)) {
     return send_compression_request();
   }
@@ -1868,6 +1908,7 @@ CtPtr ProtocolV2::finish_client_auth() {
 }
 
 CtPtr ProtocolV2::finish_server_auth() {
+  ldout(cct, 20) << __func__ << dendl;
   // server had sent AuthDone and client responded with correct pre-auth
   // signature. 
   // We can start conditioanl msgr protocol
@@ -1884,10 +1925,12 @@ CtPtr ProtocolV2::finish_server_auth() {
 
 CtPtr ProtocolV2::start_session_connect() {
   if (!server_cookie) {
+    ldout(cct, 20) << __func__ << " starting a new session" << dendl;
     ceph_assert(connect_seq == 0);
     state = SESSION_CONNECTING;
     return send_client_ident();
   } else {  // reconnecting to previous session
+    ldout(cct, 20) << __func__ << " reconnecting to session" << dendl;
     state = SESSION_RECONNECTING;
     ceph_assert(connect_seq > 0);
     return send_reconnect();
@@ -2226,7 +2269,9 @@ CtPtr ProtocolV2::_auth_bad_method(int r)
   std::vector<uint32_t> allowed_methods;
   std::vector<uint32_t> allowed_modes;
   messenger->auth_server->get_supported_auth_methods(
-    connection->get_peer_type(), &allowed_methods, &allowed_modes);
+    connection->get_peer_type(), &allowed_methods);
+  messenger->auth_server->get_supported_con_modes(
+    connection->get_peer_type(), auth_meta->auth_method, &allowed_modes);
   ldout(cct, 1) << __func__ << " auth_method " << auth_meta->auth_method
 		<< " r " << cpp_strerror(r)
 		<< ", allowed_methods " << allowed_methods
@@ -2636,11 +2681,40 @@ CtPtr ProtocolV2::handle_existing_connection(const AsyncConnectionRef& existing)
     auto wait = WaitFrame::Encode();
     return WRITE(wait, "wait", read_frame);
   }
+  // Detect a peer (client) restart and prefer the new connection.
+  // Rationale:
+  // - The client cookie is regenerated in send_client_ident() on client startup.
+  // - If the existing connection (exproto) has a strictly higher peer_global_seq
+  //   than the incoming one, the peer’s sequence appears to have reset on the new
+  //   connection (exproto->peer_global_seq > peer_global_seq).
+  // - Both sides present non-zero cookies and they differ, which strongly indicates
+  //   a new client instance (exproto->client_cookie != client_cookie).
+  // - We only do this when the existing connection is not in a benign terminal/idle
+  //   state (READY or STANDBY); otherwise we might drop a healthy/idle connection.
+  // Action:
+  // Drop the existing connection in favor of the incoming one, then continue the
+  // handshake on the new connection.
+  if (exproto->peer_global_seq > peer_global_seq &&
+    exproto->client_cookie && client_cookie &&
+    exproto->client_cookie != client_cookie &&
+    exproto->state != READY && exproto->state != STANDBY) {
+    ldout(cct, 1) << __func__ << " client has clearly restarted (ex_peer_global_seq="
+                  << exproto->peer_global_seq << " > peer_global_seq=" << peer_global_seq
+                  << " && cookie changed: client_cookie=" << client_cookie << " != ex_client_cookie="
+                  << exproto->client_cookie << "), "
+                  << "existing connection state is " << get_state_name(exproto->state)
+                  << " (not READY or STANDBY), dropping existing_connection=" << existing
+                  << " in favor of new_connection=" << connection << dendl;
+    existing->protocol->stop();
+    existing->dispatch_queue->queue_reset(existing.get());
+    l.unlock();
+    return send_server_ident();
+  }
 
   if (exproto->peer_global_seq > peer_global_seq) {
-    ldout(cct, 1) << __func__ << " this is a stale connection, peer_global_seq="
-                  << peer_global_seq
-                  << " existing->peer_global_seq=" << exproto->peer_global_seq
+    ldout(cct, 1) << __func__ << " this is a stale connection, ex_peer_global_seq="
+                  << exproto->peer_global_seq
+                  << " > peer_global_seq=" << peer_global_seq
                   << ", stopping this connection." << dendl;
     stop();
     connection->dispatch_queue->queue_reset(connection);
@@ -2665,7 +2739,9 @@ CtPtr ProtocolV2::handle_existing_connection(const AsyncConnectionRef& existing)
     // peer has reseted and we're going to reuse the existing connection
     // by replacing the communication socket
     ldout(cct, 1) << __func__ << " found previous session existing=" << existing
-                  << ", peer must have reseted." << dendl;
+                  << ", ex_client_cookie=" << exproto->client_cookie
+                  << "!= client_cookie=" << client_cookie
+                  << ", peer must have reseted!" << dendl;
     if (connection->policy.resetcheck) {
       exproto->reset_session();
     }
@@ -2882,11 +2958,11 @@ CtPtr ProtocolV2::send_server_ident() {
     flags = flags | CEPH_MSG_CONNECT_LOSSY;
   }
 
-  uint64_t gs = messenger->get_global_seq();
+  global_seq = messenger->get_global_seq();
   auto server_ident = ServerIdentFrame::Encode(
           messenger->get_myaddrs(),
           messenger->get_myname().num(),
-          gs,
+          global_seq,
           connection->policy.features_supported,
           connection->policy.features_required | msgr2_required,
           flags,
@@ -2895,7 +2971,7 @@ CtPtr ProtocolV2::send_server_ident() {
   ldout(cct, 5) << __func__ << " sending identification:"
                 << " addrs=" << messenger->get_myaddrs()
                 << " gid=" << messenger->get_myname().num()
-                << " global_seq=" << gs << " features_supported=" << std::hex
+                << " global_seq=" << global_seq << " features_supported=" << std::hex
                 << connection->policy.features_supported
                 << " features_required="
 		            << (connection->policy.features_required | msgr2_required)

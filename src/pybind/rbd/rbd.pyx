@@ -1,4 +1,14 @@
+# cython: language_level=3
+# cython: legacy_implicit_noexcept=True
 # cython: embedsignature=True
+
+# legacy_implicit_noexcept is needed for building with Cython 0.x and
+# Cython 3 from the same file, preserving the same behavior.
+# When Cython 0.x builds go away, replace this compiler directive with
+# noexcept on rbd_callback_t and librbd_progress_fn_t (or consider doing
+# something similar to except? -9000 on rbd_diff_iterate2() callback for
+# progress callbacks to propagate exceptions).
+
 """
 This module is a thin wrapper around librbd.
 
@@ -34,11 +44,12 @@ import errno
 from itertools import chain
 import time
 
-IF BUILD_DOC:
-    include "mock_rbd.pxi"
-ELSE:
-    from c_rbd cimport *
-    cimport rados
+{{if BUILD_DOC}}
+include "mock_rbd.pxi"
+{{else}}
+from c_rbd cimport *
+cimport rados
+{{endif}}
 
 
 cdef extern from "Python.h":
@@ -86,6 +97,7 @@ RBD_FLAG_FAST_DIFF_INVALID = _RBD_FLAG_FAST_DIFF_INVALID
 RBD_MIRROR_MODE_DISABLED = _RBD_MIRROR_MODE_DISABLED
 RBD_MIRROR_MODE_IMAGE = _RBD_MIRROR_MODE_IMAGE
 RBD_MIRROR_MODE_POOL = _RBD_MIRROR_MODE_POOL
+RBD_MIRROR_MODE_INIT_ONLY = _RBD_MIRROR_MODE_INIT_ONLY
 
 RBD_MIRROR_PEER_DIRECTION_RX = _RBD_MIRROR_PEER_DIRECTION_RX
 RBD_MIRROR_PEER_DIRECTION_TX = _RBD_MIRROR_PEER_DIRECTION_TX
@@ -97,6 +109,7 @@ RBD_MIRROR_IMAGE_MODE_SNAPSHOT = _RBD_MIRROR_IMAGE_MODE_SNAPSHOT
 RBD_MIRROR_IMAGE_DISABLING = _RBD_MIRROR_IMAGE_DISABLING
 RBD_MIRROR_IMAGE_ENABLED = _RBD_MIRROR_IMAGE_ENABLED
 RBD_MIRROR_IMAGE_DISABLED = _RBD_MIRROR_IMAGE_DISABLED
+RBD_MIRROR_IMAGE_CREATING = _RBD_MIRROR_IMAGE_CREATING
 
 MIRROR_IMAGE_STATUS_STATE_UNKNOWN = _MIRROR_IMAGE_STATUS_STATE_UNKNOWN
 MIRROR_IMAGE_STATUS_STATE_ERROR = _MIRROR_IMAGE_STATUS_STATE_ERROR
@@ -108,6 +121,7 @@ MIRROR_IMAGE_STATUS_STATE_STOPPED = _MIRROR_IMAGE_STATUS_STATE_STOPPED
 
 RBD_LOCK_MODE_EXCLUSIVE = _RBD_LOCK_MODE_EXCLUSIVE
 RBD_LOCK_MODE_SHARED = _RBD_LOCK_MODE_SHARED
+RBD_LOCK_MODE_EXCLUSIVE_TRANSIENT = _RBD_LOCK_MODE_EXCLUSIVE_TRANSIENT
 
 RBD_IMAGE_OPTION_FORMAT = _RBD_IMAGE_OPTION_FORMAT
 RBD_IMAGE_OPTION_FEATURES = _RBD_IMAGE_OPTION_FEATURES
@@ -269,6 +283,12 @@ class ImageHasSnapshots(OSError):
                 "RBD image has snapshots (%s)" % message, errno)
 
 
+class ImageMemberOfGroup(OSError):
+    def __init__(self, message, errno=None):
+        super(ImageMemberOfGroup, self).__init__(
+                "RBD image is member of group (%s)" % message, errno)
+
+
 class FunctionNotSupported(OSError):
     def __init__(self, message, errno=None):
         super(FunctionNotSupported, self).__init__(
@@ -318,6 +338,7 @@ cdef errno_to_exception = {
     errno.EROFS      : ReadOnlyImage,
     errno.EBUSY      : ImageBusy,
     errno.ENOTEMPTY  : ImageHasSnapshots,
+    errno.EMLINK     : ImageMemberOfGroup,
     errno.ENOSYS     : FunctionNotSupported,
     errno.EDOM       : ArgumentOutOfRange,
     errno.ESHUTDOWN  : ConnectionShutdown,
@@ -337,6 +358,7 @@ cdef group_errno_to_exception = {
     errno.EROFS      : ReadOnlyImage,
     errno.EBUSY      : ImageBusy,
     errno.ENOTEMPTY  : ImageHasSnapshots,
+    errno.EMLINK     : ImageMemberOfGroup,
     errno.ENOSYS     : FunctionNotSupported,
     errno.EDOM       : ArgumentOutOfRange,
     errno.ESHUTDOWN  : ConnectionShutdown,
@@ -363,18 +385,19 @@ cdef make_ex(ret, msg, exception_map=errno_to_exception):
         return OSError(msg, errno=ret)
 
 
-IF BUILD_DOC:
-    cdef rados_t convert_rados(rados) nogil:
-        return <rados_t>0
+{{if BUILD_DOC}}
+cdef rados_t convert_rados(rados) nogil:
+    return <rados_t>0
 
-    cdef rados_ioctx_t convert_ioctx(ioctx) nogil:
-        return <rados_ioctx_t>0
-ELSE:
-    cdef rados_t convert_rados(rados.Rados rados) except? NULL:
-        return <rados_t>rados.cluster
+cdef rados_ioctx_t convert_ioctx(ioctx) nogil:
+    return <rados_ioctx_t>0
+{{else}}
+cdef rados_t convert_rados(rados.Rados rados) except? NULL:
+    return <rados_t>rados.cluster
 
-    cdef rados_ioctx_t convert_ioctx(rados.Ioctx ioctx) except? NULL:
-        return <rados_ioctx_t>ioctx.io
+cdef rados_ioctx_t convert_ioctx(rados.Ioctx ioctx) except? NULL:
+    return <rados_ioctx_t>ioctx.io
+{{endif}}
 
 cdef int progress_callback(uint64_t offset, uint64_t total, void* ptr) with gil:
     return (<object>ptr)(offset, total)
@@ -4101,15 +4124,16 @@ cdef class Image(object):
         Raises :class:`InvalidArgument` if from_snapshot is after
         the currently set snapshot.
 
-        Raises :class:`ImageNotFound` if from_snapshot is not the name
+        Raises :class:`ImageNotFound` if from_snapshot is not the name or id
         of a snapshot of the image.
 
         :param offset: start offset in bytes
         :type offset: int
         :param length: size of region to report on, in bytes
         :type length: int
-        :param from_snapshot: starting snapshot name, or None
-        :type from_snapshot: str or None
+        :param from_snapshot: starting snapshot name or id, or None to
+                              get all allocated extents
+        :type from_snapshot: str or int
         :param iterate_cb: function to call for each extent
         :type iterate_cb: function acception arguments for offset,
                            length, and exists
@@ -4120,18 +4144,45 @@ cdef class Image(object):
         :raises: :class:`InvalidArgument`, :class:`IOError`,
                  :class:`ImageNotFound`
         """
-        from_snapshot = cstr(from_snapshot, 'from_snapshot', opt=True)
         cdef:
-            char *_from_snapshot = opt_str(from_snapshot)
+            char *_from_snap_name = NULL
+            uint64_t _from_snap_id = 0
             uint64_t _offset = offset, _length = length
             uint8_t _include_parent = include_parent
             uint8_t _whole_object = whole_object
-        with nogil:
-            ret = rbd_diff_iterate2(self.image, _from_snapshot, _offset,
-                                    _length, _include_parent, _whole_object,
-                                    &diff_iterate_cb, <void *>iterate_cb)
+            uint32_t _flags = 0
+
+        if from_snapshot is not None:
+            if isinstance(from_snapshot, str):
+                from_snap_name = cstr(from_snapshot, 'from_snapshot')
+                _from_snap_name = from_snap_name
+            elif isinstance(from_snapshot, int):
+                from_snap_name = None
+                _from_snap_id = from_snapshot
+            else:
+                raise TypeError("from_snapshot must be a string or an integer")
+        else:
+            from_snap_name = None
+
+        if from_snap_name is not None:
+            with nogil:
+                ret = rbd_diff_iterate2(self.image, _from_snap_name, _offset,
+                                        _length, _include_parent, _whole_object,
+                                        &diff_iterate_cb, <void *>iterate_cb)
+        else:
+            if include_parent:
+                _flags |= _RBD_DIFF_ITERATE_FLAG_INCLUDE_PARENT
+            if whole_object:
+                _flags |= _RBD_DIFF_ITERATE_FLAG_WHOLE_OBJECT
+            with nogil:
+                ret = rbd_diff_iterate3(self.image, _from_snap_id, _offset,
+                                        _length, _flags, &diff_iterate_cb,
+                                        <void *>iterate_cb)
         if ret < 0:
-            msg = 'error generating diff from snapshot %s' % from_snapshot
+            if from_snap_name is not None:
+                msg = 'error generating diff from snapshot %s' % from_snapshot
+            else:
+                msg = 'error generating diff from snapshot id %d' % _from_snap_id
             raise make_ex(ret, msg)
 
     @requires_not_closed
@@ -6092,6 +6143,7 @@ cdef class GroupSnapIterator(object):
             if ret >= 0:
                 break
             elif ret != -errno.ERANGE:
+                self.num_group_snaps = 0
                 raise make_ex(ret, 'error listing snapshots for group %s' % group.name, group_errno_to_exception)
 
     def __iter__(self):

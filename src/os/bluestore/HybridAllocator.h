@@ -1,5 +1,5 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
 
 #pragma once
 
@@ -11,13 +11,14 @@
 
 template <typename PrimaryAllocator>
 class HybridAllocatorBase : public PrimaryAllocator {
-  BitmapAllocator* bmap_alloc = nullptr;
+  std::unique_ptr<BitmapAllocator> bmap_alloc;
 public:
   HybridAllocatorBase(CephContext* cct, int64_t device_size, int64_t _block_size,
                       uint64_t max_mem,
 	              std::string_view name) :
       PrimaryAllocator(cct, device_size, _block_size, max_mem, name) {
   }
+  ~HybridAllocatorBase() = default;
   int64_t allocate(
     uint64_t want,
     uint64_t unit,
@@ -55,23 +56,37 @@ public:
     }
   }
   void init_rm_free(uint64_t offset, uint64_t length) override;
+
+  void expand(int64_t new_size) override {
+    std::lock_guard l(PrimaryAllocator::get_lock());
+    int64_t old_size = PrimaryAllocator::get_capacity();
+    ceph_assert(new_size >= old_size);
+
+    if (new_size == old_size) {
+      return;
+    }
+
+    PrimaryAllocator::expand(new_size);
+    if (bmap_alloc) {
+      bmap_alloc->expand(new_size);
+    }
+  }
+
   void shutdown() override {
     std::lock_guard l(PrimaryAllocator::get_lock());
     PrimaryAllocator::_shutdown();
     if (bmap_alloc) {
-      bmap_alloc->shutdown();
-      delete bmap_alloc;
-      bmap_alloc = nullptr;
+      bmap_alloc.reset();
     }
   }
 
 protected:
   // intended primarily for UT
   BitmapAllocator* get_bmap() {
-    return bmap_alloc;
+    return bmap_alloc.get();
   }
   const BitmapAllocator* get_bmap() const {
-    return bmap_alloc;
+    return bmap_alloc.get();
   }
 private:
   void _spillover_range(uint64_t start, uint64_t end) override;

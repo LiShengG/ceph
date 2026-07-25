@@ -2,8 +2,13 @@
 Jerasure erasure code plugin
 ============================
 
-The *jerasure* plugin is the most generic and flexible plugin, it is
-also the default for Ceph erasure coded pools. 
+Note: Techniques other than ``reed_sol_van`` are deprecated. Support for deprecated techniques will be removed in
+the Vampire release.
+
+The *jerasure* plugin is a generic and flexible plugin. However,
+the *jerasure* library is no longer maintained and has not been
+updated to support modern CPU instructions that can improve
+performance when encoding and decoding data.
 
 The *jerasure* plugin encapsulates the `Jerasure
 <https://github.com/ceph/jerasure>`_ library. It is
@@ -53,9 +58,9 @@ Where:
 
 ``technique={reed_sol_van|reed_sol_r6_op|cauchy_orig|cauchy_good|liberation|blaum_roth|liber8tion}``
 
-:Description: The more flexible technique is *reed_sol_van* : it is
+:Description: The more flexible technique is *reed_sol_van*\: it is
               enough to set *k* and *m*. The *cauchy_good* technique
-              can be faster but you need to chose the *packetsize*
+              can be faster but you need to choose the *packetsize*
               carefully. All of *reed_sol_r6_op*, *liberation*,
               *blaum_roth*, *liber8tion* are *RAID6* equivalents in
               the sense that they can only be configured with *m=2*. 

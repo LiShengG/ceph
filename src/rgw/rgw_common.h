@@ -1,5 +1,5 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab ft=cpp
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab ft=cpp
 
 /*
  * Ceph - scalable distributed file system
@@ -18,15 +18,18 @@
 
 #include <array>
 #include <cstdint>
+#include <iterator>
+#include <ranges>
 #include <string_view>
-#include <atomic>
 #include <unordered_map>
 
 #include <fmt/format.h>
+
 #include <boost/container/flat_map.hpp>
 #include <boost/container/flat_set.hpp>
 
-#include "common/dout_fmt.h"
+#include "include/neorados/RADOS.hpp"
+
 #include "common/ceph_crypto.h"
 #include "common/random_string.h"
 #include "common/tracer.h"
@@ -41,6 +44,7 @@
 #include "common/async/yield_context.h"
 #include "rgw_website.h"
 #include "rgw_object_lock.h"
+#include "rgw_object_ownership.h"
 #include "rgw_tag.h"
 #include "rgw_op_type.h"
 #include "rgw_sync_policy.h"
@@ -50,7 +54,6 @@
 #include "include/rados/librados.hpp"
 #include "rgw_public_access.h"
 #include "rgw_sal_fwd.h"
-#include "rgw_hex.h"
 
 namespace ceph {
   class Formatter;
@@ -85,7 +88,8 @@ using ceph::crypto::MD5;
 #define RGW_ATTR_LC		RGW_ATTR_PREFIX "lc"
 #define RGW_ATTR_CORS		RGW_ATTR_PREFIX "cors"
 #define RGW_ATTR_ETAG RGW_ATTR_PREFIX "etag"
-#define RGW_ATTR_CKSUM    	RGW_ATTR_PREFIX "cksum"
+#define RGW_ATTR_CKSUM          RGW_ATTR_PREFIX "cksum"
+#define RGW_ATTR_BLAKE3         RGW_ATTR_PREFIX "blake3"
 #define RGW_ATTR_BUCKETS	RGW_ATTR_PREFIX "buckets"
 #define RGW_ATTR_META_PREFIX	RGW_ATTR_PREFIX RGW_AMZ_META_PREFIX
 #define RGW_ATTR_CONTENT_TYPE	RGW_ATTR_PREFIX "content_type"
@@ -100,6 +104,7 @@ using ceph::crypto::MD5;
 #define RGW_ATTR_SHADOW_OBJ    	RGW_ATTR_PREFIX "shadow_name"
 #define RGW_ATTR_MANIFEST    	RGW_ATTR_PREFIX "manifest"
 #define RGW_ATTR_USER_MANIFEST  RGW_ATTR_PREFIX "user_manifest"
+#define RGW_ATTR_SHARE_MANIFEST RGW_ATTR_PREFIX "shared_manifest"
 #define RGW_ATTR_AMZ_WEBSITE_REDIRECT_LOCATION	RGW_ATTR_PREFIX RGW_AMZ_WEBSITE_REDIRECT_LOCATION
 #define RGW_ATTR_SLO_MANIFEST   RGW_ATTR_PREFIX "slo_manifest"
 /* Information whether an object is SLO or not must be exposed to
@@ -108,12 +113,17 @@ using ceph::crypto::MD5;
 #define RGW_ATTR_X_ROBOTS_TAG	RGW_ATTR_PREFIX "x-robots-tag"
 #define RGW_ATTR_STORAGE_CLASS  RGW_ATTR_PREFIX "storage_class"
 #define RGW_ATTR_BUCKET_LOGGING RGW_ATTR_PREFIX "logging"
+#define RGW_ATTR_BUCKET_LOGGING_MTIME RGW_ATTR_PREFIX "logging-mtime"
+#define RGW_ATTR_BUCKET_LOGGING_SOURCES RGW_ATTR_PREFIX "logging-sources"
+#define RGW_ATTR_ARCHIVE_INSTANCE_MTIME RGW_ATTR_PREFIX "zone.archive.instance.mtime"
 
 /* S3 Object Lock*/
 #define RGW_ATTR_OBJECT_LOCK        RGW_ATTR_PREFIX "object-lock"
 #define RGW_ATTR_OBJECT_RETENTION   RGW_ATTR_PREFIX "object-retention"
 #define RGW_ATTR_OBJECT_LEGAL_HOLD  RGW_ATTR_PREFIX "object-legal-hold"
 
+// S3 Object Ownership
+#define RGW_ATTR_OWNERSHIP_CONTROLS RGW_ATTR_PREFIX "ownership-controls"
 
 #define RGW_ATTR_PG_VER 	RGW_ATTR_PREFIX "pg_ver"
 #define RGW_ATTR_SOURCE_ZONE    RGW_ATTR_PREFIX "source_zone"
@@ -124,6 +134,8 @@ using ceph::crypto::MD5;
 #define RGW_ATTR_RESTORE_TYPE   RGW_ATTR_PREFIX "restore-type"
 #define RGW_ATTR_RESTORE_TIME   RGW_ATTR_PREFIX "restored-at"
 #define RGW_ATTR_RESTORE_EXPIRY_DATE   RGW_ATTR_PREFIX "restore-expiry-date"
+#define RGW_ATTR_TRANSITION_TIME RGW_ATTR_PREFIX "transition-at"
+#define RGW_ATTR_RESTORE_VERSIONED_EPOCH RGW_ATTR_PREFIX "restore-versioned-epoch"
 
 #define RGW_ATTR_TEMPURL_KEY1   RGW_ATTR_META_PREFIX "temp-url-key"
 #define RGW_ATTR_TEMPURL_KEY2   RGW_ATTR_META_PREFIX "temp-url-key-2"
@@ -162,10 +174,11 @@ using ceph::crypto::MD5;
 #define RGW_ATTR_OBJ_REPLICATION_TIMESTAMP RGW_ATTR_PREFIX "replicated-at"
 
 /* IAM Policy */
-#define RGW_ATTR_IAM_POLICY	RGW_ATTR_PREFIX "iam-policy"
-#define RGW_ATTR_USER_POLICY    RGW_ATTR_PREFIX "user-policy"
-#define RGW_ATTR_MANAGED_POLICY RGW_ATTR_PREFIX "managed-policy"
-#define RGW_ATTR_PUBLIC_ACCESS  RGW_ATTR_PREFIX "public-access"
+#define RGW_ATTR_IAM_POLICY                    RGW_ATTR_PREFIX "iam-policy"
+#define RGW_ATTR_USER_POLICY                   RGW_ATTR_PREFIX "user-policy"
+#define RGW_ATTR_MANAGED_POLICY                RGW_ATTR_PREFIX "managed-policy"
+#define RGW_ATTR_PUBLIC_ACCESS                 RGW_ATTR_PREFIX "public-access"
+#define RGW_ATTR_IAM_POLICY_REMOVE_SELF_ACCESS RGW_ATTR_PREFIX "iam-policy-remove-self-access"
 
 /* RGW File Attributes */
 #define RGW_ATTR_UNIX_KEY1      RGW_ATTR_PREFIX "unix-key1"
@@ -179,6 +192,11 @@ using ceph::crypto::MD5;
 #define RGW_ATTR_CRYPT_CONTEXT  RGW_ATTR_CRYPT_PREFIX "context"
 #define RGW_ATTR_CRYPT_DATAKEY  RGW_ATTR_CRYPT_PREFIX "datakey"
 #define RGW_ATTR_CRYPT_PARTS    RGW_ATTR_CRYPT_PREFIX "part-lengths"
+#define RGW_ATTR_CRYPT_PART_NUMS RGW_ATTR_CRYPT_PREFIX "part-numbers"
+#define RGW_ATTR_CRYPT_PART_SALT  RGW_ATTR_CRYPT_PREFIX "part-salt"
+#define RGW_ATTR_CRYPT_SALT     RGW_ATTR_CRYPT_PREFIX "salt"
+#define RGW_ATTR_CRYPT_ORIGINAL_SIZE RGW_ATTR_CRYPT_PREFIX "original-size"
+#define RGW_ATTR_CRYPT_PREFETCH_ALIGN RGW_ATTR_CRYPT_PREFIX "prefetch-align"
 
 /* SSE-S3 Encryption Attributes */
 #define RGW_ATTR_BUCKET_ENCRYPTION_PREFIX RGW_ATTR_PREFIX "sse-s3."
@@ -188,6 +206,8 @@ using ceph::crypto::MD5;
 #define RGW_ATTR_TRACE RGW_ATTR_PREFIX "trace"
 
 #define RGW_ATTR_BUCKET_NOTIFICATION RGW_ATTR_PREFIX "bucket-notification"
+
+#define RGW_ATTR_INTERNAL_MTIME RGW_ATTR_PREFIX "rgw-internal-mtime"
 
 enum class RGWFormat : int8_t {
   BAD_FORMAT = -1,
@@ -228,6 +248,7 @@ static inline const char* to_mime_type(const RGWFormat f)
 #define RGW_REST_STS            0x10
 #define RGW_REST_IAM            0x20
 #define RGW_REST_SNS            0x40
+#define RGW_REST_S3CONTROL      0x80
 
 inline constexpr const char* RGW_REST_IAM_XMLNS =
     "https://iam.amazonaws.com/doc/2010-05-08/";
@@ -337,10 +358,15 @@ inline constexpr const char* RGW_REST_STS_XMLNS =
 #define ERR_PRESIGNED_URL_EXPIRED			 2223
 #define ERR_PRESIGNED_URL_DISABLED     2224
 #define ERR_AUTHORIZATION        2225 // SNS 403 AuthorizationError
+#define ERR_ILLEGAL_LOCATION_CONSTRAINT_EXCEPTION 2226
+#define ERR_ACLS_NOT_SUPPORTED   2227 // 400 AccessControlListNotSupported
+#define ERR_INVALID_BUCKET_ACL   2228 // 400 InvalidBucketAclWithObjectOwnership
+#define ERR_NO_SUCH_OWNERSHIP_CONTROLS 2229 // 404 OwnershipControlsNotFoundError
 
 #define ERR_BUSY_RESHARDING      2300 // also in cls_rgw_types.h, don't change!
 #define ERR_NO_SUCH_ENTITY       2301
 #define ERR_LIMIT_EXCEEDED       2302
+#define ERR_CONCURRENT_MODIFICATION 2303
 
 // STS Errors
 #define ERR_PACKED_POLICY_TOO_LARGE 2400
@@ -348,6 +374,9 @@ inline constexpr const char* RGW_REST_STS_XMLNS =
 
 #define ERR_NO_SUCH_TAG_SET 2402
 #define ERR_ACCOUNT_EXISTS 2403
+
+#define ERR_RESTORE_ALREADY_IN_PROGRESS 2500
+#define ERR_EXPIRED_TOKEN 2501
 
 #ifndef UINT32_MAX
 #define UINT32_MAX (0xffffffffu)
@@ -554,26 +583,40 @@ class RateLimiter;
 struct RGWRateLimitInfo {
   int64_t max_write_ops;
   int64_t max_read_ops;
+  int64_t max_list_ops;
+  int64_t max_delete_ops;
   int64_t max_write_bytes;
   int64_t max_read_bytes;
   bool enabled = false;
   RGWRateLimitInfo()
-    : max_write_ops(0), max_read_ops(0), max_write_bytes(0), max_read_bytes(0)  {}
+    : max_write_ops(0), max_read_ops(0), max_list_ops(0), max_delete_ops(0), max_write_bytes(0), max_read_bytes(0)  {}
 
   void encode(bufferlist& bl) const {
-    ENCODE_START(1, 1, bl);
+    ENCODE_START(2, 1, bl);
     encode(max_write_ops, bl);
     encode(max_read_ops, bl);
+    encode(max_list_ops, bl);
+    encode(max_delete_ops, bl);
     encode(max_write_bytes, bl);
     encode(max_read_bytes, bl);
     encode(enabled, bl);
     ENCODE_FINISH(bl);
   }
   void decode(bufferlist::const_iterator& bl) {
-    DECODE_START(1, bl);
-    decode(max_write_ops,bl);
+    DECODE_START(2, bl);
+    decode(max_write_ops, bl);
     decode(max_read_ops, bl);
-    decode(max_write_bytes,bl);
+    if (struct_v >= 2) {
+      decode(max_list_ops, bl);
+    } else {
+      max_list_ops = 0;
+    }
+    if (struct_v >= 2) {
+      decode(max_delete_ops, bl);
+    } else {
+      max_delete_ops = 0;
+    }
+    decode(max_write_bytes, bl);
     decode(max_read_bytes, bl);
     decode(enabled, bl);
     DECODE_FINISH(bl);
@@ -785,7 +828,7 @@ struct RGWUserInfo
     DECODE_FINISH(bl);
   }
   void dump(Formatter *f) const;
-  static void generate_test_instances(std::list<RGWUserInfo*>& o);
+  static std::list<RGWUserInfo> generate_test_instances();
 
   void decode_json(JSONObj *obj);
 };
@@ -851,7 +894,7 @@ struct RGWAccountInfo {
 
   void dump(Formatter* f) const;
   void decode_json(JSONObj* obj);
-  static void generate_test_instances(std::list<RGWAccountInfo*>& o);
+  static std::list<RGWAccountInfo> generate_test_instances();
 };
 WRITE_CLASS_ENCODER(RGWAccountInfo)
 
@@ -885,7 +928,7 @@ struct RGWGroupInfo {
 
   void dump(Formatter* f) const;
   void decode_json(JSONObj* obj);
-  static void generate_test_instances(std::list<RGWGroupInfo*>& o);
+  static std::list<RGWGroupInfo> generate_test_instances();
 };
 WRITE_CLASS_ENCODER(RGWGroupInfo)
 
@@ -971,6 +1014,14 @@ struct RGWObjVersionTracker {
   /// This function is defined in `rgw_rados.cc` rather than `rgw_common.cc`.
   void prepare_op_for_read(librados::ObjectReadOperation* op);
 
+  /// This function is to be called on any read operation. If we have
+  /// a non-empty `read_version`, assert on the OSD that the object
+  /// has the same version. Also reads the version into `read_version`.
+  ///
+  /// This function is defined in `rgw_rados.cc` rather than
+  /// `rgw_common.cc`.
+  void prepare_read(neorados::ReadOp& op);
+
   /// This function is to be called on any write operation. If we have
   /// a non-empty read operation, assert on the OSD that the object
   /// has the same version. If we have a non-empty `write_version`,
@@ -979,6 +1030,15 @@ struct RGWObjVersionTracker {
   /// This function is defined in `rgw_rados.cc` rather than
   /// `rgw_common.cc`.
   void prepare_op_for_write(librados::ObjectWriteOperation* op);
+
+  /// This function is to be called on any write operation. If we have
+  /// a non-empty read operation, assert on the OSD that the object
+  /// has the same version. If we have a non-empty `write_version`,
+  /// set the object to it. Otherwise increment the version on the OSD.
+  ///
+  /// This function is defined in `rgw_rados.cc` rather than
+  /// `rgw_common.cc`.
+  void prepare_write(neorados::WriteOp& op);
 
   /// This function is to be called after the completion of any write
   /// operation on which `prepare_op_for_write` was called. If we did
@@ -1015,12 +1075,6 @@ struct RGWObjVersionTracker {
   void generate_new_write_ver(CephContext* cct);
 };
 
-inline std::ostream& operator<<(std::ostream& out, const obj_version &v)
-{
-  out << v.tag << ":" << v.ver;
-  return out;
-}
-
 inline std::ostream& operator<<(std::ostream& out, const RGWObjVersionTracker &ot)
 {
   out << "{r=" << ot.read_version << ",w=" << ot.write_version << "}";
@@ -1034,12 +1088,16 @@ enum RGWBucketFlags {
   BUCKET_DATASYNC_DISABLED = 0X8,
   BUCKET_MFA_ENABLED = 0X10,
   BUCKET_OBJ_LOCK_ENABLED = 0X20,
+  BUCKET_DELETED = 0X40,
 };
 
 class RGWSI_Zone;
 
 #include "rgw_cksum.h"
 
+
+// this represents the at-rest bucket instance object and is stored as
+// a system object
 struct RGWBucketInfo {
   rgw_bucket bucket;
   rgw_owner owner;
@@ -1080,7 +1138,7 @@ struct RGWBucketInfo {
   void encode(bufferlist& bl) const;
   void decode(bufferlist::const_iterator& bl);
   void dump(Formatter *f) const;
-  static void generate_test_instances(std::list<RGWBucketInfo*>& o);
+  static std::list<RGWBucketInfo> generate_test_instances();
 
   void decode_json(JSONObj *obj);
 
@@ -1090,6 +1148,7 @@ struct RGWBucketInfo {
   bool mfa_enabled() const { return (versioning_status() & BUCKET_MFA_ENABLED) != 0; }
   bool datasync_flag_enabled() const { return (flags & BUCKET_DATASYNC_DISABLED) == 0; }
   bool obj_lock_enabled() const { return (flags & BUCKET_OBJ_LOCK_ENABLED) != 0; }
+  bool bucket_deleted() const { return (flags & BUCKET_DELETED) != 0; }
 
   bool has_swift_versioning() const {
     /* A bucket may be versioned through one mechanism only. */
@@ -1176,7 +1235,7 @@ struct RGWBucketEntryPoint
 
   void dump(Formatter *f) const;
   void decode_json(JSONObj *obj);
-  static void generate_test_instances(std::list<RGWBucketEntryPoint*>& o);
+  static std::list<RGWBucketEntryPoint> generate_test_instances();
 };
 WRITE_CLASS_ENCODER(RGWBucketEntryPoint)
 
@@ -1225,7 +1284,7 @@ struct req_info {
   meta_map_t crypt_attribute_map;
 
   std::string host;
-  const char *method;
+  const char *method = nullptr;
   std::string script_uri;
   std::string request_uri;
   std::string request_uri_aws4;
@@ -1259,6 +1318,7 @@ struct req_state : DoutPrefixProvider {
   std::shared_ptr<RateLimiter> ratelimit_data;
   RGWRateLimitInfo user_ratelimit;
   RGWRateLimitInfo bucket_ratelimit;
+  int64_t ratelimit_retry_after{0};
   std::string ratelimit_bucket_marker;
   std::string ratelimit_user_name;
   bool content_started{false};
@@ -1283,6 +1343,7 @@ struct req_state : DoutPrefixProvider {
 
   std::string bucket_tenant;
   std::string bucket_name;
+  rgw_obj_key object_key; // requested object name and version id
 
   /* bucket is only created in rgw_build_bucket_policies() and should never be
    * overwritten */
@@ -1290,6 +1351,7 @@ struct req_state : DoutPrefixProvider {
   std::unique_ptr<rgw::sal::Object> object;
   std::string src_tenant_name;
   std::string src_bucket_name;
+  rgw_obj_key src_object_key; // requested source object name and version id
   std::unique_ptr<rgw::sal::Object> src_object;
   ACLOwner bucket_owner;
   // Resource owner for the authenticated identity, initialized in authorize()
@@ -1350,7 +1412,9 @@ struct req_state : DoutPrefixProvider {
 
   rgw::IAM::Environment env;
   boost::optional<rgw::IAM::Policy> iam_policy;
-  boost::optional<PublicAccessBlockConfiguration> bucket_access_conf;
+  // PublicAccessBlock configuration that applies to this request
+  PublicAccessBlockConfiguration public_access_block;
+  rgw::s3::ObjectOwnership bucket_object_ownership = rgw::s3::ObjectOwnership::ObjectWriter;
   std::vector<rgw::IAM::Policy> iam_identity_policies;
 
   /* Is the request made by an user marked as a system one?
@@ -1359,6 +1423,7 @@ struct req_state : DoutPrefixProvider {
 
   std::string canned_acl;
   bool has_acl_header{false};
+  bool granted_by_acl{false};
   bool local_source{false}; /* source is local */
 
   int prot_flags{0};
@@ -1426,6 +1491,7 @@ struct RGWBucketEnt {
   size_t size;
   size_t size_rounded;
   ceph::real_time creation_time;
+  ceph::real_time modification_time;
   uint64_t count;
 
   /* The placement_rule is necessary to calculate per-storage-policy statics
@@ -1502,7 +1568,7 @@ struct RGWBucketEnt {
     DECODE_FINISH(bl);
   }
   void dump(Formatter *f) const;
-  static void generate_test_instances(std::list<RGWBucketEnt*>& o);
+  static std::list<RGWBucketEnt> generate_test_instances();
 };
 WRITE_CLASS_ENCODER(RGWBucketEnt)
 
@@ -1526,9 +1592,10 @@ struct multipart_upload_info
   RGWObjectRetention obj_retention;
   RGWObjectLegalHold obj_legal_hold;
   rgw::cksum::Type cksum_type {rgw::cksum::Type::none};
+  uint16_t cksum_flags{rgw::cksum::Cksum::FLAG_CKSUM_NONE};
 
   void encode(bufferlist& bl) const {
-    ENCODE_START(3, 1, bl);
+    ENCODE_START(4, 1, bl);
     encode(dest_placement, bl);
     encode(obj_retention_exist, bl);
     encode(obj_legal_hold_exist, bl);
@@ -1536,11 +1603,12 @@ struct multipart_upload_info
     encode(obj_legal_hold, bl);
     uint16_t ct{uint16_t(cksum_type)};
     encode(ct, bl);
+    encode(cksum_flags, bl);
     ENCODE_FINISH(bl);
   }
 
   void decode(bufferlist::const_iterator& bl) {
-    DECODE_START_LEGACY_COMPAT_LEN(3, 1, 1, bl);
+    DECODE_START_LEGACY_COMPAT_LEN(4, 1, 1, bl);
     decode(dest_placement, bl);
     if (struct_v >= 2) {
       decode(obj_retention_exist, bl);
@@ -1551,6 +1619,9 @@ struct multipart_upload_info
 	uint16_t ct;
 	decode(ct, bl);
 	cksum_type = rgw::cksum::Type(ct);
+	if (struct_v >= 4) {
+	  decode(cksum_flags, bl);
+	}
       }
     } else {
       obj_retention_exist = false;
@@ -1563,11 +1634,13 @@ struct multipart_upload_info
     dest_placement.dump(f);
   }
 
-  static void generate_test_instances(std::list<multipart_upload_info*>& o) {
-    o.push_back(new multipart_upload_info);
-    o.push_back(new multipart_upload_info);
-    o.back()->dest_placement.name = "dest_placement";
-    o.back()->dest_placement.storage_class = "dest_storage_class";
+  static std::list<multipart_upload_info> generate_test_instances() {
+    std::list<multipart_upload_info> o;
+    o.emplace_back();
+    o.emplace_back();
+    o.back().dest_placement.name = "dest_placement";
+    o.back().dest_placement.storage_class = "dest_storage_class";
+    return o;
   }
 };
 WRITE_CLASS_ENCODER(multipart_upload_info)
@@ -1583,13 +1656,14 @@ static inline int rgw_str_to_bool(const char *s, int def_val)
           strcasecmp(s, "1") == 0);
 }
 
-static inline void append_rand_alpha(CephContext *cct, const std::string& src, std::string& dest, int len)
+inline void
+append_rand_alpha(
+    CephContext* cct,
+    const std::string& src,
+    std::string& dest,
+    int len)
 {
-  dest = src;
-  char buf[len + 1];
-  gen_rand_alphanumeric(cct, buf, len);
-  dest.append("_");
-  dest.append(buf);
+  dest = fmt::format("{}_{}", src, gen_rand_alphanumeric(cct, len));
 }
 
 static inline uint64_t rgw_rounded_kb(uint64_t bytes)
@@ -1656,24 +1730,27 @@ struct perm_state_base {
   const rgw::IAM::Environment& env;
   rgw::auth::Identity *identity;
   const RGWBucketInfo bucket_info;
+  rgw::s3::ObjectOwnership bucket_object_ownership;
   int perm_mask;
   bool defer_to_bucket_acls;
-  boost::optional<PublicAccessBlockConfiguration> bucket_access_conf;
+  PublicAccessBlockConfiguration public_access_block;
 
   perm_state_base(CephContext *_cct,
                   const rgw::IAM::Environment& _env,
                   rgw::auth::Identity *_identity,
                   const RGWBucketInfo& _bucket_info,
+                  rgw::s3::ObjectOwnership bucket_object_ownership,
                   int _perm_mask,
                   bool _defer_to_bucket_acls,
-                  boost::optional<PublicAccessBlockConfiguration> _bucket_access_conf = boost::none) :
+                  PublicAccessBlockConfiguration _public_access_block = {}) :
                                                 cct(_cct),
                                                 env(_env),
                                                 identity(_identity),
                                                 bucket_info(_bucket_info),
+                                                bucket_object_ownership(bucket_object_ownership),
                                                 perm_mask(_perm_mask),
                                                 defer_to_bucket_acls(_defer_to_bucket_acls),
-                                                bucket_access_conf(_bucket_access_conf)
+                                                public_access_block(_public_access_block)
   {}
 
   virtual ~perm_state_base() {}
@@ -1693,6 +1770,7 @@ struct perm_state : public perm_state_base {
              const rgw::IAM::Environment& _env,
              rgw::auth::Identity *_identity,
              const RGWBucketInfo& _bucket_info,
+             rgw::s3::ObjectOwnership bucket_object_ownership,
              int _perm_mask,
              bool _defer_to_bucket_acls,
              const char *_referer,
@@ -1700,6 +1778,7 @@ struct perm_state : public perm_state_base {
                                                     _env,
                                                     _identity,
                                                     _bucket_info,
+                                                    bucket_object_ownership,
                                                     _perm_mask,
                                                     _defer_to_bucket_acls),
                                     referer(_referer),
@@ -1718,10 +1797,10 @@ struct perm_state : public perm_state_base {
  * to do the requested action  */
 bool verify_bucket_permission_no_policy(
   const DoutPrefixProvider* dpp,
-  struct perm_state_base * const s,
+  const perm_state_base * const s,
   const RGWAccessControlPolicy& user_acl,
   const RGWAccessControlPolicy& bucket_acl,
-  const int perm);
+  const int perm, bool* granted_by_acl = nullptr);
 
 bool verify_user_permission_no_policy(const DoutPrefixProvider* dpp,
                                       struct perm_state_base * const s,
@@ -1733,7 +1812,8 @@ bool verify_object_permission_no_policy(const DoutPrefixProvider* dpp,
 					const RGWAccessControlPolicy& user_acl,
 					const RGWAccessControlPolicy& bucket_acl,
 					const RGWAccessControlPolicy& object_acl,
-					const int perm);
+					const int perm,
+                                        bool *granted_by_acl = nullptr);
 
 // determine whether a request is allowed or denied within an account
 rgw::IAM::Effect evaluate_iam_policies(
@@ -1747,24 +1827,22 @@ rgw::IAM::Effect evaluate_iam_policies(
 
 bool verify_user_permission(const DoutPrefixProvider* dpp,
                             req_state * const s,
-                            const RGWAccessControlPolicy& user_acl,
-                            const std::vector<rgw::IAM::Policy>& user_policies,
-                            const std::vector<rgw::IAM::Policy>& session_policies,
-                            const rgw::ARN& res,
-                            const uint64_t op,
-                            bool mandatory_policy=true);
-bool verify_user_permission_no_policy(const DoutPrefixProvider* dpp,
-                                      req_state * const s,
-                                      const RGWAccessControlPolicy& user_acl,
-                                      const int perm);
-bool verify_user_permission(const DoutPrefixProvider* dpp,
-                            req_state * const s,
                             const rgw::ARN& res,
                             const uint64_t op,
                             bool mandatory_policy=true);
 bool verify_user_permission_no_policy(const DoutPrefixProvider* dpp,
                                       req_state * const s,
                                       int perm);
+bool verify_bucket_permission(const DoutPrefixProvider* dpp,
+                              const perm_state_base * const s,
+                              const rgw::ARN& arn,
+                              bool account_root,
+                              const RGWAccessControlPolicy& user_acl,
+                              const RGWAccessControlPolicy& bucket_acl,
+			      const boost::optional<rgw::IAM::Policy>& bucket_policy,
+                              const std::vector<rgw::IAM::Policy>& identity_policies,
+                              const std::vector<rgw::IAM::Policy>& session_policies,
+                              const uint64_t op, bool *granted_by_acl = nullptr);
 bool verify_bucket_permission(
   const DoutPrefixProvider* dpp,
   req_state * const s,
@@ -1800,13 +1878,6 @@ extern bool verify_object_permission(
   const std::vector<rgw::IAM::Policy>& session_policies,
   const uint64_t op);
 extern bool verify_object_permission(const DoutPrefixProvider* dpp, req_state *s, uint64_t op);
-extern bool verify_object_permission_no_policy(
-  const DoutPrefixProvider* dpp,
-  req_state * const s,
-  const RGWAccessControlPolicy& user_acl,
-  const RGWAccessControlPolicy& bucket_acl,
-  const RGWAccessControlPolicy& object_acl,
-  int perm);
 extern bool verify_object_permission_no_policy(const DoutPrefixProvider* dpp, req_state *s,
 					       int perm);
 extern int verify_object_lock(
@@ -1902,65 +1973,253 @@ extern std::string calc_hash_sha256_restart_stream(ceph::crypto::SHA256** phash)
 extern int rgw_parse_op_type_list(const std::string& str, uint32_t *perm);
 
 static constexpr uint32_t MATCH_POLICY_ACTION = 0x01;
-static constexpr uint32_t MATCH_POLICY_RESOURCE = 0x02;
-static constexpr uint32_t MATCH_POLICY_ARN = 0x04;
-static constexpr uint32_t MATCH_POLICY_STRING = 0x08;
+static constexpr uint32_t MATCH_POLICY_ARN = 0x02;
 
 extern bool match_policy(const std::string& pattern, const std::string& input,
                          uint32_t flag);
 
-extern std::string camelcase_dash_http_attr(const std::string& orig, bool convert2dash = true);
-extern std::string lowercase_dash_http_attr(const std::string& orig, bool bidirection = false);
+/*
+ * Converts to lowercase with upper after a separator
+ *
+ * `THIS_KIND_OF_STRING` to `This_Kind_Of_String` and possibly
+ * `This-Kind-Of-String` if `convert2dash` is true. Not actually CamelCase
+ * as generally understood.
+ *
+ * \param[in] in Range to transform
+ * \param[out] out Output iterator
+ * \param[in] convert2dash Transform '_' to '-'
+ *
+ * \return A structure of input and output iterators, as with std::transform.
+ */
+inline auto
+camelcase_dash_transform(
+    std::ranges::input_range auto&& in,
+    std::output_iterator<char> auto out,
+    bool convert2dash = true)
+{
+  bool last_sep = true;
+  return std::ranges::transform(
+      std::forward<decltype(in)>(in), out, [&last_sep, convert2dash](char c) -> char {
+    switch (c) {
+    case '_':
+    case '-':
+      last_sep = true;
+      return convert2dash ? '-' : c;
+    default:
+      c = last_sep ? toupper(static_cast<unsigned char>(c)) : tolower(static_cast<unsigned char>(c));
+      last_sep = false;
+      return c;
+    }
+  });
+}
+
+/*
+ * Converts to lowercase with upper after a separator
+ *
+ * `THIS_KIND_OF_STRING` to `This_Kind_Of_String` and possibly
+ * `This-Kind-Of-String` if `convert2dash` is true. Not actually CamelCase
+ * as generally understood.
+ *
+ * \param[in] in Range to transform
+ * \param[in] convert2dash Transform '_' to '-'
+ *
+ * \return Transformed string
+ */
+inline std::string
+camelcase_dash_http_attr(const std::string& in, bool convert2dash = true)
+{
+  std::string out;
+  out.reserve(in.size());
+  camelcase_dash_transform(in, std::back_inserter(out), convert2dash);
+  return out;
+}
+
+/*
+ * Converts to lowercase with upper after a separator
+ *
+ * `THIS_KIND_OF_STRING` to `This_Kind_Of_String` and possibly
+ * `This-Kind-Of-String` if `convert2dash` is true. Not actually CamelCase
+ * as generally understood.
+ *
+ * \param[in] in Range to transform
+ * \param[in] convert2dash Transform '_' to '-'
+ *
+ * \return Transformed string move-constructed from 'in'.
+ */
+inline std::string
+camelcase_dash_http_attr(std::string&& in, bool convert2dash = true)
+{
+  camelcase_dash_transform(in, in.begin(), convert2dash);
+  return std::move(in);
+}
+
+/*
+ * Converts uppercase to lowercase and underscores to dashes
+ *
+ * `THIS_KIND_OF_STRING` to `this-kind-of-string`
+ *
+ * \param[in] in Range to transform
+ * \param[out] out Output iterator
+ * \param[in] bidirectional Transform '-' to '_'
+ *
+ * \return A structure of input and output iterators, as with std::transform.
+ */
+inline auto
+lowercase_dash_transform(
+    std::ranges::input_range auto&& in,
+    std::output_iterator<char> auto out,
+    bool bidirectional = false)
+{
+  return std::ranges::transform(
+      std::forward<decltype(in)>(in), out, [bidirectional](char c) -> char {
+        switch (c) {
+        case '_':
+          return '-';
+        case '-':
+          return bidirectional ? '_' : '-';
+        default:
+          return tolower(static_cast<unsigned char>(c));
+        }
+      });
+}
+
+/*
+ * Converts uppercase to lowercase and underscores to dashes
+ *
+ * `THIS_KIND_OF_STRING` to `this-kind-of-string`
+ *
+ * \param[in] in String to transform
+ * \param[in] bidirectional Transform '-' to '_'
+ *
+ * \return Transformed string
+ */
+inline std::string
+lowercase_dash_http_attr(const std::string& in, bool bidirectional = false)
+{
+  std::string out;
+  out.reserve(in.size());
+  lowercase_dash_transform(in, std::back_inserter(out), bidirectional);
+  return out;
+}
+
+/*
+ * Converts uppercase to lowercase and underscores to dashes
+ *
+ * `THIS_KIND_OF_STRING` to `this-kind-of-string`
+ *
+ * \param[in] in String to transform
+ * \param[in] bidirectional Transform '-' to '_'
+ *
+ * \return Transformed string move-constructed from 'in'.
+ */
+inline std::string
+lowercase_dash_http_attr(std::string&& in, bool bidirectional = false)
+{
+  lowercase_dash_transform(in, in.begin(), bidirectional);
+  return std::move(in);
+}
+
+/*
+ * Converts lower to upper and dashes to underscores
+ *
+ * 'this-kind-of-string' to 'THIS_KIND_OF_STRING'
+ *
+ * \param[in] in Range to transform
+ * \param[out] out Output iterator
+ * \param[in] bidirectional Transform '_' to '-'
+ *
+ * \return A structure of input and output iterators, as with std::transform.
+ */
+inline auto
+uppercase_dash_transform(
+    std::ranges::input_range auto&& in,
+    std::output_iterator<char> auto out,
+    bool bidirectional = false)
+{
+  return std::ranges::transform(
+      std::forward<decltype(in)>(in), out, [bidirectional](char c) -> char {
+        switch (c) {
+        case '-':
+          return '_';
+        case '_':
+          if (bidirectional)
+            return '-';
+          else
+            return toupper(static_cast<unsigned char>(c));
+        default:
+          return toupper(static_cast<unsigned char>(c));
+        }
+      });
+}
 
 void rgw_setup_saved_curl_handles();
 void rgw_release_all_curl_handles();
 
-static inline void rgw_escape_str(const std::string& s, char esc_char,
-				  char special_char, std::string *dest)
+/// Escape one character with another
+///
+/// \note This function appends, it does not clear its output.
+///
+/// \param[in] in Input string
+/// \param[in] esc_char Character with which to escape
+/// \param[in] special_char Character to be escaped
+/// \param[in] out Output iterator to append
+///
+/// \return New output iterator
+inline auto
+rgw_escape_str(
+    std::ranges::input_range auto&& in,
+    char esc_char,
+    char special_char,
+    std::output_iterator<char> auto out)
 {
-  const char *src = s.c_str();
-  char dest_buf[s.size() * 2 + 1];
-  char *destp = dest_buf;
-
-  for (size_t i = 0; i < s.size(); i++) {
-    char c = src[i];
+  for (const auto c : std::forward<decltype(in)>(in)) {
     if (c == esc_char || c == special_char) {
-      *destp++ = esc_char;
+      *out++ = esc_char;
     }
-    *destp++ = c;
+    *out++ = c;
   }
-  *destp++ = '\0';
-  *dest = dest_buf;
+  return out;
 }
 
-static inline ssize_t rgw_unescape_str(const std::string& s, ssize_t ofs,
-				       char esc_char, char special_char,
-				       std::string *dest)
+/// Unescapes an escaped character
+///
+/// \note This function appends, it does not clear its output.
+///
+/// \param[in] in Input string
+/// \param[in] esc_char Character with which we escaped
+/// \param[in] special_char Character which was to be escaped
+/// \param[in] out Output iterator to append
+///
+/// \return If we encounter `special_char` not preceded by `esc_char`,
+///         return a subrange beginning with the next character,
+///         otherwise an empty subrange.
+template <std::ranges::input_range In>
+  requires std::ranges::borrowed_range<In> || std::is_lvalue_reference_v<In&&>
+inline auto
+rgw_unescape_str(
+    In&& in,
+    char esc_char,
+    char special_char,
+    std::output_iterator<char> auto out)
 {
-  const char *src = s.c_str();
-  char dest_buf[s.size() + 1];
-  char *destp = dest_buf;
   bool esc = false;
 
-  dest_buf[0] = '\0';
-
-  for (size_t i = ofs; i < s.size(); i++) {
-    char c = src[i];
+  auto it = std::ranges::begin(in);
+  auto end = std::ranges::end(in);
+  while (it != end) {
+    const char c = *it;
+    ++it;
     if (!esc && c == esc_char) {
       esc = true;
       continue;
     }
     if (!esc && c == special_char) {
-      *destp = '\0';
-      *dest = dest_buf;
-      return (ssize_t)i + 1;
+      break;
     }
-    *destp++ = c;
+    *out++ = c;
     esc = false;
   }
-  *destp = '\0';
-  *dest = dest_buf;
-  return std::string::npos;
+  return std::ranges::subrange{it, end};
 }
 
 /// Return a string copy of the given bufferlist with trailing nulls removed
@@ -2012,3 +2271,64 @@ struct AioCompletionDeleter {
   void operator()(librados::AioCompletion* c) { c->release(); }
 };
 using aio_completion_ptr = std::unique_ptr<librados::AioCompletion, AioCompletionDeleter>;
+
+extern boost::optional<rgw::IAM::Policy>
+get_iam_policy_from_attr(CephContext* cct,
+                         const std::map<std::string, bufferlist>& attrs,
+                         const std::string& tenant);
+
+static inline void prepend_bucket_marker(const rgw_bucket& bucket, const std::string& orig_oid, std::string& oid)
+{
+  if (bucket.marker.empty() || orig_oid.empty()) {
+    oid = orig_oid;
+  } else {
+    oid = bucket.marker;
+    oid.append("_");
+    oid.append(orig_oid);
+  }
+}
+
+static inline void get_obj_bucket_and_oid_loc(const rgw_obj& obj, std::string& oid, std::string& locator)
+{
+  const rgw_bucket& bucket = obj.bucket;
+  prepend_bucket_marker(bucket, obj.get_oid(), oid);
+  const std::string& loc = obj.key.get_loc();
+  if (!loc.empty()) {
+    prepend_bucket_marker(bucket, loc, locator);
+  } else {
+    locator.clear();
+  }
+}
+
+/// Truncate a bufferlist to a given length
+///
+/// \param[inout] bl The bufferlist to truncate
+/// \param[in] len The new size
+inline void
+truncate_bl(buffer::list& bl, std::size_t len)
+{
+  if (len < bl.length()) {
+    bl.splice(len, bl.length() - len);
+  }
+}
+
+/// Reserve a size and append to a bufferlist
+///
+/// \param[inout] bl The list to which we append
+/// \param[in] reserve The maximum that we will append
+/// \param[in] appender A function taking an iterator that it increments
+///                     and returns. The function *must not* append more
+///                     than was reserved.
+inline void
+append_bl(
+    buffer::list& bl,
+    std::size_t reserve,
+    std::invocable<char*> auto&& appender)
+requires std::is_same_v<std::invoke_result_t<decltype(appender), char*>, char*>
+{
+  auto orig_size = bl.length();
+  auto iter = bl.append_hole(reserve).c_str();
+  const auto start = iter;
+  iter = std::forward<decltype(appender)>(appender)(iter);
+  truncate_bl(bl, orig_size + (iter - start));
+}

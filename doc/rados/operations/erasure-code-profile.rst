@@ -25,6 +25,11 @@ same size as the data chunk, i.e. 1MB). The raw space overhead is only
 40% and the object will not be lost even if four OSDs break at the
 same time.
 
+.. warning:: In the Umbrella release, the SHEC and CLAY plugins are deprecated.
+   All Jerasure techniques, other than the default ``reed_sol_van`` technique,
+   are also deprecated. Support for these deprecated plugins and techniques
+   will be removed in the Vampire release.
+
 .. _list of available plugins:
 
 .. toctree::
@@ -67,7 +72,7 @@ Where:
 
 :Type: String
 :Required: No.
-:Default: jerasure
+:Default: isa
 
 ``{stripe_unit=stripe_unit}``
 
@@ -80,7 +85,9 @@ Where:
               ``osd_pool_erasure_code_stripe_unit`` when a pool is
               created.  The stripe_width of a pool using this profile
               will be the number of data chunks multiplied by this
-              stripe_unit.
+              stripe_unit. See :ref:`rados_ops_erasure_coding_optimizations`
+              for more information.
+
 
 :Type: String
 :Required: No.

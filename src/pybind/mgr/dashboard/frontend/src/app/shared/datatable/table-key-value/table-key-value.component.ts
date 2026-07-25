@@ -5,7 +5,9 @@ import {
   OnChanges,
   OnInit,
   Output,
-  ViewChild
+  TemplateRef,
+  ViewChild,
+  ViewEncapsulation
 } from '@angular/core';
 
 import _ from 'lodash';
@@ -31,11 +33,15 @@ interface KeyValueItem {
 @Component({
   selector: 'cd-table-key-value',
   templateUrl: './table-key-value.component.html',
-  styleUrls: ['./table-key-value.component.scss']
+  styleUrls: ['./table-key-value.component.scss'],
+  encapsulation: ViewEncapsulation.None,
+  standalone: false
 })
 export class TableKeyValueComponent implements OnInit, OnChanges {
   @ViewChild(TableComponent, { static: true })
   table: TableComponent;
+  @ViewChild('valueCellTpl', { static: true })
+  valueCellTpl: TemplateRef<any>;
 
   @Input()
   data: any;
@@ -50,6 +56,12 @@ export class TableKeyValueComponent implements OnInit, OnChanges {
   hideEmpty = false;
   @Input()
   hideKeys: string[] = []; // Keys of pairs not to be displayed
+  @Input()
+  showMultiLineText = false; // If true, the value field will use a template that supports multi line text
+  @Input()
+  multilineTextKeys: string[]; // If set, the value field will use a template that supports multi line text for this key
+  @Input()
+  preserveOrder = false;
 
   // If set, the classAddingTpl is used to enable different css for different values
   @Input()
@@ -80,6 +92,9 @@ export class TableKeyValueComponent implements OnInit, OnChanges {
     ];
     if (this.customCss) {
       this.columns[1].cellTransformation = CellTemplate.classAdding;
+    }
+    if (this.showMultiLineText) {
+      this.columns[1].cellTemplate = this.valueCellTpl;
     }
     // We need to subscribe the 'fetchData' event here and not in the
     // HTML template, otherwise the data table will display the loading
@@ -126,7 +141,8 @@ export class TableKeyValueComponent implements OnInit, OnChanges {
         return item;
       })
       .filter((i) => i.value !== null);
-    return _.sortBy(this.renderObjects ? this.insertFlattenObjects(result) : result, 'key');
+    const processed = this.renderObjects ? this.insertFlattenObjects(result) : result;
+    return this.preserveOrder ? processed : _.sortBy(processed, 'key');
   }
 
   private makePairsFromArray(data: any[]): KeyValueItem[] {

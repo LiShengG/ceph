@@ -5,7 +5,7 @@ import { forkJoin as observableForkJoin, Observable, Subscriber } from 'rxjs';
 import { RgwDaemonService } from '~/app/shared/api/rgw-daemon.service';
 import { RgwMultisiteService } from '~/app/shared/api/rgw-multisite.service';
 import { ListWithDetails } from '~/app/shared/classes/list-with-details.class';
-import { CriticalConfirmationModalComponent } from '~/app/shared/components/critical-confirmation-modal/critical-confirmation-modal.component';
+import { DeleteConfirmationModalComponent } from '~/app/shared/components/delete-confirmation-modal/delete-confirmation-modal.component';
 import { ActionLabelsI18n, URLVerbs } from '~/app/shared/constants/app.constants';
 import { TableComponent } from '~/app/shared/datatable/table/table.component';
 import { CellTemplate } from '~/app/shared/enum/cell-template.enum';
@@ -27,7 +27,8 @@ const BASE_URL = 'rgw/multisite/sync-policy';
   selector: 'cd-rgw-multisite-sync-policy',
   templateUrl: './rgw-multisite-sync-policy.component.html',
   styleUrls: ['./rgw-multisite-sync-policy.component.scss'],
-  providers: [{ provide: URLBuilderService, useValue: new URLBuilderService(BASE_URL) }]
+  providers: [{ provide: URLBuilderService, useValue: new URLBuilderService(BASE_URL) }],
+  standalone: false
 })
 export class RgwMultisiteSyncPolicyComponent extends ListWithDetails implements OnInit {
   @ViewChild(TableComponent, { static: true })
@@ -74,10 +75,10 @@ export class RgwMultisiteSyncPolicyComponent extends ListWithDetails implements 
         cellTransformation: CellTemplate.tooltip,
         customTemplateConfig: {
           map: {
-            Enabled: { class: 'badge-success', tooltip: 'sync is allowed and enabled' },
-            Allowed: { class: 'badge-info', tooltip: 'sync is allowed' },
+            Enabled: { class: 'tag-success', tooltip: 'sync is allowed and enabled' },
+            Allowed: { class: 'tag-info', tooltip: 'sync is allowed' },
             Forbidden: {
-              class: 'badge-warning',
+              class: 'tag-warning',
               tooltip:
                 'sync (as defined by this group) is not allowed and can override other groups'
             }
@@ -174,7 +175,7 @@ export class RgwMultisiteSyncPolicyComponent extends ListWithDetails implements 
 
   deleteAction() {
     const groupNames = this.selection.selected.map((policy: any) => policy.groupName);
-    this.modalService.show(CriticalConfirmationModalComponent, {
+    this.modalService.show(DeleteConfirmationModalComponent, {
       itemDescription: this.selection.hasSingleSelection
         ? $localize`Policy Group`
         : $localize`Policy Groups`,

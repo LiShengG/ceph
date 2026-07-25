@@ -55,6 +55,11 @@ if(LINUX)
   CHECK_INCLUDE_FILES("sched.h" HAVE_SCHED)
 endif()
 CHECK_INCLUDE_FILES("valgrind/helgrind.h" HAVE_VALGRIND_HELGRIND_H)
+CHECK_INCLUDE_FILES("openssl/engine.h" HAVE_OPENSSL_ENGINE_H)
+option(WITH_OPENSSL_ENGINE "Build with OpenSSL Engine Support")
+if(WITH_OPENSSL_ENGINE AND NOT HAVE_OPENSSL_ENGINE)
+  message(FATAL_ERROR "Can't find openssl/engine.h")
+endif()
 
 include(CheckTypeSize)
 set(CMAKE_EXTRA_INCLUDE_FILES "linux/types.h" "netinet/in.h")
@@ -145,6 +150,20 @@ else(NOT CMAKE_CROSSCOMPILING)
   message(STATUS "Assuming unaligned access is supported")
 endif(NOT CMAKE_CROSSCOMPILING)
 
+# Clang warns on deprecated specialization used in system
+# headers. but libstdc++-12 uses deprecated get_temporary_buffer<>
+# to implement templated stable_sort(), which is turn used by
+# googletest. see https://github.com/llvm/llvm-project/issues/76515
+# Let's detect it, so we can disable -Wdeprecated-declarations when
+# building googletest.
+cmake_push_check_state(RESET)
+set(CMAKE_REQUIRED_FLAGS "-Werror=deprecated-declarations")
+check_cxx_source_compiles("
+#include <algorithm>
+int main() { std::stable_sort((int *)0, (int*)0); }
+" COMPILER_IGNORES_DEPRECATED_DECL_IN_SYSTEM_HEADERS)
+cmake_pop_check_state()
+
 set(version_script_source "v1 { }; v2 { } v1;")
 file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/version_script.txt "${version_script_source}")
 cmake_push_check_state(RESET)
@@ -183,3 +202,12 @@ try_compile(HAVE_LINK_EXCLUDE_LIBS
   ${CMAKE_CURRENT_BINARY_DIR}
   SOURCES ${CMAKE_CURRENT_LIST_DIR}/CephCheck_link.c
   LINK_LIBRARIES "-Wl,--exclude-libs,ALL")
+
+# Mold linker applies --exclude-libs after version script processing,
+# which hides .symver-aliased symbols (e.g. rados_*) even when the
+# version script lists them as global.  Disable --exclude-libs for Mold;
+# version scripts already control symbol visibility.
+if(HAVE_LINK_EXCLUDE_LIBS AND USING_MOLD_LINKER)
+  message(STATUS "Mold linker -- disabling --exclude-libs (incompatible with .symver)")
+  set(HAVE_LINK_EXCLUDE_LIBS FALSE CACHE INTERNAL "" FORCE)
+endif()

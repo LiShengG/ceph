@@ -1,5 +1,5 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab ft=cpp
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab ft=cpp
 
 #pragma once
 
@@ -132,7 +132,7 @@ public:
 
   std::string get_marker(void *handle);
 
-  void dump_log_entry(cls_log_entry& entry, Formatter *f);
+  void dump_log_entry(cls::log::entry& entry, Formatter *f);
 
   void get_sections(std::list<std::string>& sections);
 

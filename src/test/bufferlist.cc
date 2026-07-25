@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph - scalable distributed file system
  *
@@ -45,6 +46,18 @@
 
 #define MAX_TEST 1000000
 #define FILENAME "bufferlist"
+
+#ifndef __has_feature
+#define __has_feature(x) 0
+#endif
+#if __has_feature(address_sanitizer) || defined(__SANITIZE_ADDRESS__)
+static constexpr bool bench_under_asan = true;
+#else
+static constexpr bool bench_under_asan = false;
+#endif
+static constexpr size_t asan_bench_rounds(size_t full) {
+  return bench_under_asan ? (full < 2 ? full : 2) : full;
+}
 
 using namespace std;
 
@@ -139,12 +152,13 @@ void bench_buffer_alloc(int size, int num)
 }
 
 TEST(Buffer, BenchAlloc) {
-  bench_buffer_alloc(16384, 1000000);
-  bench_buffer_alloc(4096, 1000000);
-  bench_buffer_alloc(1024, 1000000);
-  bench_buffer_alloc(256, 1000000);
-  bench_buffer_alloc(32, 1000000);
-  bench_buffer_alloc(4, 1000000);
+  const int n = asan_bench_rounds(1000000);
+  bench_buffer_alloc(16384, n);
+  bench_buffer_alloc(4096, n);
+  bench_buffer_alloc(1024, n);
+  bench_buffer_alloc(256, n);
+  bench_buffer_alloc(32, n);
+  bench_buffer_alloc(4, n);
 }
 
 TEST(BufferRaw, ostream) {
@@ -481,15 +495,44 @@ TEST(BufferPtr, cmp) {
   EXPECT_LE(1, af.cmp(acc));
 }
 
+TEST(BufferPtr, is_zero_fast) {
+  // there is no easy way to create `raw_zeros` instances outside
+  // of bufferlist, thus use list::append_zero() to instantiate
+  buffer::list zeroed_bl;
+  zeroed_bl.append_zero2(42);
+  {
+    const auto& zeroed_bptr = zeroed_bl.front();
+    EXPECT_TRUE(zeroed_bptr.is_zero());
+    EXPECT_TRUE(zeroed_bptr.is_zero_fast());
+  }
+  {
+    buffer::ptr sub_zeroed_bptr(zeroed_bl.front(), 0, 42/2);
+    EXPECT_TRUE(sub_zeroed_bptr.is_zero());
+    EXPECT_TRUE(sub_zeroed_bptr.is_zero_fast());
+  }
+  {
+    buffer::ptr zeroed_empty_bptr(zeroed_bl.front(), 0, 0);
+    EXPECT_TRUE(zeroed_empty_bptr.is_zero());
+    EXPECT_TRUE(zeroed_empty_bptr.is_zero_fast());
+  }
+}
+
 TEST(BufferPtr, is_zero) {
   char str[2] = { '\0', 'X' };
   {
     const bufferptr ptr(buffer::create_static(2, str));
     EXPECT_FALSE(ptr.is_zero());
+    EXPECT_FALSE(ptr.is_zero_fast());
   }
   {
     const bufferptr ptr(buffer::create_static(1, str));
     EXPECT_TRUE(ptr.is_zero());
+    EXPECT_FALSE(ptr.is_zero_fast());
+  }
+  {
+    const bufferptr ptr(buffer::create_static(0, str));
+    EXPECT_TRUE(ptr.is_zero());
+    EXPECT_FALSE(ptr.is_zero_fast());
   }
 }
 
@@ -514,7 +557,7 @@ TEST(BufferPtr, copy_out_bench) {
   for (int s=1; s<=8; s*=2) {
     utime_t start = ceph_clock_now();
     int buflen = 1048576;
-    int count = 1000;
+    int count = asan_bench_rounds(1000);
     uint64_t v;
     for (int i=0; i<count; ++i) {
       bufferptr bp(buflen);
@@ -553,7 +596,7 @@ TEST(BufferPtr, copy_in_bench) {
   for (int s=1; s<=8; s*=2) {
     utime_t start = ceph_clock_now();
     int buflen = 1048576;
-    int count = 1000;
+    int count = asan_bench_rounds(1000);
     for (int i=0; i<count; ++i) {
       bufferptr bp(buflen);
       for (int64_t j=0; j<buflen; j += s) {
@@ -597,7 +640,7 @@ TEST(BufferPtr, append_bench) {
   for (int s=4; s<=16384; s*=4) {
     utime_t start = ceph_clock_now();
     int buflen = 1048576;
-    int count = 4000;
+    int count = asan_bench_rounds(4000);
     for (int i=0; i<count; ++i) {
       bufferptr bp(buflen);
       bp.set_length(0);
@@ -793,7 +836,7 @@ static void bench_bufferlistiter_deref(const size_t step,
 
   utime_t start = ceph_clock_now();
   bufferlist::iterator iter = bl.begin();
-  while (iter != bl.end()) {
+  while (iter.get_remaining() >= step) {
     iter += step;
   }
   utime_t end = ceph_clock_now();
@@ -803,15 +846,15 @@ static void bench_bufferlistiter_deref(const size_t step,
 }
 
 TEST(BufferListIterator, BenchDeref) {
-  bench_bufferlistiter_deref(1, 1, 4096000);
-  bench_bufferlistiter_deref(1, 10, 409600);
-  bench_bufferlistiter_deref(1, 100, 40960);
-  bench_bufferlistiter_deref(1, 1000, 4096);
+  bench_bufferlistiter_deref(1, 1, asan_bench_rounds(4096000));
+  bench_bufferlistiter_deref(1, 10, asan_bench_rounds(409600));
+  bench_bufferlistiter_deref(1, 100, asan_bench_rounds(40960));
+  bench_bufferlistiter_deref(1, 1000, asan_bench_rounds(4096));
 
-  bench_bufferlistiter_deref(4, 1, 1024000);
-  bench_bufferlistiter_deref(4, 10, 102400);
-  bench_bufferlistiter_deref(4, 100, 10240);
-  bench_bufferlistiter_deref(4, 1000, 1024);
+  bench_bufferlistiter_deref(4, 1, asan_bench_rounds(1024000));
+  bench_bufferlistiter_deref(4, 10, asan_bench_rounds(102400));
+  bench_bufferlistiter_deref(4, 100, asan_bench_rounds(10240));
+  bench_bufferlistiter_deref(4, 1000, asan_bench_rounds(1024));
 }
 
 TEST(BufferListIterator, advance) {
@@ -1326,17 +1369,18 @@ void bench_bufferlist_alloc(int size, int num, int per)
 }
 
 TEST(BufferList, BenchAlloc) {
-  bench_bufferlist_alloc(32768, 100000, 16);
-  bench_bufferlist_alloc(25000, 100000, 16);
-  bench_bufferlist_alloc(16384, 100000, 16);
-  bench_bufferlist_alloc(10000, 100000, 16);
-  bench_bufferlist_alloc(8192, 100000, 16);
-  bench_bufferlist_alloc(6000, 100000, 16);
-  bench_bufferlist_alloc(4096, 100000, 16);
-  bench_bufferlist_alloc(1024, 100000, 16);
-  bench_bufferlist_alloc(256, 100000, 16);
-  bench_bufferlist_alloc(32, 100000, 16);
-  bench_bufferlist_alloc(4, 100000, 16);
+  const int n = asan_bench_rounds(100000);
+  bench_bufferlist_alloc(32768, n, 16);
+  bench_bufferlist_alloc(25000, n, 16);
+  bench_bufferlist_alloc(16384, n, 16);
+  bench_bufferlist_alloc(10000, n, 16);
+  bench_bufferlist_alloc(8192, n, 16);
+  bench_bufferlist_alloc(6000, n, 16);
+  bench_bufferlist_alloc(4096, n, 16);
+  bench_bufferlist_alloc(1024, n, 16);
+  bench_bufferlist_alloc(256, n, 16);
+  bench_bufferlist_alloc(32, n, 16);
+  bench_bufferlist_alloc(4, n, 16);
 }
 
 /*
@@ -1361,7 +1405,7 @@ TEST(BufferList, append_bench_with_size_hint) {
   for (size_t step = 4; step <= 16384; step *= 4) {
     const utime_t start = ceph_clock_now();
 
-    constexpr size_t rounds = 4000;
+    constexpr size_t rounds = asan_bench_rounds(4000);
     for (size_t r = 0; r < rounds; ++r) {
       ceph::bufferlist bl(std::size(src));
       for (auto iter = std::begin(src);
@@ -1378,7 +1422,7 @@ TEST(BufferList, append_bench_with_size_hint) {
 
 TEST(BufferList, append_bench_with_size_hint2) {
   std::array<char, 1048576> src = { 0, };
-  constexpr size_t rounds = 4000;
+  constexpr size_t rounds = asan_bench_rounds(4000);
   constexpr int conc_bl = 400;
   std::vector<ceph::bufferlist*> bls(conc_bl);
 
@@ -1409,7 +1453,7 @@ TEST(BufferList, append_bench) {
   std::array<char, 1048576> src = { 0, };
   for (size_t step = 4; step <= 16384; step *= 4) {
     const utime_t start = ceph_clock_now();
-    constexpr size_t rounds = 4000;
+    constexpr size_t rounds = asan_bench_rounds(4000);
     for (size_t r = 0; r < rounds; ++r) {
       ceph::bufferlist bl;
       for (auto iter = std::begin(src);
@@ -1426,7 +1470,7 @@ TEST(BufferList, append_bench) {
 
 TEST(BufferList, append_bench2) {
   std::array<char, 1048576> src = { 0, };
-  constexpr size_t rounds = 4000;
+  constexpr size_t rounds = asan_bench_rounds(4000);
   constexpr int conc_bl = 400;
   std::vector<ceph::bufferlist*> bls(conc_bl);
 
@@ -1458,7 +1502,7 @@ TEST(BufferList, append_hole_bench) {
 
   for (size_t step = 512; step <= 65536; step *= 2) {
     const utime_t start = ceph_clock_now();
-    constexpr size_t rounds = 80000;
+    constexpr size_t rounds = asan_bench_rounds(80000);
     for (size_t r = 0; r < rounds; ++r) {
       ceph::bufferlist bl;
       while (bl.length() < targeted_bl_size) {
@@ -1473,7 +1517,7 @@ TEST(BufferList, append_hole_bench) {
 
 TEST(BufferList, append_hole_bench2) {
   constexpr size_t targeted_bl_size = 1048576;
-  constexpr size_t rounds = 80000;
+  constexpr size_t rounds = asan_bench_rounds(80000);
   constexpr int conc_bl = 400;
   std::vector<ceph::bufferlist*> bls(conc_bl);
 
@@ -1622,7 +1666,7 @@ TEST(BufferList, contents_equal) {
 }
 
 TEST(BufferList, is_aligned) {
-  const int SIMD_ALIGN = 32;
+  const int SIMD_ALIGN = 64;
   {
     bufferlist bl;
     EXPECT_TRUE(bl.is_aligned(SIMD_ALIGN));
@@ -1650,7 +1694,7 @@ TEST(BufferList, is_aligned) {
 }
 
 TEST(BufferList, is_n_align_sized) {
-  const int SIMD_ALIGN = 32;
+  const int SIMD_ALIGN = 64;
   {
     bufferlist bl;
     EXPECT_TRUE(bl.is_n_align_sized(SIMD_ALIGN));
@@ -1794,7 +1838,7 @@ TEST(BufferList, page_aligned_appender) {
 }
 
 TEST(BufferList, rebuild_aligned_size_and_memory) {
-  const unsigned SIMD_ALIGN = 32;
+  const unsigned SIMD_ALIGN = 64;
   const unsigned BUFFER_SIZE = 67;
 
   bufferlist bl;
@@ -1837,6 +1881,9 @@ TEST(BufferList, rebuild_aligned_size_and_memory) {
   EXPECT_TRUE(bl.is_aligned(SIMD_ALIGN));
   EXPECT_TRUE(bl.is_n_align_sized(BUFFER_SIZE));
   EXPECT_EQ(3U, bl.get_num_buffers());
+
+  bl.rebuild_aligned_size_and_memory(BUFFER_SIZE, SIMD_ALIGN, 1);
+  EXPECT_EQ(1U, bl.get_num_buffers());
 
   {
     /* bug replicator, to test rebuild_aligned_size_and_memory() in the
@@ -3020,7 +3067,7 @@ TEST(BufferList, TestIsProvidedBuffer) {
   ASSERT_FALSE(bl.is_provided_buffer(buff));
 }
 
-TEST(BufferList, DISABLED_DanglingLastP) {
+TEST(BufferList, DanglingLastP) {
   bufferlist bl;
   {
     // previously we're using the unsharable buffer type to distinguish
@@ -3050,6 +3097,17 @@ TEST(BufferList, DISABLED_DanglingLastP) {
   // Otherwise `bl::copy_in` will call `seek()` and refresh `last_p`.
   bl.begin(2).copy_in(1, "C");
   EXPECT_EQ(0, ::memcmp("12C", bl.c_str(), 3));
+}
+
+TEST(BufferList, size) {
+ buffer::list bl;
+ EXPECT_EQ(bl.size(), bl.length());
+
+ bl.append("12345"); 
+ EXPECT_EQ(bl.size(), bl.length());
+
+ bl.clear();
+ EXPECT_EQ(bl.size(), bl.length());
 }
 
 TEST(BufferHash, all) {

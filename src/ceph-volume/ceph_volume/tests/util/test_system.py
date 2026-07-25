@@ -4,7 +4,7 @@ import getpass
 import pytest
 from textwrap import dedent
 from ceph_volume.util import system
-from mock.mock import patch
+from unittest.mock import patch
 from ceph_volume.tests.conftest import Factory
 
 
@@ -207,6 +207,16 @@ class TestGetFileContents(object):
         interesting_file = fake_filesystem.create_file('/tmp/fake-file', contents="0\n1")
         result = system.get_file_contents(interesting_file.path)
         assert result == "0\n1"
+
+    def test_path_empty_returns_default(self, fake_filesystem):
+        interesting_file = fake_filesystem.create_file('/tmp/fake-file', contents="")
+        result = system.get_file_contents(interesting_file.path, 'default')
+        assert result == 'default'
+
+    def test_path_whitespace_returns_default(self, fake_filesystem):
+        interesting_file = fake_filesystem.create_file('/tmp/fake-file', contents="   \n\t")
+        result = system.get_file_contents(interesting_file.path, 'default')
+        assert result == 'default'
 
     def test_exception_returns_default(self):
         with patch('builtins.open') as mocked_open:

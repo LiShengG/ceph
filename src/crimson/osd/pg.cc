@@ -1,5 +1,5 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
-// vim: ts=8 sw=2 smarttab expandtab
+// vim: ts=8 sw=2 sts=2 expandtab expandtab
 
 #include "pg.h"
 
@@ -35,8 +35,9 @@
 #include "crimson/common/log.h"
 #include "crimson/net/Connection.h"
 #include "crimson/net/Messenger.h"
-#include "crimson/os/cyanstore/cyan_store.h"
 #include "crimson/os/futurized_collection.h"
+#include "crimson/osd/ec_backend.h"
+#include "crimson/osd/ec_recovery_backend.h"
 #include "crimson/osd/exceptions.h"
 #include "crimson/osd/pg_meta.h"
 #include "crimson/osd/pg_backend.h"
@@ -95,6 +96,7 @@ public:
 PG::PG(
   spg_t pgid,
   pg_shard_t pg_shard,
+  store_index_t store_index,
   crimson::os::CollectionRef coll_ref,
   pg_pool_t&& pool,
   std::string&& name,
@@ -104,6 +106,7 @@ PG::PG(
   : pgid{pgid},
     pg_whoami{pg_shard},
     coll_ref{coll_ref},
+    store_index{store_index},
     pgmeta_oid{pgid.make_pgmeta_oid()},
     osdmap_gate("PG::osdmap_gate"),
     shard_services{shard_services},
@@ -116,10 +119,15 @@ PG::PG(
 	coll_ref,
 	shard_services,
 	profile,
+	*this,
 	*this)),
     recovery_backend(
-      std::make_unique<ReplicatedRecoveryBackend>(
-	*this, shard_services, coll_ref, backend.get())),
+       RecoveryBackend::create(
+	pool,
+	*this,
+        shard_services,
+        coll_ref,
+        backend.get())),
     recovery_handler(
       std::make_unique<PGRecovery>(this)),
     peering_state(
@@ -143,7 +151,7 @@ PG::PG(
       *backend.get(),
       *this},
     osdriver(
-      &shard_services.get_store(),
+      shard_services.get_store(store_index),
       coll_ref,
       pgid.make_snapmapper_oid()),
     snap_mapper(
@@ -184,11 +192,12 @@ void PG::check_blocklisted_watchers()
 
 bool PG::try_flush_or_schedule_async() {
   logger().debug("PG::try_flush_or_schedule_async: flush ...");
-  (void)shard_services.get_store().flush(
-    coll_ref
+  (void)crimson::os::with_store_do_transaction(
+    shard_services.get_store(store_index),
+    coll_ref, ceph::os::Transaction{}
   ).then(
     [this, epoch=get_osdmap_epoch()]() {
-      return shard_services.start_operation<LocalPeeringEvent>(
+    return shard_services.start_operation<LocalPeeringEvent>(
 	this,
 	pg_whoami,
 	pgid,
@@ -284,7 +293,7 @@ PG::interruptible_future<> PG::find_unfound(epoch_t epoch_started)
         PeeringState::UnfoundRecovery());
     }
   }
-  return get_shard_services().dispatch_context(get_collection_ref(), std::move(rctx));
+  return get_shard_services().dispatch_context(store_index, get_collection_ref(), std::move(rctx));
 }
 
 void PG::recheck_readable()
@@ -480,37 +489,58 @@ void PG::prepare_write(pg_info_t &info,
 std::pair<ghobject_t, bool>
 PG::do_delete_work(ceph::os::Transaction &t, ghobject_t _next)
 {
-  logger().info("removing pg {}", pgid);
+  LOG_PREFIX(PG::do_delete_work);
+  DEBUGDPP("removing pg {}", *this, pgid);
   auto fut = interruptor::make_interruptible(
-    shard_services.get_store().list_objects(
+    crimson::os::with_store<&crimson::os::FuturizedStore::Shard::list_objects>(
+      shard_services.get_store(store_index),
       coll_ref,
       _next,
       ghobject_t::get_max(),
-      local_conf()->osd_target_transaction_size));
+      local_conf()->osd_target_transaction_size,
+      0));
 
   auto [objs_to_rm, next] = fut.get();
   if (objs_to_rm.empty()) {
-    logger().info("all objs removed, removing coll for {}", pgid);
+    DEBUGDPP("all objs removed, removing coll for {}", *this, pgid);
     t.remove(coll_ref->get_cid(), pgid.make_snapmapper_oid());
     t.remove(coll_ref->get_cid(), pgmeta_oid);
     t.remove_collection(coll_ref->get_cid());
-    (void) shard_services.get_store().do_transaction(
-      coll_ref, t.claim_and_reset()).then([this] {
+    /*
+     * Mark the PG as fully deleted *before* dispatching the final
+     * RMCOLL transaction.  A PGAdvanceMap may already have been queued
+     * (with a Ref<PG>) by an earlier broadcast_map_to_pgs while this
+     * PG was still in pg_map, and is now sitting behind these
+     * DeleteSome events on the peering pipeline.  Setting the deleted
+     * flag now lets that queued PGAdvanceMap detect the situation and
+     * skip itself instead of issuing ops on a collection that is
+     * about to disappear.
+     */
+    peering_state.set_delete_complete();
+    (void) crimson::os::with_store_do_transaction(
+      shard_services.get_store(store_index),
+      coll_ref,
+      t.claim_and_reset()).then([this] {
       return shard_services.remove_pg(pgid);
     });
     return {next, false};
   } else {
+    DEBUGDPP("pg {}, removing {} objects in this batch",
+        *this, pgid, objs_to_rm.size());
     for (auto &obj : objs_to_rm) {
       if (obj == pgmeta_oid || obj.is_internal_pg_local()) {
         continue;
       }
-      logger().trace("pg {}, removing obj {}", pgid, obj);
+      if (obj.is_pgmeta()) {
+	WARNDPP("pg {} found stray pgmeta-like {} during PG removal", *this, pgid, obj);
+      }
+      TRACEDPP("pg {}, removing obj {}", *this, pgid, obj);
       t.remove(coll_ref->get_cid(), obj);
     }
     t.register_on_commit(
-      new LambdaContext([this](int r) {
+      new LambdaContext([this, FNAME](int r) {
       ceph_assert(r == 0);
-      logger().trace("triggering more pg delete {}", pgid);
+      DEBUGDPP("triggering more pg delete {}", *this, pgid);
       (void) shard_services.start_operation<LocalPeeringEvent>(
         this,
         pg_whoami,
@@ -539,11 +569,13 @@ seastar::future<> PG::clear_temp_objects()
   ceph::os::Transaction t;
   auto max_size = local_conf()->osd_target_transaction_size;
   while(true) {
-    auto [objs, next] = co_await shard_services.get_store().list_objects(
-      coll_ref, _next, ghobject_t::get_max(), max_size);
+    auto [objs, next] = co_await crimson::os::with_store<&crimson::os::FuturizedStore::Shard::list_objects>(
+      shard_services.get_store(store_index),
+      coll_ref, _next, ghobject_t::get_max(), max_size, 0);
     if (objs.empty()) {
       if (!t.empty()) {
-        co_await shard_services.get_store().do_transaction(
+        co_await crimson::os::with_store_do_transaction(
+          shard_services.get_store(store_index),
           coll_ref, std::move(t));
       }
       break;
@@ -555,7 +587,8 @@ seastar::future<> PG::clear_temp_objects()
     }
     _next = next;
     if (t.get_num_ops() >= max_size) {
-      co_await shard_services.get_store().do_transaction(
+      co_await crimson::os::with_store_do_transaction(
+        shard_services.get_store(store_index),
         coll_ref, t.claim_and_reset());
     }
   }
@@ -593,6 +626,12 @@ PG::interruptible_future<seastar::stop_iteration> PG::trim_snap(
 
 void PG::on_active_actmap()
 {
+  logger().debug("{}: {}", *this, __func__);
+  initiate_snap_trim();
+}
+
+void PG::initiate_snap_trim()
+{
   logger().debug("{}: {} snap_trimq={}", *this, __func__, snap_trimq);
   peering_state.state_clear(PG_STATE_SNAPTRIM_ERROR);
   if (peering_state.is_active() && peering_state.is_clean()) {
@@ -600,7 +639,16 @@ void PG::on_active_actmap()
       logger().debug("{}: {} already trimming.", *this, __func__);
       return;
     }
-    // loops until snap_trimq is empty or SNAPTRIM_ERROR.
+    // Temporary: defer snap trimming while scrubbing, until the full scrub
+    // scheduling code (including is_scrub_queued_or_active()) is merged.
+    // (mark https://tracker.ceph.com/issues/76428 as solved once fixed).
+    if (peering_state.state_test(PG_STATE_SCRUBBING)) {
+      logger().info("{}: {} scrubbing, deferring snap trim", *this, __func__);
+      return;
+    }
+    if (snap_trimq.empty()) {
+      return;
+    }
     Ref<PG> pg_ref = this;
     std::ignore = interruptor::with_interruption([this] {
       return interruptor::repeat(
@@ -617,7 +665,7 @@ void PG::on_active_actmap()
           return trim_snap(to_trim, needs_pause);
         }
       ).then_interruptible([this] {
-        logger().debug("{}: PG::on_active_actmap() finished trimming",
+        logger().debug("{}: PG::initiate_snap_trim() finished trimming",
                        *this);
         peering_state.state_clear(PG_STATE_SNAPTRIM);
         peering_state.state_clear(PG_STATE_SNAPTRIM_ERROR);
@@ -625,13 +673,22 @@ void PG::on_active_actmap()
       });
     }, [this](std::exception_ptr eptr) {
       logger().debug("{}: snap trimming interrupted", *this);
-      ceph_assert(!peering_state.state_test(PG_STATE_SNAPTRIM));
     }, pg_ref, pg_ref->get_osdmap_epoch()).finally([pg_ref, this] {
       publish_stats_to_osd();
     });
   } else {
-    logger().debug("{}: pg not clean, skipping snap trim");
+    logger().debug("pg not clean, skipping snap trim");
     ceph_assert(!peering_state.state_test(PG_STATE_SNAPTRIM));
+  }
+}
+
+void PG::kick_snap_trim()
+{
+  if (peering_state.is_active() && peering_state.is_clean()
+      && !snap_trimq.empty()
+      && !peering_state.state_test(PG_STATE_SNAPTRIM)) {
+    logger().info("{}: scrub complete, retriggering snap trim", *this);
+    (void) shard_services.start_operation<SnapTrimInitiate>(this);
   }
 }
 
@@ -640,7 +697,7 @@ void PG::on_active_advmap(const OSDMapRef &osdmap)
   const auto new_removed_snaps = osdmap->get_new_removed_snaps();
   if (auto it = new_removed_snaps.find(get_pgid().pool());
       it != new_removed_snaps.end()) {
-    bool bad = false;
+    [[maybe_unused]] bool bad = false;
     for (auto j : it->second) {
       if (snap_trimq.intersects(j.first, j.second)) {
 	decltype(snap_trimq) added, overlap;
@@ -657,6 +714,69 @@ void PG::on_active_advmap(const OSDMapRef &osdmap)
     logger().info("{}: {} new removed snaps {}, snap_trimq now{}",
                   *this, __func__, it->second, snap_trimq);
     assert(!bad || !local_conf().get_val<bool>("osd_debug_verify_cached_snaps"));
+  }
+}
+
+PG::interruptible_future<bool> PG::do_recover_missing(
+  const hobject_t& soid,
+  const osd_reqid_t& reqid)
+{
+  LOG_PREFIX(PG::do_recover_missing);
+  DEBUGDPP(
+    "reqid {} check for recovery, {}",
+    *this, reqid, soid);
+  assert(is_primary());
+  eversion_t ver;
+  auto &missing_loc = peering_state.get_missing_loc();
+  bool needs_recovery_or_backfill = false;
+
+  if (is_unreadable_object(soid)) {
+    DEBUGDPP(
+      "reqid {}, {} is unreadable",
+      *this, reqid, soid);
+    ceph_assert(missing_loc.needs_recovery(soid, &ver));
+    needs_recovery_or_backfill = true;
+  }
+
+  if (is_degraded_or_backfilling_object(soid)) {
+    DEBUGDPP(
+      "reqid {}, {} is degraded or backfilling",
+      *this, reqid, soid);
+    if (missing_loc.needs_recovery(soid, &ver)) {
+      needs_recovery_or_backfill = true;
+    }
+  }
+
+  if (!needs_recovery_or_backfill) {
+    DEBUGDPP(
+      "reqid {} nothing to recover {}",
+      *this, reqid, soid);
+    co_return false;
+  }
+
+  if (peering_state.get_missing_loc().is_unfound(soid)) {
+    co_return true;
+  }
+  DEBUGDPP(
+    "reqid {} need to wait for recovery, {} version {}",
+    *this, reqid, soid, ver);
+  if (recovery_backend->is_recovering(soid)) {
+    DEBUGDPP(
+      "reqid {} object {} version {}, already recovering",
+      *this, reqid, soid, ver);
+    co_await PG::interruptor::make_interruptible(
+      recovery_backend->get_recovering(
+	soid).wait_for_recovered());
+    co_return false;
+  } else {
+    DEBUGDPP(
+      "reqid {} object {} version {}, starting recovery",
+      *this, reqid, soid, ver);
+    auto [op, fut] =
+      shard_services.start_operation<UrgentRecovery>(
+        soid, ver, this, shard_services, get_osdmap_epoch());
+    co_await PG::interruptor::make_interruptible(std::move(fut));
+    co_return false;
   }
 }
 
@@ -723,25 +843,27 @@ seastar::future<> PG::init(
     role, newup, new_up_primary, newacting,
     new_acting_primary, history, pi, t);
   assert(coll_ref);
-  return shard_services.get_store().exists(
-    get_collection_ref(), pgid.make_snapmapper_oid()
+  return crimson::os::with_store<&crimson::os::FuturizedStore::Shard::exists>(
+    shard_services.get_store(store_index),
+    get_collection_ref(), pgid.make_snapmapper_oid(), 0
   ).safe_then([&t, this](bool existed) {
-      if (!existed) {
-        t.touch(coll_ref->get_cid(), pgid.make_snapmapper_oid());
-      }
-    },
-    ::crimson::ct_error::assert_all{"unexpected eio"}
-  );
+    if (!existed) {
+      t.touch(coll_ref->get_cid(), pgid.make_snapmapper_oid());
+    }
+  },
+  ::crimson::ct_error::assert_all(
+    "{} {} unexpected eio", std::cref(*this), __func__)
+);
 }
 
-seastar::future<> PG::read_state(crimson::os::FuturizedStore::Shard* store)
+seastar::future<> PG::read_state(crimson::os::BackendStore store)
 {
   if (__builtin_expect(stopping, false)) {
     return seastar::make_exception_future<>(
 	crimson::common::system_shutdown_exception());
   }
 
-  return seastar::do_with(PGMeta(*store, pgid), [] (auto& pg_meta) {
+  return seastar::do_with(PGMeta(store, pgid), [] (auto& pg_meta) {
     return pg_meta.load();
   }).then([this, store](auto&& ret) {
     auto [pg_info, past_intervals] = std::move(ret);
@@ -750,7 +872,7 @@ seastar::future<> PG::read_state(crimson::os::FuturizedStore::Shard* store)
 	std::move(past_intervals),
 	[this, store] (PGLog &pglog) {
 	  return pglog.read_log_and_missing_crimson(
-	    *store,
+	    store,
 	    coll_ref,
 	    peering_state.get_info(),
 	    pgmeta_oid);
@@ -780,7 +902,8 @@ seastar::future<> PG::read_state(crimson::os::FuturizedStore::Shard* store)
     return seastar::now();
   }).then([this, store]() {
     logger().debug("{} setting collection options", __func__);
-    return store->set_collection_opts(
+    return crimson::os::with_store<&crimson::os::FuturizedStore::Shard::set_collection_opts>(
+          store,
           coll_ref,
           get_pgpool().info.opts);
   });
@@ -833,7 +956,8 @@ void PG::handle_initialize(PeeringCtx &rctx)
 
 void PG::init_collection_pool_opts()
 {
-  std::ignore = shard_services.get_store().set_collection_opts(coll_ref, get_pgpool().info.opts);
+  std::ignore = crimson::os::with_store<&crimson::os::FuturizedStore::Shard::set_collection_opts>(
+    shard_services.get_store(store_index), coll_ref, get_pgpool().info.opts);
 }
 
 void PG::on_pool_change()
@@ -879,9 +1003,18 @@ void PG::enqueue_push_for_backfill(
   backfill_state->enqueue_standalone_push(obj, v, peers);
 }
 
-PG::interruptible_future<
-  std::tuple<PG::interruptible_future<>,
-             PG::interruptible_future<>>>
+void PG::enqueue_delete_for_backfill(
+  const hobject_t &obj,
+  const eversion_t &v,
+  const std::vector<pg_shard_t> &peers)
+{
+  assert(recovery_handler);
+  assert(recovery_handler->backfill_state);
+  auto backfill_state = recovery_handler->backfill_state.get();
+  backfill_state->enqueue_standalone_delete(obj, v, peers);
+}
+
+PG::interruptible_future<PG::rep_op_fut_t>
 PG::submit_transaction(
   ObjectContextRef&& obc,
   ObjectContextRef&& new_clone,
@@ -912,25 +1045,17 @@ PG::submit_transaction(
 
   auto [submitted, all_completed] = co_await backend->submit_transaction(
       peering_state.get_acting_recovery_backfill(),
-      obc->obs.oi.soid,
+      std::move(obc),
       std::move(new_clone),
       std::move(txn),
       std::move(osd_op_p),
       peering_state.get_last_peering_reset(),
       map_epoch,
-      std::move(log_entries));
+      std::move(log_entries),
+      get_log());
   co_return std::make_tuple(
     std::move(submitted),
-    all_completed.then_interruptible(
-      [this, last_complete=peering_state.get_info().last_complete, at_version]
-      (auto acked) {
-      for (const auto& peer : acked) {
-        peering_state.update_peer_last_complete_ondisk(
-          peer.shard, peer.last_complete_ondisk);
-      }
-      peering_state.complete_write(at_version, last_complete);
-      return seastar::now();
-    })
+    std::move(all_completed)
   );
 }
 
@@ -956,12 +1081,12 @@ PG::BackgroundProcessLock::lock() noexcept
 }
 
 // We may need to rollback the ObjectContext on failed op execution.
-// Copy the current obc before mutating it in order to recover on failures.
-ObjectContextRef duplicate_obc(const ObjectContextRef &obc) {
-  ObjectContextRef object_context = new ObjectContext(obc->obs.oi.soid);
-  object_context->obs = obc->obs;
-  object_context->ssc = new SnapSetContext(*obc->ssc);
-  return object_context;
+// Copy the current obc data before mutating it in order to recover on failures.
+std::pair<ObjectState, SnapSetContextRef>
+duplicate_obc_data(const ObjectContextRef &obc) {
+  ObjectState os = obc->obs;
+  SnapSetContextRef ssc = new SnapSetContext(*obc->ssc);
+  return {os, ssc};
 }
 
 PG::interruptible_future<> PG::complete_error_log(const ceph_tid_t& rep_tid,
@@ -1000,12 +1125,12 @@ PG::interruptible_future<eversion_t> PG::submit_error_log(
   const std::error_code e,
   ceph_tid_t rep_tid)
 {
-  // as with submit_executer, need to ensure that log numbering and submission
-  // are atomic
-  co_await interruptor::make_interruptible(submit_lock.lock());
   auto unlocker = seastar::defer([this] {
     submit_lock.unlock();
   });
+  // as with submit_executer, need to ensure that log numbering and submission
+  // are atomic
+  co_await interruptor::make_interruptible(submit_lock.lock());
   LOG_PREFIX(PG::submit_error_log);
   DEBUGDPP("{} rep_tid: {} error: {}",
 	   *this, *m, rep_tid, e);
@@ -1029,8 +1154,26 @@ PG::interruptible_future<eversion_t> PG::submit_error_log(
     log_entries, t, peering_state.get_pg_trim_to(),
     peering_state.get_pg_committed_to());
 
-
   set<pg_shard_t> waiting_on;
+
+  waiting_on.insert(pg_whoami);
+
+  // preapre log_entry_update_waiting_on prior to sending requests
+  for (const auto &peer: get_acting_recovery_backfill()) {
+    if (peer == pg_whoami) {
+      continue;
+    }
+    ceph_assert(peering_state.get_peer_missing().count(peer));
+    ceph_assert(peering_state.has_peer_info(peer));
+    waiting_on.insert(peer);
+  }
+
+  DEBUGDPP("inserting rep_tid {} waiting on {}", *this, rep_tid, waiting_on);
+  log_entry_update_waiting_on.insert(
+    std::make_pair(rep_tid,
+                   log_update_t{std::move(waiting_on)}));
+
+  // Send missing_requests to peers
   for (const auto &peer: get_acting_recovery_backfill()) {
     if (peer == pg_whoami) {
       continue;
@@ -1046,7 +1189,6 @@ PG::interruptible_future<eversion_t> PG::submit_error_log(
       rep_tid,
       peering_state.get_pg_trim_to(),
       peering_state.get_pg_committed_to());
-    waiting_on.insert(peer);
 
     DEBUGDPP("sending log missing_request (rep_tid: {} entries: {}) to osd {}",
 	     *this, rep_tid, log_entries, peer.osd);
@@ -1056,13 +1198,10 @@ PG::interruptible_future<eversion_t> PG::submit_error_log(
 	std::move(log_m),
 	get_osdmap_epoch()));
   }
-  waiting_on.insert(pg_whoami);
-  DEBUGDPP("inserting rep_tid {}", *this, rep_tid);
-  log_entry_update_waiting_on.insert(
-    std::make_pair(rep_tid,
-		   log_update_t{std::move(waiting_on)}));
+
   co_await interruptor::make_interruptible(
-    shard_services.get_store().do_transaction(
+    crimson::os::with_store_do_transaction(
+      shard_services.get_store(store_index),
       get_collection_ref(), std::move(t)
     ));
 
@@ -1078,8 +1217,19 @@ PG::run_executer_fut PG::run_executer(
 {
   LOG_PREFIX(PG::run_executer);
   auto rollbacker = ox.create_rollbacker(
-    [stored_obc=duplicate_obc(obc)](auto &obc) mutable {
-      obc->update_from(*stored_obc);
+    [FNAME, obc_data = duplicate_obc_data(obc), &ox, this](auto &obc) mutable {
+      // First, revert the OBC state
+      obc->update_from(obc_data);
+      // Then clean up any prepared clone OBCs
+      if (ox.has_cloning_ctx()) {
+        const auto coid = ox.get_cloning_coid();
+        DEBUGDPP("cleaning up clone OBC for {} reqid={}",
+        FNAME, coid, ox.get_message().get_reqid());
+        // Use single-key clear by passing [coid, coid] to avoid impacting other clones
+        this->obc_registry.clear_range(coid, coid);
+        // Reset the cloning context directly
+        ox.reset_cloning_ctx();
+      }
     });
   auto rollback_on_error = seastar::defer([&rollbacker] {
     rollbacker.rollback_obc_if_modified();
@@ -1125,12 +1275,12 @@ PG::submit_executer_fut PG::submit_executer(
   LOG_PREFIX(PG::submit_executer);
   DEBUGDPP("", *this);
 
-  // we need to build the pg log entries and submit the transaction
-  // atomically to ensure log ordering
-  co_await interruptor::make_interruptible(submit_lock.lock());
   auto unlocker = seastar::defer([this] {
     submit_lock.unlock();
   });
+  // we need to build the pg log entries and submit the transaction
+  // atomically to ensure log ordering
+  co_await interruptor::make_interruptible(submit_lock.lock());
 
   auto [submitted, completed] = co_await std::move(
     ox
@@ -1198,7 +1348,8 @@ void PG::check_blocklisted_obc_watchers(
       auto watch = crimson::osd::Watch::create(
         obc, winfo, src.second, this);
       watch->disconnect();
-      auto [it, emplaced] = obc->watchers.emplace(src, std::move(watch));
+      [[maybe_unused]] auto [it, emplaced] =
+        obc->watchers.emplace(src, std::move(watch));
       assert(emplaced);
       logger().debug("added watch for obj {}, client {}",
         obc->get_oid(), src.second);
@@ -1215,17 +1366,16 @@ void PG::update_stats(const pg_stat_t &stat) {
   );
 }
 
-PG::interruptible_future<> PG::handle_rep_op(Ref<MOSDRepOp> req)
+PG::handle_rep_op_fut PG::handle_rep_op(Ref<MOSDRepOp> req)
 {
   LOG_PREFIX(PG::handle_rep_op);
   DEBUGDPP("{}", *this, *req);
-  if (can_discard_replica_op(*req)) {
-    co_return;
-  }
 
   ceph::os::Transaction txn;
-  auto encoded_txn = req->get_data().cbegin();
-  decode(txn, encoded_txn);
+  auto encoded_txn_p = req->get_middle().cbegin();
+  auto encoded_txn_d = req->get_data().cbegin();
+  txn.decode(req->get_middle().length() != 0 ? encoded_txn_p : encoded_txn_d,
+             encoded_txn_d);
   auto p = req->logbl.cbegin();
   std::vector<pg_log_entry_t> log_entries;
   decode(log_entries, p);
@@ -1236,6 +1386,7 @@ PG::interruptible_future<> PG::handle_rep_op(Ref<MOSDRepOp> req)
     txn);
 
   log_operation(std::move(log_entries),
+                std::nullopt,
                 req->pg_trim_to,
                 req->version,
                 req->pg_committed_to,
@@ -1243,8 +1394,11 @@ PG::interruptible_future<> PG::handle_rep_op(Ref<MOSDRepOp> req)
                 txn,
                 false);
   DEBUGDPP("{} do_transaction", *this, *req);
-  co_await interruptor::make_interruptible(
-    shard_services.get_store().do_transaction(coll_ref, std::move(txn))
+
+  auto commit_fut = interruptor::make_interruptible(
+    crimson::os::with_store_do_transaction(
+      shard_services.get_store(store_index),
+      coll_ref, std::move(txn))
   );
 
   const auto &lcod = peering_state.get_info().last_complete;
@@ -1254,10 +1408,7 @@ PG::interruptible_future<> PG::handle_rep_op(Ref<MOSDRepOp> req)
     req.get(), pg_whoami, 0,
     map_epoch, req->get_min_epoch(), CEPH_OSD_FLAG_ONDISK);
   reply->set_last_complete_ondisk(lcod);
-  co_await interruptor::make_interruptible(
-    shard_services.send_to_osd(req->from.osd, std::move(reply), map_epoch)
-  );
-  co_return;
+  co_return handle_rep_op_ret(std::move(commit_fut), std::move(reply));
 }
 
 PG::interruptible_future<> PG::update_snap_map(
@@ -1282,6 +1433,7 @@ PG::interruptible_future<> PG::update_snap_map(
 
 void PG::log_operation(
   std::vector<pg_log_entry_t>&& logv,
+  const std::optional<pg_hit_set_history_t> &hset_history,
   const eversion_t &trim_to,
   const eversion_t &roll_forward_to,
   const eversion_t &pg_committed_to,
@@ -1293,6 +1445,9 @@ void PG::log_operation(
   if (is_primary()) {
     ceph_assert(trim_to <= peering_state.get_pg_committed_to());
   }
+  if (hset_history) {
+    peering_state.update_hset(*hset_history);
+  }
   auto last = logv.rbegin();
   if (is_primary() && last != logv.rend()) {
     DEBUGDPP("on primary, trimming projected log", *this);
@@ -1303,7 +1458,7 @@ void PG::log_operation(
 
   if (!is_primary()) { // && !is_ec_pg()
     DEBUGDPP("on replica, clearing obc", *this);
-    replica_clear_repop_obc(logv);
+    clear_repop_obc(logv);
   }
   if (!logv.empty()) {
     scrubber.on_log_update(logv.rbegin()->version);
@@ -1317,12 +1472,13 @@ void PG::log_operation(
                            false);
 }
 
-void PG::replica_clear_repop_obc(
+void PG::clear_repop_obc(
   const std::vector<pg_log_entry_t> &logv) {
-  LOG_PREFIX(PG::replica_clear_repop_obc);
-  DEBUGDPP("clearing obc for {} log entries", logv.size());
+  LOG_PREFIX(PG::clear_repop_obc);
+  DEBUGDPP("clearing obc for {} log entries", *this, logv.size());
   for (auto &&e: logv) {
     DEBUGDPP("clearing entry for {} from: {} to: {}",
+	     *this,
 	     e.soid,
 	     e.soid.get_object_boundary(),
 	     e.soid.get_head());
@@ -1337,6 +1493,71 @@ void PG::handle_rep_op_reply(const MOSDRepOpReply& m)
   if (!can_discard_replica_op(m)) {
     backend->got_rep_op_reply(m);
   }
+}
+
+PG::interruptible_future<> PG::handle_rep_write_op(Ref<MOSDECSubOpWrite> m)
+{
+  logger().debug("{}", __func__);
+  if (!is_primary()) {
+    peering_state.update_stats([&new_stats=m->op.stats](auto&, auto &stats) {
+      stats = new_stats;
+      return false;
+    });
+  }
+  auto* ec_backend=dynamic_cast<crimson::osd::ECBackend*>(&get_backend());
+  assert(ec_backend);
+  const auto tid = m->op.tid;
+  return ec_backend->handle_rep_write_op(
+    std::move(m),
+    *this
+  ).si_then([this, then_lcod=peering_state.get_info().last_complete, tid] {
+    logger().debug("{} sending response", "handle_rep_write_op");
+    peering_state.update_last_complete_ondisk(then_lcod);
+    auto r = crimson::make_message<MOSDECSubOpWriteReply>();
+    r->pgid = spg_t(peering_state.get_info().pgid.pgid, get_primary().shard);
+    r->map_epoch = get_osdmap_epoch();
+    r->min_epoch = peering_state.get_info().history.same_interval_since;
+    r->op.tid = tid;
+    r->op.last_complete = then_lcod;
+    r->op.committed = true;
+    r->op.applied = true;
+    r->op.from = pg_whoami;
+    r->set_priority(CEPH_MSG_PRIO_HIGH);
+    return shard_services.send_to_osd(get_primary().osd, std::move(r), get_osdmap_epoch());
+  }).handle_error_interruptible(crimson::ct_error::assert_all("unexpected error"));
+}
+
+PG::interruptible_future<> PG::handle_rep_write_reply(Ref<MOSDECSubOpWriteReply> m)
+{
+  if (const auto& op = m->op; op.committed) {
+    // TODO: trace.event("sub write committed");
+    if (op.from != pg_whoami) {
+      peering_state.update_peer_last_complete_ondisk(op.from, op.last_complete);
+    }
+  }
+  auto* ec_backend=dynamic_cast<crimson::osd::ECBackend*>(&get_backend());
+  assert(ec_backend);
+  return ec_backend->handle_rep_write_reply(
+    std::move(m->op)
+  ).handle_error_interruptible(crimson::ct_error::assert_all("unexpected error"));
+}
+
+PG::interruptible_future<> PG::handle_rep_read_op(Ref<MOSDECSubOpRead> m)
+{
+  auto* ec_backend=dynamic_cast<crimson::osd::ECBackend*>(&get_backend());
+  assert(ec_backend);
+  return ec_backend->handle_rep_read_op(
+    std::move(m)
+  ).si_then([then_lcod=peering_state.get_info().last_complete,
+             this](auto&& rep) {
+    auto reply = crimson::make_message<MOSDECSubOpReadReply>();
+    reply->pgid = spg_t(peering_state.get_info().pgid.pgid, get_primary().shard);
+    reply->map_epoch = get_osdmap_epoch();
+    reply->min_epoch = get_interval_start_epoch();
+    reply->op = std::move(rep);
+    return shard_services.send_to_osd(
+      get_primary().osd, std::move(reply), get_osdmap_epoch());
+  }).handle_error_interruptible(crimson::ct_error::assert_all("unexpected error"));
 }
 
 PG::interruptible_future<> PG::do_update_log_missing(
@@ -1362,8 +1583,10 @@ PG::interruptible_future<> PG::do_update_log_missing(
   peering_state.append_log_entries_update_missing(
     m->entries, t, op_trim_to, op_pg_committed_to);
 
-  return interruptor::make_interruptible(shard_services.get_store().do_transaction(
-    coll_ref, std::move(t))).then_interruptible(
+  return interruptor::make_interruptible(
+    crimson::os::with_store_do_transaction(
+      shard_services.get_store(store_index),
+      coll_ref, std::move(t))).then_interruptible(
     [m, conn, lcod=peering_state.get_info().last_complete, this] {
     if (!peering_state.pg_has_reset_since(m->get_epoch())) {
       peering_state.update_last_complete_ondisk(lcod);
@@ -1409,8 +1632,9 @@ PG::interruptible_future<> PG::do_update_log_missing_reply(
       log_entry_update_waiting_on.erase(it);
     }
   } else {
-    logger().error("{} : {} got reply {} on unknown tid {}",
-      __func__, peering_state.get_info().pgid, *m, m->get_tid());
+   ceph_abort_msg(fmt::format(
+     "{} : {} got reply {} on unknown tid {}",
+     __func__, peering_state.get_info().pgid, *m, m->get_tid()));
   }
   return seastar::now();
 }
@@ -1458,19 +1682,28 @@ seastar::future<> PG::stop()
 {
   logger().info("PG {} {}", pgid, __func__);
   stopping = true;
+
+  context_registry_on_change();
+  clear_primary_state();
+  if (is_primary()) {
+    clear_ready_to_merge();
+  }
+
+  reset_merge_rendezvous();
+
   cancel_local_background_io_reservation();
   cancel_remote_recovery_reservation();
   check_readable_timer.cancel();
   renew_lease_timer.cancel();
-  return osdmap_gate.stop().then([this] {
-    return wait_for_active_blocker.stop();
-  }).then([this] {
-    return recovery_handler->stop();
-  }).then([this] {
-    return recovery_backend->stop();
-  }).then([this] {
-    return backend->stop();
-  });
+  backend->on_actingset_changed(false);
+
+  co_await merge_notify_gate.close();
+  co_await osdmap_gate.stop();
+  co_await wait_for_active_blocker.stop();
+  client_request_orderer.clear_and_cancel(*this);
+  co_await recovery_handler->stop();
+  co_await recovery_backend->stop();
+  co_await backend->stop();
 }
 
 void PG::on_change(ceph::os::Transaction &t) {
@@ -1495,7 +1728,8 @@ void PG::on_change(ceph::os::Transaction &t) {
   // is save and in time.
   peering_state.state_clear(PG_STATE_SNAPTRIM);
   peering_state.state_clear(PG_STATE_SNAPTRIM_ERROR);
-  snap_mapper.reset_backend();
+  auto _t = osdriver.get_transaction(&t);
+  snap_mapper.flush_and_reset_backend(&_t);
   reset_pglog_based_recovery_op();
 }
 
@@ -1515,6 +1749,10 @@ void PG::context_registry_on_change() {
   }
 }
 
+bool PG::is_missing_head_and_clones(const hobject_t &hoid) {
+  return peering_state.is_missing_any_head_or_clone_of(hoid);
+}
+
 bool PG::can_discard_op(const MOSDOp& m) const {
   if (m.get_map_epoch() <
       peering_state.get_info().history.same_primary_since) {
@@ -1523,8 +1761,7 @@ bool PG::can_discard_op(const MOSDOp& m) const {
     return true;
   }
 
-  if ((m.get_flags() & (CEPH_OSD_FLAG_BALANCE_READS |
-                        CEPH_OSD_FLAG_LOCALIZE_READS))
+  if ((m.get_flags() & CEPH_OSD_FLAGS_DIRECT_READ)
     && !is_primary()
     && (m.get_map_epoch() <
         peering_state.get_info().history.same_interval_since))
@@ -1536,6 +1773,15 @@ bool PG::can_discard_op(const MOSDOp& m) const {
       // (us).
       return true;
     }
+
+  // Note: the Objecter will resend on pg split
+  // hence we can discard ops here.
+  // Refer: https://github.com/ceph/ceph/pull/13235
+  if (m.get_map_epoch() < peering_state.get_info().history.last_epoch_split) {
+    logger().debug("{} pg split in {} dropping!", __func__,
+        peering_state.get_info().history.last_epoch_split);
+    return true;
+  }
   return __builtin_expect(m.get_map_epoch()
       < peering_state.get_info().history.same_primary_since, false);
 }
@@ -1572,31 +1818,51 @@ bool PG::is_degraded_or_backfilling_object(const hobject_t& soid) const {
 
 bool PG::should_send_op(
   pg_shard_t peer,
-  const hobject_t &hoid) const
+  const hobject_t &hoid)
 {
   if (peer == get_primary())
     return true;
   bool should_send =
     (hoid.pool != (int64_t)get_info().pgid.pool() ||
-    // An object has been fully pushed to the backfill target if and only if
-    // either of the following conditions is met:
-    // 1. peer_info.last_backfill has passed "hoid"
-    // 2. last_backfill_started has passed "hoid" and "hoid" is not in the peer
-    //    missing set
-    hoid <= peering_state.get_peer_info(peer).last_backfill ||
-    (has_backfill_state() && hoid <= get_last_backfill_started() &&
-     !is_missing_on_peer(peer, hoid)));
-  if (!should_send) {
-    ceph_assert(is_backfill_target(peer));
-    logger().debug("{} issue_repop shipping empty opt to osd."
-                   "{}, object {} beyond std::max(last_backfill_started, "
-                   "peer_info[peer].last_backfill {})",
-                   __func__, peer, hoid,
-                   peering_state.get_peer_info(peer).last_backfill);
+     // An object has been fully pushed to the backfill target if and only if
+     // hoid is not in the peer's missing set and either of the following
+     // conditions is met:
+     // 1. peer_info.last_backfill has passed "hoid"
+     // 2. last_backfill_started has passed "hoid"
+     hoid <= peering_state.get_peer_info(peer).last_backfill ||
+     (has_backfill_state() && hoid <= get_last_backfill_started())) &&
+    !is_missing_on_peer(peer, hoid);
+  if (unlikely(!should_send)) {
+    if (peering_state.is_async_recovery_target(peer)) {
+      logger().info("{}: {} shipping empty opt to osd.{}, object {}"
+                    " which is pending recovery in async_recovery_targets",
+                   *this, __func__, peer, hoid);
+    } else {
+      ceph_assert(is_backfill_target(peer));
+      logger().debug("{} issue_repop shipping empty opt to osd."
+                     "{}, object {} beyond std::max(last_backfill_started, "
+                     "peer_info[peer].last_backfill {})",
+                     __func__, peer, hoid,
+                     peering_state.get_peer_info(peer).last_backfill);
+    }
   }
   return should_send;
-  // TODO: should consider async recovery cases in the future which are not supported
-  //       by crimson yet
+}
+
+void PG::op_applied(const eversion_t &applied_version)
+{
+  logger().info("{}: op_applied version {}", __func__, applied_version);
+  assert(applied_version != eversion_t());
+  assert(applied_version <= peering_state.get_info().last_update);
+  peering_state.local_write_applied(applied_version);
+
+#if 0
+  if (is_primary() && m_scrubber) {
+    // if there's a scrub operation waiting for the selected chunk to be fully updated -
+    // allow it to continue
+    m_scrubber->on_applied_when_primary(recovery_state.get_last_update_applied());
+  }
+#endif
 }
 
 PG::interruptible_future<std::optional<PG::complete_op_t>>
@@ -1654,9 +1920,10 @@ void PG::reset_pglog_based_recovery_op() {
 }
 
 void PG::cancel_pglog_based_recovery_op() {
-  ceph_assert(pglog_based_recovery_op);
-  pglog_based_recovery_op->cancel();
-  reset_pglog_based_recovery_op();
+  if (pglog_based_recovery_op) {
+    pglog_based_recovery_op->cancel();
+    reset_pglog_based_recovery_op();
+  }
 }
 
 void PG::C_PG_FinishRecovery::finish(int r) {
@@ -1688,4 +1955,172 @@ bool PG::check_in_progress_op(
       reqid, version, user_version, return_code, op_returns));
 }
 
+void PG::send_message_osd_cluster(int osd, MOSDPGPush* msg, epoch_t from_epoch)
+{
+  logger().debug("{}: MOSDPGPush from_epoch {} to osd.{}",
+                 __func__, from_epoch, osd);
+  if (whoami_shard().osd == osd) {
+    std::ignore =
+      static_cast<ECRecoveryBackend&>(*recovery_backend).handle_push(msg);
+  } else {
+    std::vector wrapped_msg {
+      std::make_pair(osd, static_cast<Message*>(msg))
+    };
+    send_message_osd_cluster(wrapped_msg, from_epoch);
+  }
+}
+
+void PG::PGLogEntryHandler::partial_write(pg_info_t *info,
+                                          eversion_t previous_version,
+                                          const pg_log_entry_t &entry)
+{
+  assert(info != nullptr);
+  if (entry.written_shards.empty() && info->partial_writes_last_complete.empty()) {
+    return;
+  }
+  logger().debug("{}: version version={} written_shards={}"
+                 " pwlc={} previous_version={}",
+                 __func__,
+                 entry.version,
+                 entry.written_shards,
+                 info->partial_writes_last_complete,
+                 previous_version);
+  const pg_pool_t &pool = pg->get_pool();
+  for (shard_id_t shard : pool.nonprimary_shards) {
+    auto pwlc_iter = info->partial_writes_last_complete.find(shard);
+    if (!entry.is_written_shard(shard)) {
+      if (pwlc_iter == info->partial_writes_last_complete.end()) {
+	// 1st partial write since all logs were updated
+	info->partial_writes_last_complete[shard] =
+	  std::pair(previous_version, entry.version);
+
+	continue;
+      }
+      auto &&[old_v,  new_v] = pwlc_iter->second;
+      if (old_v == new_v) {
+        if (old_v.version == eversion_t::max().version) {
+	  // shard is backfilling or in async recovery, pwlc is
+	  // invalid
+          logger().debug("{}: pwlc invalid {}", __func__, shard);
+	} else if (old_v.version >= entry.version.version) {
+	  // Abnormal case - consider_adjusting_pwlc may advance pwlc
+	  // during peering because all shards have updates but these
+	  // have not been marked complete. At the end of peering
+	  // partial_write catches up with these entries - these need
+	  // to be ignored to preserve old_v.epoch
+          logger().debug("{}: pwlc is ahead of entry {}", __func__, shard);
+	} else {
+	  old_v = previous_version;
+	  new_v = entry.version;
+	}
+      } else if (new_v == previous_version) {
+	// Subsequent partial write, contiguous versions
+	new_v = entry.version;
+      } else {
+	// Subsequent partial write, discontiguous versions
+        logger().debug("{}: cannot update shard {}", __func__, shard);
+      }
+    } else if (pwlc_iter != info->partial_writes_last_complete.end()) {
+      auto &&[old_v,  new_v] = pwlc_iter->second;
+      // Log updated or shard absent, partial write entry is a no-op
+      if (old_v.version == eversion_t::max().version) {
+	// shard is backfilling or in async recovery, pwlc is invalid
+        logger().debug("{}: pwlc invalid {}", __func__, shard);
+      } else if (old_v.version >= entry.version.version) {
+	// Abnormal case - see above
+        logger().debug("{}: pwlc is ahead of entry {}", __func__, shard);
+      } else {
+	old_v = new_v = entry.version;
+      }
+    }
+  }
+  logger().debug("{}: after pwlc={}",
+                 __func__, info->partial_writes_last_complete);
+}
+
+void PG::add_merge_source(
+    spg_t source,
+    core_id_t birth_shard,
+    seastar::foreign_ptr<Ref<PG>> source_pg)
+{
+  LOG_PREFIX(PG::add_merge_source);
+  auto wrapped =
+    crimson::make_local_shared_foreign<Ref<PG>>(std::move(source_pg));
+  auto [_, inserted] = merge_rendezvous.sources.emplace(
+    source, std::make_pair(birth_shard, std::move(wrapped)));
+  if (inserted) {
+    DEBUG("target {} source {} arrived from shard {} ({} total)",
+          get_pgid(), source, birth_shard,
+          merge_rendezvous.sources.size());
+    merge_rendezvous.arrivals.signal(1);
+  } else {
+    DEBUG("target {} source {} already registered, ignoring",
+          get_pgid(), source);
+  }
+}
+
+seastar::future<PG::merge_source_map_t>
+PG::collect_merge_sources(std::size_t n)
+{
+  LOG_PREFIX(PG::collect_merge_sources);
+  DEBUG("target {} waiting for {} sources ({} already arrived)",
+        get_pgid(), n, merge_rendezvous.sources.size());
+  try {
+    co_await merge_rendezvous.arrivals.wait(n);
+  } catch (const seastar::broken_semaphore&) {
+    DEBUG("target {} merge rendezvous broken, aborting wait", get_pgid());
+    co_return merge_source_map_t{};
+  }
+  ceph_assert(merge_rendezvous.sources.size() == n);
+  auto sources = std::move(merge_rendezvous.sources);
+  merge_rendezvous.sources.clear();
+  co_return sources;
+}
+
+void PG::reset_merge_rendezvous()
+{
+  // Unblock any waiter in collect_merge_sources() with broken(); then
+  // replace the semaphore so the next merge attempt starts at zero signals.
+  merge_rendezvous.arrivals.broken();
+  merge_rendezvous = merge_rendezvous_t{};
+}
+
+void PG::merge_from(
+    merge_source_map_t& sources,
+    PeeringCtx &rctx,
+    unsigned split_bits,
+    const pg_merge_meta_t& last_pg_merge_meta)
+{
+  LOG_PREFIX(PG::merge_from);
+  DEBUG("target {}", get_pgid());
+
+  std::map<spg_t, PeeringState*> source_states;
+  for (auto& [pgid, entry] : sources) {
+    auto& src_pg = entry.second;
+    source_states.emplace(pgid, &src_pg->peering_state);
+  }
+
+  // Updates the target's PeeringState and stats (Synchronous)
+  peering_state.merge_from(source_states, rctx, split_bits, last_pg_merge_meta);
+
+  // We iterate through each source and move its objects into the target collection
+  for (auto& [pgid, entry] : sources) {
+    auto& src_pg = entry.second;
+    auto src_coll = src_pg->get_collection_ref()->get_cid();
+    auto dst_coll = coll_ref->get_cid();
+    DEBUG("merging source {}", pgid);
+
+    // Remove source-specific metadata objects that are no longer needed
+    // now that the collections are being collapsed.
+    rctx.transaction.remove(src_coll, src_pg->get_pgid().make_snapmapper_oid());
+    rctx.transaction.remove(src_coll, src_pg->pgmeta_oid);
+    // Move source collection into target collection.
+    rctx.transaction.merge_collection(src_coll, dst_coll, split_bits);
+  }
+
+  // Adjust the collection and snap_mapper to reflect the
+  // new, smaller PG count (reducing bitmask).
+  rctx.transaction.collection_set_bits(coll_ref->get_cid(), split_bits);
+  snap_mapper.update_bits(split_bits);
+}
 }

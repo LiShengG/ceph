@@ -1,45 +1,61 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*- 
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*- 
+// vim: ts=8 sw=2 sts=2 expandtab
 
 #include "./ScrubStore.h"
 #include "osd/osd_types.h"
+#include "common/debug.h"
 #include "common/scrub_types.h"
 #include "include/rados/rados_types.hpp"
 
 #include "pg_scrubber.h"
 
-using std::ostringstream;
 using std::string;
 using std::vector;
 
 using ceph::bufferlist;
 
 namespace {
+
+/// the 'to_str()' representation of an hobject, if created with the specific
+/// parameters, prefixed with 'prefix'.
+std::string virtual_hobject_w_prefix(std::string_view prefix,
+                                     const std::string& key,
+                                     snapid_t snap,
+                                     uint32_t hash,
+                                     int64_t pool)
+{
+  return fmt::format("{}_{}", prefix,
+                     hobject_t(object_t(), key, snap, hash, pool, "").to_str());
+}
+
+/// the 'to_str()' representation of an hobject, if created with the specific
+/// parameters, prefixed with 'prefix'.
+std::string virtual_hobject_w_prefix(std::string_view prefix,
+                                     const librados::object_id_t& oid,
+                                     uint32_t hash,
+                                     int64_t pool) {
+  return fmt::format("{}_{}", prefix,
+                     hobject_t(object_t{oid.name}, oid.locator, oid.snap, hash,
+                               pool, oid.nspace)
+                         .to_str());
+}
+
 string first_object_key(int64_t pool)
 {
-  auto hoid = hobject_t(object_t(), "", CEPH_NOSNAP, 0x00000000, pool, "");
-  hoid.build_hash_cache();
-  return "SCRUB_OBJ_" + hoid.to_str();
+  return virtual_hobject_w_prefix("SCRUB_OBJ", "", CEPH_NOSNAP, 0x00000000,
+                                  pool);
 }
 
 // the object_key should be unique across pools
 string to_object_key(int64_t pool, const librados::object_id_t& oid)
 {
-  auto hoid = hobject_t(object_t(oid.name),
-			oid.locator, // key
-			oid.snap,
-			0,		// hash
-			pool,
-			oid.nspace);
-  hoid.build_hash_cache();
-  return "SCRUB_OBJ_" + hoid.to_str();
+  return virtual_hobject_w_prefix("SCRUB_OBJ", oid, 0x00000000, pool);
 }
 
 string last_object_key(int64_t pool)
 {
-  auto hoid = hobject_t(object_t(), "", CEPH_NOSNAP, 0xffffffff, pool, "");
-  hoid.build_hash_cache();
-  return "SCRUB_OBJ_" + hoid.to_str();
+  return virtual_hobject_w_prefix("SCRUB_OBJ", "", CEPH_NOSNAP, 0xffffffff,
+                                  pool);
 }
 
 string first_snap_key(int64_t pool)
@@ -47,28 +63,17 @@ string first_snap_key(int64_t pool)
   // scrub object is per spg_t object, so we can misuse the hash (pg.seed) for
   // representing the minimal and maximum keys. and this relies on how
   // hobject_t::to_str() works: hex(pool).hex(revhash).
-  auto hoid = hobject_t(object_t(), "", 0, 0x00000000, pool, "");
-  hoid.build_hash_cache();
-  return "SCRUB_SS_" + hoid.to_str();
+  return virtual_hobject_w_prefix("SCRUB_SS", "", 0, 0x00000000, pool);
 }
 
 string to_snap_key(int64_t pool, const librados::object_id_t& oid)
 {
-  auto hoid = hobject_t(object_t(oid.name),
-			oid.locator, // key
-			oid.snap,
-			0x77777777, // hash
-			pool,
-			oid.nspace);
-  hoid.build_hash_cache();
-  return "SCRUB_SS_" + hoid.to_str();
+  return virtual_hobject_w_prefix("SCRUB_SS", oid, 0x77777777, pool);
 }
 
 string last_snap_key(int64_t pool)
 {
-  auto hoid = hobject_t(object_t(), "", 0, 0xffffffff, pool, "");
-  hoid.build_hash_cache();
-  return "SCRUB_SS_" + hoid.to_str();
+  return virtual_hobject_w_prefix("SCRUB_SS", "", 0, 0xffffffff, pool);
 }
 
 }  // namespace
@@ -303,10 +308,9 @@ inline void decode(
 
 
 inconsistent_obj_wrapper decode_wrapper(
-    hobject_t obj,
     ceph::buffer::list::const_iterator bp)
 {
-  inconsistent_obj_wrapper iow{obj};
+  inconsistent_obj_wrapper iow;
   iow.decode(bp);
   return iow;
 }
@@ -337,13 +341,12 @@ void Store::collect_specific_store(
  *   structure.
  */
 bufferlist Store::merge_encoded_error_wrappers(
-    hobject_t obj,
     ExpCacherPosData& latest_sh,
     ExpCacherPosData& latest_dp) const
 {
   // decode both error wrappers
-  auto sh_wrap = decode_wrapper(obj, latest_sh->data.cbegin());
-  auto dp_wrap = decode_wrapper(obj, latest_dp->data.cbegin());
+  auto sh_wrap = decode_wrapper(latest_sh->data.cbegin());
+  auto dp_wrap = decode_wrapper(latest_dp->data.cbegin());
 
   // note: the '20' level is just until we're sure the merging works as
   // expected
@@ -409,6 +412,7 @@ bufferlist Store::merge_encoded_error_wrappers(
 	}
       }
     } else if (sh_wrap.version > dp_wrap.version) {
+        // RRR decide on the policy here.
 	if (false && dp_wrap.version == 0) {
 	  // there was a read error in the deep scrub. The deep version
 	  // shows as '0'. That's severe enough for us to ignore the shallow.
@@ -486,8 +490,7 @@ std::vector<bufferlist> Store::get_errors(
     // we have results from both stores. Select the one with a lower key.
     // If the keys are equal, combine the errors.
     if (latest_sh->last_key == latest_dp->last_key) {
-      auto bl = merge_encoded_error_wrappers(
-	  shallow_db->errors_hoid.hobj, latest_sh, latest_dp);
+      auto bl = merge_encoded_error_wrappers(latest_sh, latest_dp);
       errors.push_back(bl);
       latest_sh = shallow_db->backend.get_1st_after_key(latest_sh->last_key);
       latest_dp = deep_db->backend.get_1st_after_key(latest_dp->last_key);

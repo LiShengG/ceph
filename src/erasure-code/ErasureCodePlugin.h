@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*- 
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*- 
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph distributed storage system
  *
@@ -17,6 +18,8 @@
 
 #ifndef CEPH_ERASURE_CODE_PLUGIN_H
 #define CEPH_ERASURE_CODE_PLUGIN_H
+
+#include <functional>
 
 #include "common/ceph_mutex.h"
 #include "ErasureCodeInterface.h"
@@ -67,6 +70,10 @@ namespace ceph {
     int add(const std::string &name, ErasureCodePlugin *plugin);
     int remove(const std::string &name);
     ErasureCodePlugin *get(const std::string &name);
+
+    static int register_builtin(
+      const std::string &name,
+      std::function<ErasureCodePlugin*()> create);
 
     int load(const std::string &plugin_name,
 	     const std::string &directory,

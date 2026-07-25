@@ -1,5 +1,5 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
 
 #include "Btree2Allocator.h"
 #include "common/debug.h"
@@ -23,7 +23,8 @@ Btree2Allocator::Btree2Allocator(CephContext* _cct,
   double _rweight_factor,
   bool with_cache,
   std::string_view name) :
-    Allocator(name, device_size, block_size),
+    AllocatorBase(name, device_size, block_size),
+    AllocatorPerf(_cct, name),
     myTraits(RANGE_SIZE_BUCKET_COUNT),
     cct(_cct),
     range_count_cap(max_mem / sizeof(range_seg_t))
@@ -65,7 +66,7 @@ int64_t Btree2Allocator::allocate(
   uint64_t want,
   uint64_t unit,
   uint64_t max_alloc_size,
-  int64_t  hint, // unused, for now!
+  int64_t  hint, // unused and likely unneeded
   PExtentVector* extents)
 {
   ldout(cct, 10) << __func__ << std::hex
@@ -85,13 +86,31 @@ int64_t Btree2Allocator::allocate(
     max_alloc_size = p2align(uint64_t(cap), (uint64_t)block_size);
   }
   uint64_t cached_chunk_offs = 0;
+  auto fast_alloc_start = mono_clock::now();
   if (cache && cache->try_get(&cached_chunk_offs, want)) {
     num_free -= want;
     extents->emplace_back(cached_chunk_offs, want);
+    logger->tinc_with_max(
+        l_bluestore_allocator_nolock_process_lat,
+        mono_clock::now() - fast_alloc_start);
     return want;
   }
+  auto lock_wait_start = mono_clock::now();
+
   std::lock_guard l(lock);
-  return _allocate(want, unit, max_alloc_size, hint, extents);
+
+  auto lock_acquired = mono_clock::now();
+
+  auto ret = _allocate(want, unit, max_alloc_size, hint, extents);
+
+  logger->tinc_with_max(
+      l_bluestore_allocator_alloc_process_lat,
+      mono_clock::now() - lock_acquired);
+  logger->tinc_with_max(
+      l_bluestore_allocator_lock_wait_lat,
+      lock_acquired - lock_wait_start);
+
+  return ret;
 }
 
 void Btree2Allocator::release(const release_set_t& release_set)
@@ -182,7 +201,7 @@ int64_t Btree2Allocator::_allocate(
   uint64_t want,
   uint64_t unit,
   uint64_t max_alloc_size,
-  int64_t  hint, // unused, for now!
+  int64_t  hint, // unused and likely unneeded
   PExtentVector* extents)
 {
   uint64_t allocated = 0;

@@ -9,11 +9,11 @@
 Synopsis
 ========
 
-| **cephadm**** [-h] [--image IMAGE] [--docker] [--data-dir DATA_DIR]
-|               [--log-dir LOG_DIR] [--logrotate-dir LOGROTATE_DIR]
-|               [--unit-dir UNIT_DIR] [--verbose] [--timeout TIMEOUT]
-|               [--retry RETRY] [--no-container-init]
-|               {version,pull,inspect-image,ls,list-networks,adopt,rm-daemon,rm-cluster,run,shell,enter,ceph-volume,unit,logs,bootstrap,deploy,check-host,prepare-host,add-repo,rm-repo,install,list-images}
+| **cephadm** [-h] [--image IMAGE] [--docker] [--data-dir DATA_DIR]
+|             [--log-dir LOG_DIR] [--logrotate-dir LOGROTATE_DIR]
+|             [--unit-dir UNIT_DIR] [--verbose] [--timeout TIMEOUT]
+|             [--retry RETRY] [--no-container-init]
+|             {version,pull,inspect-image,ls,list-networks,list-rdma,adopt,rm-daemon,rm-cluster,remove-file,deploy-file,run,shell,enter,ceph-volume,unit,logs,bootstrap,deploy,check-host,prepare-host,prepare-host-sudo-hardening,setup-ssh-user,add-repo,rm-repo,install,list-images,update-osd-service}
 |               ...
 
 
@@ -24,6 +24,8 @@ Synopsis
 | **cephadm** **ls** [-h] [--no-detail] [--legacy-dir LEGACY_DIR]
 
 | **cephadm** **list-networks**
+
+| **cephadm** **list-rdma**
 
 | **cephadm** **adopt** [-h] --name NAME --style STYLE [--cluster CLUSTER]
 |                       [--legacy-dir LEGACY_DIR] [--config-json CONFIG_JSON]
@@ -88,7 +90,18 @@ Synopsis
 
 | **cephadm** **check-host** [-h] [--expect-hostname EXPECT_HOSTNAME]
 
+| **cephadm** **remove-file** [-h] [--fsid FSID] --path PATH
+
+| **cephadm** **deploy-file** [-h] [--fsid FSID] --path PATH [--mode MODE]
+|                          [--uid UID] [--gid GID]
+
 | **cephadm** **prepare-host**
+
+| **cephadm** **prepare-host-sudo-hardening** [-h] [--ssh-user SSH_USER]
+|                                          [--ssh-pub-key SSH_PUB_KEY]
+|                                          [--cephadm-version VERSION]
+
+| **cephadm** **setup-ssh-user** [-h] --ssh-user SSH_USER --ssh-pub-key SSH_PUB_KEY
 
 | **cephadm** **add-repo** [-h] [--release RELEASE] [--version VERSION]
 |                          [--dev DEV] [--dev-commit DEV_COMMIT]
@@ -106,6 +119,7 @@ Synopsis
 
 | **cephadm** **list-images**
 
+| **cephadm** **update-osd-service** [-h] [--fsid FSID] --osd-ids OSD_IDS --service-name SERVICE_NAME
 
 
 Description
@@ -249,7 +263,7 @@ Arguments:
 * [--allow-overwrite]             allow overwrite of existing --output-* config/keyring/ssh files
 * [--allow-fqdn-hostname]         allow hostname that is fully-qualified (contains ".")
 * [--skip-prepare-host]           Do not prepare host
-* [--orphan-initial-daemons]      Do not create initial mon, mgr, and crash service specs
+* [--orphan-initial-daemons]      Set mon and mgr service to unmanaged and do not create the crash service
 * [--skip-monitoring-stack]       Do not automatically provision monitoring stack] (prometheus, grafana, alertmanager, node-exporter)
 * [--apply-spec APPLY_SPEC]       Apply cluster spec after bootstrap (copy ssh key, add hosts and apply services)
 * [--registry-url REGISTRY_URL]   url of custom registry to login to. e.g. docker.io, quay.io
@@ -284,6 +298,32 @@ check host configuration to be suitable for a Ceph cluster.
 Arguments:
 
 * [--expect-hostname EXPECT_HOSTNAME] Check that hostname matches an expected value
+
+
+remove-file
+-----------
+
+Remove a regular file on the local host. Missing paths are ignored.
+
+Arguments:
+
+* [--fsid FSID]   cluster FSID
+* --path PATH     absolute path of the file to remove (required)
+
+
+deploy-file
+-----------
+
+Write or replace a file on the local host. The **entire file body** is read from
+**standard input** as raw bytes (no encoding or line-ending translation).
+
+Arguments:
+
+* [--fsid FSID]   cluster FSID
+* --path PATH     absolute destination path for the file (required)
+* [--mode MODE]   octal file mode (for example ``644`` or ``0644``)
+* [--uid UID]    numeric owner user id (**must** be given together with ``--gid``)
+* [--gid GID]    numeric owner group id (**must** be given together with ``--uid``)
 
 
 deploy
@@ -346,6 +386,10 @@ list-networks
 
 list IP networks
 
+list-rdma
+---------
+
+list RDMA devices and their netdev interfaces
 
 ls
 --
@@ -413,6 +457,49 @@ Arguments:
 * [--expect-hostname EXPECT_HOSTNAME] Set hostname
 
 
+prepare-host-sudo-hardening
+---------------------------
+
+Prepare a host for sudo hardening by authorizing SSH keys, installing/upgrading
+the cephadm package, and setting up restricted sudoers permissions::
+
+    cephadm prepare-host-sudo-hardening --ssh-user cephadm --ssh-pub-key <key>
+
+This command performs the following steps:
+
+1. Authorizes the provided SSH public key for the specified user
+2. Installs or upgrades the cephadm package to match the cluster version (includes cephadm_invoker.py)
+3. Sets up sudoers with restricted permissions for cephadm_invoker.py
+
+Arguments:
+
+* [--ssh-user SSH_USER]       SSH user for key authorization (default: root)
+* [--ssh-pub-key SSH_PUB_KEY] SSH public key to authorize
+* [--cephadm-version VERSION] Specific cephadm version to install
+
+
+setup-ssh-user
+--------------
+
+Setup SSH user with passwordless sudo and SSH key authorization::
+
+    cephadm setup-ssh-user --ssh-user cephadm --ssh-pub-key <public_key>
+
+This command configures an SSH user for cephadm operations by:
+
+1. Validating that the user exists on the system
+2. Setting up passwordless sudo for the user (skipped for root)
+3. Authorizing the SSH public key for the user
+
+This command is automatically called by ``ceph cephadm set-user`` to configure
+SSH users across all cluster hosts.
+
+Arguments:
+
+* [--ssh-user SSH_USER]       SSH user to setup (required)
+* [--ssh-pub-key SSH_PUB_KEY] SSH public key to add to user's authorized_keys (required)
+
+
 pull
 ----
 
@@ -436,6 +523,23 @@ Can also use a JSON file containing the login info formatted as::
        "username":"REGISTRY_USERNAME",
        "password":"REGISTRY_PASSWORD"
       }
+
+For multiple registry logins, refer to the format below::
+
+    {
+      "registry_credentials": [
+        {
+          "url": "REGISTRY_URL1",
+          "username": "REGISTRY_USERNAME1",
+          "password": "REGISTRY_PASSWORD1"
+        },
+        {
+          "url": "REGISTRY_URL2",
+          "username": "REGISTRY_USERNAME2",
+          "password": "REGISTRY_PASSWORD2"
+        }
+      ]
+    }
 
 and turn it in with command::
 
@@ -533,6 +637,18 @@ list-images
 -----------
 
 List the default container images for all services in ini format. The output can be modified with custom images and passed to --config flag during bootstrap.
+
+
+update-osd-service
+------------------
+
+Update the OSD service for specific OSDs
+
+Arguments:
+
+* [--fsid FSID]                 cluster FSID
+* --osd-ids OSD_IDS             Comma-separated OSD IDs
+* --service-name SERVICE_NAME   OSD service name
 
 
 Availability

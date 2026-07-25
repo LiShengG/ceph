@@ -5,7 +5,7 @@ import { RouterTestingModule } from '@angular/router/testing';
 
 import { NgbNavModule } from '@ng-bootstrap/ng-bootstrap';
 import _ from 'lodash';
-import { ToastrModule } from 'ngx-toastr';
+
 import { of } from 'rxjs';
 
 import { RbdConfigurationListComponent } from '~/app/ceph/block/rbd-configuration-list/rbd-configuration-list.component';
@@ -13,7 +13,7 @@ import { PgCategoryService } from '~/app/ceph/shared/pg-category.service';
 import { ConfigurationService } from '~/app/shared/api/configuration.service';
 import { ErasureCodeProfileService } from '~/app/shared/api/erasure-code-profile.service';
 import { PoolService } from '~/app/shared/api/pool.service';
-import { CriticalConfirmationModalComponent } from '~/app/shared/components/critical-confirmation-modal/critical-confirmation-modal.component';
+import { DeleteConfirmationModalComponent } from '~/app/shared/components/delete-confirmation-modal/delete-confirmation-modal.component';
 import { ErasureCodeProfile } from '~/app/shared/models/erasure-code-profile';
 import { ExecutingTask } from '~/app/shared/models/executing-task';
 import { AuthStorageService } from '~/app/shared/services/auth-storage.service';
@@ -49,7 +49,6 @@ describe('PoolListComponent', () => {
     imports: [
       BrowserAnimationsModule,
       SharedModule,
-      ToastrModule.forRoot(),
       RouterTestingModule,
       NgbNavModule,
       HttpClientTestingModule
@@ -87,7 +86,8 @@ describe('PoolListComponent', () => {
     beforeEach(() => {
       configOptRead = true;
       spyOn(TestBed.inject(AuthStorageService), 'getPermissions').and.callFake(() => ({
-        configOpt: { read: configOptRead }
+        configOpt: { read: configOptRead },
+        pool: { read: true }
       }));
       configurationService = TestBed.inject(ConfigurationService);
     });
@@ -138,7 +138,7 @@ describe('PoolListComponent', () => {
       configOptRead = false;
       fixture = TestBed.createComponent(PoolListComponent);
       component = fixture.componentInstance;
-      expect(component.monAllowPoolDelete).toBe(false);
+      expect(component.monAllowPoolDelete).toBe(true);
     });
   });
 
@@ -152,7 +152,7 @@ describe('PoolListComponent', () => {
     const callDeletion = () => {
       component.deletePoolModal();
       expect(modalRef).toBeTruthy();
-      const deletion: CriticalConfirmationModalComponent = modalRef && modalRef.componentInstance;
+      const deletion: DeleteConfirmationModalComponent = modalRef && modalRef.componentInstance;
       deletion.submitActionObservable();
     };
 
@@ -308,6 +308,7 @@ describe('PoolListComponent', () => {
     const getPoolData = (o: object) => [
       _.merge(
         _.merge(Mocks.getPool('a', 0), {
+          application_metadata: ['Block'],
           cdIsBinary: true,
           pg_status: '',
           stats: {

@@ -1,4 +1,3 @@
-
 """
 ceph-mgr orchestrator interface
 
@@ -48,10 +47,10 @@ from ceph.deployment.service_spec import (
     TunedProfileSpec,
 )
 from ceph.deployment.drive_group import DriveGroupSpec
-from ceph.deployment.hostspec import HostSpec, SpecValidationError
+from ceph.deployment.hostspec import HostSpec
 from ceph.utils import datetime_to_str, str_to_datetime
 
-from mgr_module import MgrModule, CLICommand, HandleCommandResult
+from mgr_module import MgrModule, HandleCommandResult
 
 
 logger = logging.getLogger(__name__)
@@ -74,7 +73,7 @@ class OrchestratorError(Exception):
                  errno: int = -errno.EINVAL,
                  event_kind_subject: Optional[Tuple[str, str]] = None) -> None:
         super(Exception, self).__init__(msg)
-        self.errno = errno
+        self.errno = abs(errno)
         # See OrchestratorEvent.subject
         self.event_subject = event_kind_subject
 
@@ -104,30 +103,6 @@ def set_exception_subject(kind: str, subject: str, overwrite: bool = False) -> I
         raise
 
 
-def handle_exception(prefix: str, perm: str, func: FuncT) -> FuncT:
-    @wraps(func)
-    def wrapper(*args: Any, **kwargs: Any) -> Any:
-        try:
-            return func(*args, **kwargs)
-        except (OrchestratorError, SpecValidationError) as e:
-            # Do not print Traceback for expected errors.
-            return HandleCommandResult(e.errno, stderr=str(e))
-        except ImportError as e:
-            return HandleCommandResult(-errno.ENOENT, stderr=str(e))
-        except NotImplementedError:
-            msg = 'This Orchestrator does not support `{}`'.format(prefix)
-            return HandleCommandResult(-errno.ENOENT, stderr=msg)
-
-    # misuse lambda to copy `wrapper`
-    wrapper_copy = lambda *l_args, **l_kwargs: wrapper(*l_args, **l_kwargs)  # noqa: E731
-    wrapper_copy._prefix = prefix  # type: ignore
-    wrapper_copy._cli_command = CLICommand(prefix, perm)  # type: ignore
-    wrapper_copy._cli_command.store_func_metadata(func)  # type: ignore
-    wrapper_copy._cli_command.func = wrapper_copy  # type: ignore
-
-    return cast(FuncT, wrapper_copy)
-
-
 def handle_orch_error(f: Callable[..., T]) -> Callable[..., 'OrchResult[T]']:
     """
     Decorator to make Orchestrator methods return
@@ -146,47 +121,6 @@ def handle_orch_error(f: Callable[..., T]) -> Callable[..., 'OrchResult[T]']:
             return OrchResult(None, exception=e)
 
     return cast(Callable[..., OrchResult[T]], wrapper)
-
-
-class InnerCliCommandCallable(Protocol):
-    def __call__(self, prefix: str) -> Callable[[FuncT], FuncT]:
-        ...
-
-
-def _cli_command(perm: str) -> InnerCliCommandCallable:
-    def inner_cli_command(prefix: str) -> Callable[[FuncT], FuncT]:
-        return lambda func: handle_exception(prefix, perm, func)
-    return inner_cli_command
-
-
-_cli_read_command = _cli_command('r')
-_cli_write_command = _cli_command('rw')
-
-
-class CLICommandMeta(type):
-    """
-    This is a workaround for the use of a global variable CLICommand.COMMANDS which
-    prevents modules from importing any other module.
-
-    We make use of CLICommand, except for the use of the global variable.
-    """
-    def __init__(cls, name: str, bases: Any, dct: Any) -> None:
-        super(CLICommandMeta, cls).__init__(name, bases, dct)
-        dispatch: Dict[str, CLICommand] = {}
-        for v in dct.values():
-            try:
-                dispatch[v._prefix] = v._cli_command
-            except AttributeError:
-                pass
-
-        def handle_command(self: Any, inbuf: Optional[str], cmd: dict) -> Any:
-            if cmd['prefix'] not in dispatch:
-                return self.handle_command(inbuf, cmd)
-
-            return dispatch[cmd['prefix']].call(self, cmd, inbuf)
-
-        cls.COMMANDS = [cmd.dump_cmd() for cmd in dispatch.values()]
-        cls.handle_command = handle_command
 
 
 class OrchResult(Generic[T]):
@@ -243,6 +177,25 @@ def raise_if_exception(c: OrchResult[T]) -> T:
         raise e
     assert c.result is not None, 'OrchResult should either have an exception or a result'
     return c.result
+
+
+def completion_to_result(c: OrchResult[T]) -> HandleCommandResult:
+    """
+    Converts an OrchResult to a HandleCommandResult,
+    preserving output and error codes.
+    """
+    if c.serialized_exception is None:
+        assert c.result is not None, "OrchResult should either have result or an exception"
+        return HandleCommandResult(stdout=c.result_str())
+
+    try:
+        e = pickle.loads(c.serialized_exception)
+    except (KeyError, AttributeError):
+        return HandleCommandResult(stderr=c.exception_str, retval=errno.EIO)
+    if isinstance(e, OrchestratorError):
+        return HandleCommandResult(stderr=str(e), retval=-e.errno)
+
+    raise e
 
 
 def _hide_in_features(f: FuncT) -> FuncT:
@@ -414,9 +367,17 @@ class Orchestrator(object):
         """
         raise NotImplementedError()
 
+    def node_proxy_firmware(self, hostname: Optional[str] = None) -> OrchResult[Dict[str, Any]]:
+        """
+        Return node-proxy firmware report
+
+        :param hostname: hostname
+        """
+        raise NotImplementedError()
+
     def node_proxy_firmwares(self, hostname: Optional[str] = None) -> OrchResult[Dict[str, Any]]:
         """
-        Return node-proxy firmwares report
+        Return node-proxy firmware report (deprecated alias)
 
         :param hostname: hostname
         """
@@ -449,6 +410,14 @@ class Orchestrator(object):
     def drain_host(self, hostname: str, force: bool = False, keep_conf_keyring: bool = False, zap_osd_devices: bool = False) -> OrchResult[str]:
         """
         drain all daemons from a host
+
+        :param hostname: hostname
+        """
+        raise NotImplementedError()
+
+    def stop_drain_host(self, hostname: str) -> OrchResult[str]:
+        """
+        stop draining daemons of a host
 
         :param hostname: hostname
         """
@@ -489,7 +458,7 @@ class Orchestrator(object):
         """
         raise NotImplementedError()
 
-    def host_ok_to_stop(self, hostname: str) -> OrchResult:
+    def host_ok_to_stop(self, hostname: str) -> OrchResult[str]:
         """
         Check if the specified host can be safely stopped without reducing availability
 
@@ -497,13 +466,13 @@ class Orchestrator(object):
         """
         raise NotImplementedError()
 
-    def enter_host_maintenance(self, hostname: str, force: bool = False, yes_i_really_mean_it: bool = False) -> OrchResult:
+    def enter_host_maintenance(self, hostname: str, force: bool = False, yes_i_really_mean_it: bool = False) -> OrchResult[str]:
         """
         Place a host in maintenance, stopping daemons and disabling it's systemd target
         """
         raise NotImplementedError()
 
-    def exit_host_maintenance(self, hostname: str, force: bool = False, offline: bool = False) -> OrchResult:
+    def exit_host_maintenance(self, hostname: str, force: bool = False, offline: bool = False) -> OrchResult[str]:
         """
         Return a host from maintenance, restarting the clusters systemd target
         """
@@ -560,15 +529,30 @@ class Orchestrator(object):
         """
         raise NotImplementedError()
 
-    def cert_store_cert_ls(self) -> OrchResult[Dict[str, Any]]:
+    def cert_store_cert_ls(self,
+                           filter_by: str = '',
+                           show_details: bool = False,
+                           include_cephadm_signed: bool = False) -> OrchResult[Dict[str, Any]]:
         raise NotImplementedError()
 
-    def cert_store_key_ls(self) -> OrchResult[Dict[str, Any]]:
+    def cert_store_bindings_ls(self) -> OrchResult[Dict[Any, Dict[str, List[str]]]]:
+        raise NotImplementedError()
+
+    def cert_store_reload(self) -> OrchResult[str]:
+        raise NotImplementedError()
+
+    def cert_store_cert_check(self) -> OrchResult[List[str]]:
+        raise NotImplementedError()
+
+    def cert_store_key_ls(self, include_cephadm_generated_keys: bool = False) -> OrchResult[Dict[str, Any]]:
+        raise NotImplementedError()
+
+    def get_nvmeof_tls_bundle(self, service_name: str, daemon_name: str) -> OrchResult[Dict[str, str]]:
         raise NotImplementedError()
 
     def cert_store_get_cert(
         self,
-        entity: str,
+        cert_name: str,
         service_name: Optional[str] = None,
         hostname: Optional[str] = None,
         no_exception_when_missing: bool = False
@@ -577,10 +561,57 @@ class Orchestrator(object):
 
     def cert_store_get_key(
         self,
-        entity: str,
+        key_name: str,
         service_name: Optional[str] = None,
         hostname: Optional[str] = None,
         no_exception_when_missing: bool = False
+    ) -> OrchResult[str]:
+        raise NotImplementedError()
+
+    def cert_store_set_pair(
+        self,
+        cert: str,
+        key: str,
+        consumer: str,
+        cert_name: Optional[str] = None,
+        service_name: Optional[str] = None,
+        hostname: Optional[str] = None,
+        force: Optional[bool] = False
+    ) -> OrchResult[str]:
+        raise NotImplementedError()
+
+    def cert_store_set_cert(
+        self,
+        cert_name: str,
+        cert: str,
+        service_name: Optional[str] = None,
+        hostname: Optional[str] = None,
+        force: bool = False
+    ) -> OrchResult[str]:
+        raise NotImplementedError()
+
+    def cert_store_set_key(
+        self,
+        key: str,
+        key_name: str,
+        service_name: Optional[str] = None,
+        hostname: Optional[str] = None,
+    ) -> OrchResult[str]:
+        raise NotImplementedError()
+
+    def cert_store_rm_cert(
+        self,
+        cert_name: str,
+        service_name: Optional[str] = None,
+        hostname: Optional[str] = None,
+    ) -> OrchResult[str]:
+        raise NotImplementedError()
+
+    def cert_store_rm_key(
+        self,
+        key_name: str,
+        service_name: Optional[str] = None,
+        hostname: Optional[str] = None,
     ) -> OrchResult[str]:
         raise NotImplementedError()
 
@@ -610,6 +641,7 @@ class Orchestrator(object):
             'prometheus': self.apply_prometheus,
             'loki': self.apply_loki,
             'promtail': self.apply_promtail,
+            'alloy': self.apply_alloy,
             'rbd-mirror': self.apply_rbd_mirror,
             'rgw': self.apply_rgw,
             'ingress': self.apply_ingress,
@@ -641,7 +673,7 @@ class Orchestrator(object):
         """
         raise NotImplementedError()
 
-    def remove_daemons(self, names: List[str]) -> OrchResult[List[str]]:
+    def remove_daemons(self, names: List[str], force_delete_data: bool = False) -> OrchResult[List[str]]:
         """
         Remove specific daemon(s).
 
@@ -649,7 +681,7 @@ class Orchestrator(object):
         """
         raise NotImplementedError()
 
-    def remove_service(self, service_name: str, force: bool = False) -> OrchResult[str]:
+    def remove_service(self, service_name: str, force: bool = False, force_delete_data: bool = False) -> OrchResult[str]:
         """
         Remove a service (a collection of daemons).
 
@@ -670,7 +702,7 @@ class Orchestrator(object):
         # assert action in ["start", "stop", "reload, "restart", "redeploy"]
         raise NotImplementedError()
 
-    def daemon_action(self, action: str, daemon_name: str, image: Optional[str] = None) -> OrchResult[str]:
+    def daemon_action(self, action: str, daemon_name: str, image: Optional[str] = None, force: bool = False) -> OrchResult[str]:
         """
         Perform an action (start/stop/reload) on a daemon.
 
@@ -682,7 +714,7 @@ class Orchestrator(object):
         # assert action in ["start", "stop", "reload, "restart", "redeploy"]
         raise NotImplementedError()
 
-    def create_osds(self, drive_group: DriveGroupSpec) -> OrchResult[str]:
+    def create_osds(self, drive_group: DriveGroupSpec, skip_validation: bool = False) -> OrchResult[str]:
         """
         Create one or more OSDs within a single Drive Group.
 
@@ -745,6 +777,10 @@ class Orchestrator(object):
         """
         Returns a status of the ongoing OSD removal operations.
         """
+        raise NotImplementedError()
+
+    def set_osd_spec(self, service_name: str, osd_ids: List[str]) -> OrchResult:
+        """ set service of osd """
         raise NotImplementedError()
 
     def blink_device_light(self, ident_fault: str, on: bool, locations: List['DeviceLightLoc']) -> OrchResult[List[str]]:
@@ -837,6 +873,14 @@ class Orchestrator(object):
         """remove prometheus target for multi-cluster"""
         raise NotImplementedError()
 
+    def set_prometheus_remote_write(self, url: str, remote_write_allowed_metrics: List[str]) -> OrchResult[str]:
+        """set prometheus remote write url and allowed metrics for multi-cluster"""
+        raise NotImplementedError()
+
+    def remove_prometheus_remote_write(self, url: str) -> OrchResult[str]:
+        """remove prometheus remote write url and allowed metrics for multi-cluster"""
+        raise NotImplementedError()
+
     def get_alertmanager_access_info(self) -> OrchResult[Dict[str, str]]:
         """get alertmanager access information"""
         raise NotImplementedError()
@@ -855,6 +899,10 @@ class Orchestrator(object):
 
     def apply_promtail(self, spec: ServiceSpec) -> OrchResult[str]:
         """Update existing a Promtail daemon(s)"""
+        raise NotImplementedError()
+
+    def apply_alloy(self, spec: ServiceSpec) -> OrchResult[str]:
+        """Update existing a alloy daemon(s)"""
         raise NotImplementedError()
 
     def apply_crash(self, spec: ServiceSpec) -> OrchResult[str]:
@@ -920,7 +968,8 @@ class Orchestrator(object):
         raise NotImplementedError()
 
     def upgrade_start(self, image: Optional[str], version: Optional[str], daemon_types: Optional[List[str]],
-                      hosts: Optional[str], services: Optional[List[str]], limit: Optional[int]) -> OrchResult[str]:
+                      hosts: Optional[str], services: Optional[List[str]], limit: Optional[int],
+                      bucket_type: Optional[str] = None, bucket_name: Optional[str] = None) -> OrchResult[str]:
         raise NotImplementedError()
 
     def upgrade_pause(self) -> OrchResult[str]:
@@ -939,6 +988,9 @@ class Orchestrator(object):
 
         :return: UpgradeStatusSpec instance
         """
+        raise NotImplementedError()
+
+    def update_service(self, service_type: str, service_image: str, image: str) -> OrchResult:
         raise NotImplementedError()
 
     @_hide_in_features
@@ -984,6 +1036,7 @@ def daemon_type_to_service(dtype: str) -> str:
         'ceph-exporter': 'ceph-exporter',
         'loki': 'loki',
         'promtail': 'promtail',
+        'alloy': 'alloy',
         'crash': 'crash',
         'crashcollector': 'crash',  # Specific Rook Daemon
         'container': 'container',
@@ -1019,6 +1072,7 @@ def service_to_daemon_types(stype: str) -> List[str]:
         'prometheus': ['prometheus'],
         'loki': ['loki'],
         'promtail': ['promtail'],
+        'alloy': ['alloy'],
         'node-exporter': ['node-exporter'],
         'ceph-exporter': ['ceph-exporter'],
         'crash': ['crash'],
@@ -1061,6 +1115,39 @@ class UpgradeStatusSpec(object):
             'message': self.message,
             'is_paused': self.is_paused,
         }
+
+    def to_dict(self) -> Dict:
+        out: Dict[str, Any] = {}
+        out['in_progress'] = self.in_progress
+        out['target_image'] = self.target_image
+        out['services_complete'] = self.services_complete
+        out['which'] = self.which
+        out['progress'] = self.progress
+        out['message'] = self.message
+        out['is_paused'] = self.is_paused
+        return out
+
+    @classmethod
+    def from_json(cls, data: dict) -> 'UpgradeStatusSpec':
+        if not isinstance(data, dict):
+            raise ValueError(f'Expected a dictionary, but got {type(data)}')
+        instance = cls()
+        instance.in_progress = data.get('in_progress', False)
+        instance.target_image = data.get('target_image', None)
+        instance.services_complete = data.get('services_complete', [])
+        instance.which = data.get('which', '<unknown>')
+        instance.progress = data.get('progress', None)
+        instance.message = data.get('message', "")
+        instance.is_paused = data.get('is_paused', False)
+
+        return instance
+
+    @staticmethod
+    def yaml_representer(dumper: 'yaml.Dumper', data: 'UpgradeStatusSpec') -> yaml.Node:
+        return dumper.represent_dict(cast(Mapping, data.to_json().items()))
+
+
+yaml.add_representer(UpgradeStatusSpec, UpgradeStatusSpec.yaml_representer)
 
 
 def handle_type_error(method: FuncT) -> FuncT:
@@ -1139,6 +1226,8 @@ class DaemonDescription(object):
                  rank_generation: Optional[int] = None,
                  extra_container_args: Optional[GeneralArgList] = None,
                  extra_entrypoint_args: Optional[GeneralArgList] = None,
+                 pending_daemon_config: bool = False,
+                 user_stopped: bool = False
                  ) -> None:
 
         #: Host is at the same granularity as InventoryHost
@@ -1213,6 +1302,8 @@ class DaemonDescription(object):
         if extra_entrypoint_args:
             self.extra_entrypoint_args = ArgumentSpec.from_general_args(
                 extra_entrypoint_args)
+        self.pending_daemon_config = pending_daemon_config
+        self.user_stopped = user_stopped
 
     def __setattr__(self, name: str, value: Any) -> None:
         if value is not None and name in ('extra_container_args', 'extra_entrypoint_args'):
@@ -1334,6 +1425,12 @@ class DaemonDescription(object):
             return f'{daemon_type_to_service(self.daemon_type)}.{self.service_id()}'
         return daemon_type_to_service(self.daemon_type)
 
+    def update_pending_daemon_config(self, value: bool) -> None:
+        self.pending_daemon_config = value
+
+    def update_user_stopped_status(self, value: bool) -> None:
+        self.user_stopped = value
+
     def __repr__(self) -> str:
         return "<DaemonDescription>({type}.{id})".format(type=self.daemon_type,
                                                          id=self.daemon_id)
@@ -1367,6 +1464,8 @@ class DaemonDescription(object):
         out['rank'] = self.rank
         out['rank_generation'] = self.rank_generation
         out['systemd_unit'] = self.systemd_unit
+        out['pending_daemon_config'] = self.pending_daemon_config
+        out['user_stopped'] = self.user_stopped
 
         for k in ['last_refresh', 'created', 'started', 'last_deployed',
                   'last_configured']:
@@ -1404,6 +1503,8 @@ class DaemonDescription(object):
         out['ports'] = self.ports
         out['ip'] = self.ip
         out['systemd_unit'] = self.systemd_unit
+        out['pending_daemon_config'] = self.pending_daemon_config
+        out['user_stopped'] = self.user_stopped
 
         for k in ['last_refresh', 'created', 'started', 'last_deployed',
                   'last_configured']:

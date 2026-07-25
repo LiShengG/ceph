@@ -1,5 +1,5 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab ft=cpp
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab ft=cpp
 
 #include "include/compat.h"
 #include "common/errno.h"
@@ -17,7 +17,6 @@
 #include "common/RefCountedObj.h"
 
 #include "rgw_coroutine.h"
-#include "rgw_tools.h"
 
 #include <atomic>
 #include <string_view>
@@ -36,6 +35,7 @@ static void do_curl_easy_cleanup(RGWCurlHandle *curl_handle);
 struct rgw_http_req_data : public RefCountedObject {
   RGWCurlHandle *curl_handle{nullptr};
   curl_slist *h{nullptr};
+  curl_slist *connect_to_slist{nullptr};
   uint64_t id;
   int ret{0};
   std::atomic<bool> done = { false };
@@ -107,7 +107,14 @@ struct rgw_http_req_data : public RefCountedObject {
 
     curl_handle = NULL;
     h = NULL;
+
+    if (connect_to_slist) {
+      curl_slist_free_all(connect_to_slist);
+      connect_to_slist = nullptr;
+    }
+
     done = true;
+
     if (completion) {
       boost::system::error_code ec(-ret, boost::system::system_category());
       Completion::post(std::move(completion), ec);
@@ -295,7 +302,7 @@ void RGWIOProvider::assign_io(RGWIOIDProvider& io_id_provider, int io_type)
 
 RGWHTTPClient::RGWHTTPClient(CephContext *cct,
                              const string& _method,
-                             const string& _url)
+                             const RGWEndpoint& _endpoint)
     : NoDoutPrefix(cct, dout_subsys),
       has_send_len(false),
       http_status(HTTP_STATUS_NOSTATUS),
@@ -303,19 +310,31 @@ RGWHTTPClient::RGWHTTPClient(CephContext *cct,
       verify_ssl(cct->_conf->rgw_verify_ssl),
       cct(cct),
       method(_method),
-      url_orig(_url),
-      url(_url) {
+      endpoint(_endpoint) {
   init();
 }
 
 std::ostream& RGWHTTPClient::gen_prefix(std::ostream& out) const
 {
-  out << "http_client[" << method << "/" << url << "]";
+  out << "http_client[" << method << "/" << endpoint.get_url() << "]";
   return out;
 }
 
 void RGWHTTPClient::init()
 {
+  char* ca_bundle = std::getenv("CURL_CA_BUNDLE");
+  if (ca_bundle) {
+    size_t ca_bundle_len = strlen(ca_bundle);
+    size_t max_len = PATH_MAX + NAME_MAX;
+    if (ca_bundle_len > max_len) {
+      ldout(cct, 0) << "ERROR: " << __func__ << "(): CURL_CA_BUNDLE length exceeds the allowed maximum (" << max_len << " chars)" << dendl;
+    } else {
+      set_ca_path(ca_bundle);
+    }
+  }
+
+  const string url = endpoint.get_url();
+
   auto pos = url.find("://");
   if (pos == string::npos) {
     host = url;
@@ -463,6 +482,10 @@ void RGWHTTPClient::_set_write_paused(bool pause)
   ceph_assert(ceph_mutex_is_locked(req_data->lock));
   
   RGWHTTPManager *mgr = req_data->mgr;
+  if (!mgr) {
+    // request already finished; nothing to pause/resume
+    return;
+  }
   if (pause == req_data->write_paused) {
     return;
   }
@@ -478,6 +501,10 @@ void RGWHTTPClient::_set_read_paused(bool pause)
   ceph_assert(ceph_mutex_is_locked(req_data->lock));
   
   RGWHTTPManager *mgr = req_data->mgr;
+  if (!mgr) {
+    // request already finished; nothing to pause/resume
+    return;
+  }
   if (pause == req_data->read_paused) {
     return;
   }
@@ -541,7 +568,7 @@ int RGWHTTPClient::process(const DoutPrefixProvider* dpp, optional_yield y)
 string RGWHTTPClient::to_str()
 {
   string method_str = (method.empty() ? "<no-method>" : method);
-  string url_str = (url.empty() ? "<no-url>" : url);
+  string url_str = (endpoint.get_url().empty() ? "<no-url>" : endpoint.get_url());
   return method_str + " " + url_str;
 }
 
@@ -567,14 +594,31 @@ int RGWHTTPClient::init_request(rgw_http_req_data *_req_data)
 
   CURL *easy_handle = req_data->get_easy_handle();
 
-  dout(20) << "sending request to " << url << dendl;
+  dout(20) << "sending request to " << endpoint << dendl;
 
   curl_slist *h = headers_to_slist(headers);
 
   req_data->h = h;
 
   curl_easy_setopt(easy_handle, CURLOPT_CUSTOMREQUEST, method.c_str());
-  curl_easy_setopt(easy_handle, CURLOPT_URL, url.c_str());
+  curl_easy_setopt(easy_handle, CURLOPT_URL, endpoint.get_url().c_str());
+
+  // apply CONNECT_TO mapping if provided for this request
+  if (! endpoint.get_connect_to().empty()) {
+    if (req_data->connect_to_slist) {
+      curl_slist_free_all(req_data->connect_to_slist);
+      req_data->connect_to_slist = nullptr;
+    }
+
+    req_data->connect_to_slist = curl_slist_append(req_data->connect_to_slist, endpoint.get_connect_to().c_str());
+    if (! req_data->connect_to_slist) {
+      dout(0) << "ERROR: RGWHTTPClient::init_request failed to allocate connect_to_slist: " << endpoint << dendl;
+    } else {
+      dout(20) << "applying CURLOPT_CONNECT_TO " << endpoint << dendl;
+      curl_easy_setopt(easy_handle, CURLOPT_CONNECT_TO, req_data->connect_to_slist);
+    }
+  }
+
   curl_easy_setopt(easy_handle, CURLOPT_NOPROGRESS, 1L);
   curl_easy_setopt(easy_handle, CURLOPT_NOSIGNAL, 1L);
   curl_easy_setopt(easy_handle, CURLOPT_HEADERFUNCTION, receive_http_header);
@@ -635,6 +679,7 @@ int RGWHTTPClient::init_request(rgw_http_req_data *_req_data)
   }
   curl_easy_setopt(easy_handle, CURLOPT_PRIVATE, (void *)req_data);
   curl_easy_setopt(easy_handle, CURLOPT_TIMEOUT, req_timeout);
+  curl_easy_setopt(easy_handle, CURLOPT_CONNECTTIMEOUT, req_connect_timeout);
 
   return 0;
 }
@@ -819,9 +864,11 @@ void RGWHTTPManager::_complete_request(rgw_http_req_data *req_data)
     std::lock_guard l{req_data->lock};
     req_data->mgr = nullptr;
   }
+#ifdef WITH_RADOSGW_RADOS
   if (completion_mgr) {
     completion_mgr->complete(NULL, req_data->control_io_id, req_data->user_info);
   }
+#endif
 
   req_data->put();
 }
@@ -878,10 +925,16 @@ void RGWHTTPManager::unlink_request(rgw_http_req_data *req_data)
 
 void RGWHTTPManager::manage_pending_requests()
 {
+  std::list<set_state> changes;
+  {
+    std::lock_guard l{reqs_change_state_lock};
+    changes.swap(reqs_change_state);
+  }
+
   reqs_lock.lock_shared();
   if (max_threaded_req == num_reqs &&
       unregistered_reqs.empty() &&
-      reqs_change_state.empty()) {
+      changes.empty()) {
     reqs_lock.unlock_shared();
     return;
   }
@@ -889,11 +942,8 @@ void RGWHTTPManager::manage_pending_requests()
 
   std::unique_lock wl{reqs_lock};
 
-  if (!reqs_change_state.empty()) {
-    for (auto siter : reqs_change_state) {
-      _set_req_state(siter);
-    }
-    reqs_change_state.clear();
+  for (auto& siter : changes) {
+    _set_req_state(siter);
   }
 
   if (!unregistered_reqs.empty()) {
@@ -1033,7 +1083,10 @@ int RGWHTTPManager::set_request_state(RGWHTTPClient *client, RGWHTTPRequestSetSt
     bitmask |= CURLPAUSE_RECV;
   }
 
-  reqs_change_state.push_back(set_state(req_data, bitmask));
+  {
+    std::lock_guard l{reqs_change_state_lock};
+    reqs_change_state.push_back(set_state(req_data, bitmask));
+  }
   int ret = signal_thread();
   if (ret < 0) {
     return ret;
@@ -1168,6 +1221,7 @@ void *RGWHTTPManager::reqs_thread_entry()
   std::unique_lock rl{reqs_lock};
   for (auto r : unregistered_reqs) {
     _unlink_request(r);
+    r->put();
   }
 
   unregistered_reqs.clear();
@@ -1179,9 +1233,11 @@ void *RGWHTTPManager::reqs_thread_entry()
 
   reqs.clear();
 
+#ifdef WITH_RADOSGW_RADOS
   if (completion_mgr) {
     completion_mgr->go_down();
   }
+#endif
   
   return 0;
 }

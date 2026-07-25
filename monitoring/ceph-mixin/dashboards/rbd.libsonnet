@@ -34,7 +34,7 @@ local info_rbd_stats = std.join(
       ) + { type: 'timeseries' } + { fieldConfig: { defaults: { unit: formatY1, custom: { fillOpacity: 8, showPoints: 'never' } } } } + { gridPos: { x: x, y: y, w: w, h: h } };
 
     $.dashboardSchema(
-      'RBD Details',
+      'Ceph Block - Details',
       'Detailed Performance of RBD Images (IOPS/Throughput/Latency)',
       'YhCYGcuZz',
       'now-1h',
@@ -54,6 +54,20 @@ local info_rbd_stats = std.join(
         'dashboard'
       )
     )
+    .addLinks([
+      $.addLinkSchema(
+        asDropdown=true,
+        icon='external link',
+        includeVars=true,
+        keepTime=true,
+        tags=[],
+        targetBlank=false,
+        title='Browse Dashboards',
+        tooltip='',
+        type='dashboards',
+        url=''
+      ),
+    ])
     .addRequired(
       type='grafana', id='grafana', name='Grafana', version='5.3.3'
     )
@@ -80,7 +94,7 @@ local info_rbd_stats = std.join(
     .addTemplate(
       $.addTemplateSchema('image',
                           '$datasource',
-                          'label_values(ceph_rbd_read_ops{%(matchers)s, pool="$pool"}, image)' % $.matchers(),
+                          'label_values(ceph_rbd_read_ops{%(matchers)s pool="$pool"}, image)' % $.matchers(),
                           1,
                           false,
                           0,
@@ -163,7 +177,7 @@ local info_rbd_stats = std.join(
       ) + { type: 'timeseries' } + { fieldConfig: { defaults: { unit: formatY1, custom: { fillOpacity: 8, showPoints: 'never' } } } } + { gridPos: { x: x, y: y, w: w, h: h } };
 
     $.dashboardSchema(
-      'RBD Overview',
+      'Ceph Block - Overview',
       '',
       '41FrpeUiz',
       'now-1h',
@@ -183,6 +197,20 @@ local info_rbd_stats = std.join(
         'dashboard'
       )
     )
+    .addLinks([
+      $.addLinkSchema(
+        asDropdown=true,
+        icon='external link',
+        includeVars=true,
+        keepTime=true,
+        tags=[],
+        targetBlank=false,
+        title='Browse Dashboards',
+        tooltip='',
+        type='dashboards',
+        url=''
+      ),
+    ])
     .addRequired(
       type='grafana', id='grafana', name='Grafana', version='5.4.2'
     )

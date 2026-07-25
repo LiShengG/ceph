@@ -19,6 +19,8 @@
 #include <errno.h>
 #include <sstream>
 
+using namespace rados::cls::numops;
+
 namespace rados {
   namespace cls {
     namespace numops {
@@ -28,7 +30,7 @@ namespace rados {
               const std::string& key,
               double value_to_add)
       {
-        bufferlist in, out;
+        bufferlist in;
         encode(key, in);
 
         std::stringstream stream;
@@ -36,7 +38,10 @@ namespace rados {
 
         encode(stream.str(), in);
 
-        return ioctx->exec(oid, "numops", "add", in, out);
+        librados::ObjectWriteOperation op;
+        op.exec(method::add, in);
+
+        return ioctx->operate(oid, &op);
       }
 
       int sub(librados::IoCtx *ioctx,
@@ -60,7 +65,10 @@ namespace rados {
 
         encode(stream.str(), in);
 
-        return ioctx->exec(oid, "numops", "mul", in, out);
+        librados::ObjectWriteOperation op;
+        op.exec(method::mul, in);
+
+        return ioctx->operate(oid, &op);
       }
 
       int div(librados::IoCtx *ioctx,

@@ -1,5 +1,5 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab ft=cpp
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab ft=cpp
 
 #include <errno.h>
 #include <ctime>
@@ -21,13 +21,11 @@
 #include "rgw_account.h"
 #include "rgw_b64.h"
 #include "rgw_common.h"
-#include "rgw_tools.h"
 #include "rgw_role.h"
-#include "rgw_user.h"
+#include "driver/rados/rgw_user.h"
 #include "rgw_iam_policy.h"
 #include "rgw_sts.h"
 #include "rgw_sal.h"
-#include "rgw_sal_rados.h"
 
 #define dout_subsys ceph_subsys_rgw
 
@@ -77,6 +75,11 @@ int Credentials::generateCredentials(const DoutPrefixProvider *dpp,
     return -EINVAL;
   }
   string secret_s = cct->_conf->rgw_sts_key;
+  if (secret_s.empty()) {
+    ldpp_dout(dpp, 1) << "ERROR: rgw sts key not set" << dendl;
+    return -EINVAL;
+  }
+
   buffer::ptr secret(secret_s.c_str(), secret_s.length());
   int ret = 0;
   if (ret = cryptohandler->validate_secret(secret); ret < 0) {
@@ -124,7 +127,7 @@ int Credentials::generateCredentials(const DoutPrefixProvider *dpp,
   if (identity) {
     token.acct_name = identity->get_acct_name();
     token.perm_mask = identity->get_perm_mask();
-    token.is_admin = identity->is_admin_of(token.user);
+    token.is_admin = identity->is_admin();
     token.acct_type = identity->get_identity_type();
   } else {
     token.acct_name = {};
@@ -399,16 +402,16 @@ AssumeRoleResponse STSService::assumeRole(const DoutPrefixProvider *dpp,
   AssumeRoleResponse response;
   response.packedPolicySize = 0;
 
-  //Get the role info which is being assumed
-  boost::optional<rgw::ARN> r_arn = rgw::ARN::parse(req.getRoleARN());
-  if (r_arn == boost::none) {
-    ldpp_dout(dpp, 0) << "Error in parsing role arn: " << req.getRoleARN() << dendl;
-    response.retCode = -EINVAL;
+  auto [ret, r] = getRoleInfo(dpp, req.getRoleARN(), y);
+  if (ret < 0) {
+    response.retCode = ret;
     return response;
   }
 
-  string roleId = role->get_id();
-  uint64_t roleMaxSessionDuration = role->get_max_session_duration();
+  boost::optional<rgw::ARN> r_arn = rgw::ARN::parse(req.getRoleARN());
+
+  string roleId = r->get_id();
+  uint64_t roleMaxSessionDuration = r->get_max_session_duration();
   req.setMaxDuration(roleMaxSessionDuration);
 
   //Validate input

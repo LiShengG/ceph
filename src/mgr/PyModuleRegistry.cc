@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph - scalable distributed file system
  *
@@ -98,6 +99,7 @@ void PyModuleRegistry::init()
   ceph_assert(pMainThreadState != nullptr);
 
   std::list<std::string> failed_modules;
+  thread_monitor->start_monitoring();
 
   const std::string module_path = g_conf().get_val<std::string>("mgr_module_path");
   auto module_names = probe_modules(module_path);
@@ -117,7 +119,6 @@ void PyModuleRegistry::init()
       failed_modules.push_back(module_name);
       // Don't drop out here, load the other modules
     }
-
     // Record the module even if the load failed, so that we can
     // report its loading error
     modules[module_name] = std::move(mod);
@@ -211,7 +212,7 @@ void PyModuleRegistry::active_start(
             const std::map<std::string, std::string> &kv_store,
 	    bool mon_provides_kv_sub,
             MonClient &mc, LogChannelRef clog_, LogChannelRef audit_clog_,
-            Objecter &objecter_, Client &client_, Finisher &f,
+            Objecter &objecter_, Finisher &f,
             DaemonServer &server)
 {
   std::lock_guard locker(lock);
@@ -234,8 +235,8 @@ void PyModuleRegistry::active_start(
       module_config,
       kv_store, mon_provides_kv_sub,
       ds, cs, mc,
-      clog_, audit_clog_, objecter_, client_, f, server,
-      *this));
+      clog_, audit_clog_, objecter_, f, server,
+      *this, thread_monitor.get()));
 
   for (const auto &i : modules) {
     // Anything we're skipping because of !can_run will be flagged
@@ -428,6 +429,8 @@ void PyModuleRegistry::get_health_checks(health_check_map_t *checks)
         //   checks (to avoid outputting two health messages about a
         //   module that said can_run=false but we tried running it anyway)
         failed_modules[module->get_name()] = module->get_error_string();
+      } else if ((active_modules->is_pending(module->get_name()))) {
+        failed_modules[module->get_name()] = "Module failed to initialize.";
       }
     }
 
@@ -506,4 +509,8 @@ void PyModuleRegistry::handle_config_notify()
   if (active_modules) {
     active_modules->config_notify();
   }
+}
+
+void PyModuleRegistry::check_all_modules_started(Context *modules_start_complete) {
+  active_modules->check_all_modules_started(modules_start_complete);
 }

@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*- 
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*- 
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph - scalable distributed file system
  *
@@ -15,22 +16,26 @@
 #ifndef CEPH_MONMAP_H
 #define CEPH_MONMAP_H
 
-#ifdef WITH_SEASTAR
+#ifdef WITH_CRIMSON
 #include <seastar/core/future.hh>
 #endif
 
 #include "common/config_fwd.h"
 #include "common/ceph_releases.h"
+#include "include/types.h" // for epoch_t
+#include "include/uuid.h" // for uuid_d
 
-#include "include/err.h"
-#include "include/types.h"
+#include "mon/mon_types.h" // for mon_feature_t
 
-#include "mon/mon_types.h"
-#include "msg/Message.h"
+#include <iosfwd>
+#include <map>
+#include <set>
+#include <string>
+#include <vector>
 
 class health_check_map_t;
 
-#ifdef WITH_SEASTAR
+#ifdef WITH_CRIMSON
 namespace crimson::common {
   class ConfigProxy;
 }
@@ -60,6 +65,8 @@ struct mon_info_t {
   uint16_t priority{0};
   uint16_t weight{0};
 
+  ceph::real_clock::time_point time_added = ceph::real_clock::zero();
+
   /**
    * The location of the monitor, in CRUSH hierarchy terms
    */
@@ -79,25 +86,19 @@ struct mon_info_t {
     : name(n), public_addrs(p_addrs)
   { }
 
-  mon_info_t() { }
-
+  mon_info_t() = default;
 
   void encode(ceph::buffer::list& bl, uint64_t features) const;
   void decode(ceph::buffer::list::const_iterator& p);
   void print(std::ostream& out) const;
   void dump(ceph::Formatter *f) const;
-  static void generate_test_instances(std::list<mon_info_t*>& ls);
+  static std::list<mon_info_t> generate_test_instances();
 };
 WRITE_CLASS_ENCODER_FEATURES(mon_info_t)
 
-inline std::ostream& operator<<(std::ostream& out, const mon_info_t& mon) {
-  mon.print(out);
-  return out;
-}
-
 class MonMap {
  public:
-  epoch_t epoch;       // what epoch/version of the monmap
+  epoch_t epoch{0};       // what epoch/version of the monmap
   uuid_d fsid;
   utime_t last_changed;
   utime_t created;
@@ -180,9 +181,7 @@ public:
     }
   }
 
-  MonMap()
-    : epoch(0) {
-  }
+  MonMap() = default;
 
   uuid_d& get_fsid() { return fsid; }
 
@@ -213,26 +212,16 @@ public:
     }
   }
 
+  mon_info_t const& get(std::string const& name) const {
+    return mon_info.at(name);
+  }
+
   /**
    * Add new monitor to the monmap
    *
    * @param m monitor info of the new monitor
    */
-  void add(const mon_info_t& m) {
-    ceph_assert(mon_info.count(m.name) == 0);
-    for (auto& a : m.public_addrs.v) {
-      ceph_assert(addr_mons.count(a) == 0);
-    }
-    mon_info[m.name] = m;
-    if (get_required_features().contains_all(
-	  ceph::features::mon::FEATURE_NAUTILUS)) {
-      ranks.push_back(m.name);
-      ceph_assert(ranks.size() == mon_info.size());
-    } else {
-      calc_legacy_ranks();
-    }
-    calc_addr_mons();
-  }
+  mon_info_t& add(mon_info_t&& m);
 
   /**
    * Add new monitor to the monmap
@@ -240,9 +229,9 @@ public:
    * @param name Monitor name (i.e., 'foo' in 'mon.foo')
    * @param addr Monitor's public address
    */
-  void add(const std::string &name, const entity_addrvec_t &addrv,
+  mon_info_t& add(const std::string &name, const entity_addrvec_t &addrv,
 	   uint16_t priority=0, uint16_t weight=0) {
-    add(mon_info_t(name, addrv, priority, weight));
+    return add(mon_info_t(name, addrv, priority, weight));
   }
 
   /**
@@ -456,7 +445,7 @@ public:
    * @param cct context (and associated config)
    * @param errout std::ostream to send error messages too
    */
-#ifdef WITH_SEASTAR
+#ifdef WITH_CRIMSON
   seastar::future<> build_initial(const crimson::common::ConfigProxy& conf, bool for_mkfs);
 #else
   int build_initial(CephContext *cct, bool for_mkfs, std::ostream& errout);
@@ -487,7 +476,7 @@ public:
 
   void check_health(health_check_map_t *checks) const;
 
-  static void generate_test_instances(std::list<MonMap*>& o);
+  static std::list<MonMap> generate_test_instances();
 protected:
   /**
    * build a monmap from a list of entity_addrvec_t's
@@ -525,7 +514,7 @@ protected:
 		      bool for_mkfs,
 		      std::string_view prefix);
   int init_with_config_file(const ConfigProxy& conf, std::ostream& errout);
-#if WITH_SEASTAR
+#if WITH_CRIMSON
   seastar::future<> read_monmap(const std::string& monmap);
   /// try to build monmap with different settings, like
   /// mon_host, mon* sections, and mon_dns_srv_name

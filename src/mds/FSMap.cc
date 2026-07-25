@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*- 
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*- 
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph - scalable distributed file system
  *
@@ -19,8 +20,9 @@
 #include "FSMap.h"
 #include "common/debug.h"
 #include "common/StackStringStream.h"
+#include "common/strtol.h" // for strict_strtoll()
 
-#ifdef WITH_SEASTAR
+#ifdef WITH_CRIMSON
 #include "crimson/common/config_proxy.h"
 #else
 #include "common/config_proxy.h"
@@ -115,12 +117,14 @@ void MirrorInfo::dump(ceph::Formatter *f) const {
   f->close_section(); // peers
 }
 
-void MirrorInfo::generate_test_instances(std::list<MirrorInfo*>& ls) {
-  ls.push_back(new MirrorInfo());
-  ls.push_back(new MirrorInfo());
-  ls.back()->mirrored = true;
-  ls.back()->peers.insert(Peer());
-  ls.back()->peers.insert(Peer());
+std::list<MirrorInfo> MirrorInfo::generate_test_instances() {
+  std::list<MirrorInfo> ls;
+  ls.push_back(MirrorInfo());
+  ls.push_back(MirrorInfo());
+  ls.back().mirrored = true;
+  ls.back().peers.insert(Peer());
+  ls.back().peers.insert(Peer());
+  return ls;
 }
 
 void MirrorInfo::print(std::ostream& out) const {
@@ -194,23 +198,23 @@ FSMap &FSMap::operator=(const FSMap &rhs)
   return *this;
 }
 
-void FSMap::generate_test_instances(std::list<FSMap*>& ls)
+std::list<FSMap> FSMap::generate_test_instances()
 {
-  FSMap* fsmap = new FSMap();
+  std::list<FSMap> ls;
 
-  std::list<MDSMap*> mds_map_instances;
-  MDSMap::generate_test_instances(mds_map_instances);
+  FSMap fsmap;
 
   int k = 20;
-  for (auto& mdsmap : mds_map_instances) {
+  for (auto& mdsmap : MDSMap::generate_test_instances()) {
     auto fs = Filesystem();
     fs.fscid = k++;
-    fs.mds_map = *mdsmap;
-    fsmap->filesystems[fs.fscid] = fs;
-    delete mdsmap;
+    fs.mds_map = mdsmap;
+    fsmap.filesystems[fs.fscid] = fs;
   }
 
-  ls.push_back(fsmap);
+  ls.push_back(std::move(fsmap));
+
+  return ls;
 }
 
 void FSMap::print(ostream& out) const
@@ -513,7 +517,11 @@ const Filesystem& FSMap::commit_filesystem(fs_cluster_id_t fscid, Filesystem fs)
     legacy_client_fscid = fs.fscid;
   }
 
-  auto [it, inserted] = filesystems.emplace(std::piecewise_construct, std::forward_as_tuple(fs.fscid), std::forward_as_tuple(std::move(fs)));
+  auto fs_fscid = fs.fscid; // Avoid use of fs after its moved
+  // the use and move are unsequenced, i.e. there is no guarantee about the order in which they are evaluated
+  auto [it, inserted] = filesystems.emplace(
+      std::piecewise_construct, std::forward_as_tuple(fs_fscid),
+      std::forward_as_tuple(std::move(fs)));
   ceph_assert(inserted);
   return it->second;
 }
@@ -664,7 +672,7 @@ void FSMap::decode(bufferlist::const_iterator& p)
   struct_version = 0;
   DECODE_START(STRUCT_VERSION, p);
   DECODE_OLDEST(7);
-  struct_version = struct_v;
+  struct_version = struct_v.v;
   decode(epoch, p);
   decode(next_filesystem_id, p);
   decode(legacy_client_fscid, p);
@@ -677,7 +685,11 @@ void FSMap::decode(bufferlist::const_iterator& p)
     for (__u32 i = 0; i < len; i++) {
       auto fs = Filesystem();
       decode(fs, p); /* need fscid to insert into map */
-      [[maybe_unused]] auto [it, inserted] = filesystems.emplace(std::piecewise_construct, std::forward_as_tuple(fs.fscid), std::forward_as_tuple(std::move(fs)));
+      auto fs_fscid = fs.fscid; // Avoid use of fs after its moved
+      // the use and move are unsequenced, i.e. there is no guarantee about the order in which they are evaluated
+      [[maybe_unused]] auto [it, inserted] = filesystems.emplace(
+          std::piecewise_construct, std::forward_as_tuple(fs_fscid),
+          std::forward_as_tuple(std::move(fs)));
       ceph_assert(inserted);
     }
   }
@@ -737,7 +749,7 @@ int FSMap::parse_filesystem(std::string_view ns_str, Filesystem const** result) 
         return 0;
       }
     }
-    return -CEPHFS_ENOENT;
+    return -ENOENT;
   } else {
     *result = &get_filesystem(fscid);
     return 0;
@@ -1162,7 +1174,7 @@ int FSMap::parse_role(
     if (r >= 0) {
       ss << "Invalid file system";
     }
-    return -CEPHFS_ENOENT;
+    return -ENOENT;
   }
 
   return r;
@@ -1179,14 +1191,14 @@ int FSMap::parse_role(
   if (colon_pos == std::string::npos) {
     if (legacy_client_fscid == FS_CLUSTER_ID_NONE) {
       ss << "No filesystem selected";
-      return -CEPHFS_ENOENT;
+      return -ENOENT;
     }
     fs = &get_filesystem(legacy_client_fscid);
     rank_pos = 0;
   } else {
     if (parse_filesystem(role_str.substr(0, colon_pos), &fs) < 0) {
       ss << "Invalid filesystem";
-      return -CEPHFS_ENOENT;
+      return -ENOENT;
     }
     rank_pos = colon_pos+1;
   }
@@ -1197,14 +1209,14 @@ int FSMap::parse_role(
   long rank_i = strict_strtol(rank_str.c_str(), 10, &err);
   if (rank_i < 0 || !err.empty()) {
     ss << "Invalid rank '" << rank_str << "'";
-    return -CEPHFS_EINVAL;
+    return -EINVAL;
   } else {
     rank = rank_i;
   }
 
   if (fs->mds_map.in.count(rank) == 0) {
     ss << "Rank '" << rank << "' not found";
-    return -CEPHFS_ENOENT;
+    return -ENOENT;
   }
 
   *role = {fs->fscid, rank};
@@ -1233,7 +1245,7 @@ void FSMap::erase_filesystem(fs_cluster_id_t fscid)
       });
     }
   }
-  for ([[maybe_unused]] auto& [fscid, fs] : filesystems) {
+  for ([[maybe_unused]] auto& [remaining_fscid, fs] : filesystems) {
     for (auto& [gid, info] : fs.mds_map.get_mds_info()) {
       if (info.join_fscid == fscid) {
         modify_daemon(gid, [](auto& info) {

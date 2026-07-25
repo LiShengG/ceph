@@ -1,17 +1,19 @@
-import { ComponentFixture, TestBed, fakeAsync, tick } from '@angular/core/testing';
+import { ComponentFixture, TestBed } from '@angular/core/testing';
 import { HttpClientModule } from '@angular/common/http';
-import { of } from 'rxjs';
+import { ActivatedRoute, Router } from '@angular/router';
+import { BehaviorSubject, Subject, of } from 'rxjs';
+import { take } from 'rxjs/operators';
 import { RouterTestingModule } from '@angular/router/testing';
 import { SharedModule } from '~/app/shared/shared.module';
 
 import { NvmeofService } from '../../../shared/api/nvmeof.service';
 import { AuthStorageService } from '~/app/shared/services/auth-storage.service';
-import { ModalService } from '~/app/shared/services/modal.service';
+import { ModalCdsService } from '~/app/shared/services/modal-cds.service';
 import { TaskWrapperService } from '~/app/shared/services/task-wrapper.service';
 import { NvmeofSubsystemsComponent } from './nvmeof-subsystems.component';
-import { NvmeofTabsComponent } from '../nvmeof-tabs/nvmeof-tabs.component';
 import { NvmeofSubsystemsDetailsComponent } from '../nvmeof-subsystems-details/nvmeof-subsystems-details.component';
-import { ComboBoxModule, GridModule } from 'carbon-components-angular';
+import { NvmeofGatewayGroupFilterComponent } from '../nvmeof-gateway-group-filter/nvmeof-gateway-group-filter.component';
+import { NvmeofStateService } from '../nvmeof-state.service';
 
 const mockSubsystems = [
   {
@@ -30,32 +32,41 @@ const mockSubsystems = [
 const mockGroups = [
   [
     {
-      service_name: 'nvmeof.rbd.default',
+      service_name: 'nvmeof.default',
       service_type: 'nvmeof',
-      unmanaged: false,
-      spec: {
-        group: 'default'
-      }
-    },
-    {
-      service_name: 'nvmeof.rbd.foo',
-      service_type: 'nvmeof',
-      unmanaged: false,
-      spec: {
-        group: 'foo'
-      }
+      service_id: 'default',
+      spec: { group: 'default' }
     }
-  ],
-  2
+  ]
 ];
 
 class MockNvmeOfService {
+  listGatewayGroups() {
+    return of([
+      [
+        {
+          service_name: 'nvmeof.default',
+          service_type: 'nvmeof',
+          service_id: 'default',
+          spec: { group: 'default' }
+        }
+      ]
+    ]);
+  }
+
+  formatGwGroupsList(response: any) {
+    return (response?.[0] || []).map((g: any) => ({
+      content: g.spec.group,
+      selected: false
+    }));
+  }
+
   listSubsystems() {
     return of(mockSubsystems);
   }
 
-  listGatewayGroups() {
-    return of(mockGroups);
+  getInitiators() {
+    return of([]);
   }
 }
 
@@ -72,22 +83,47 @@ class MockTaskWrapperService {}
 describe('NvmeofSubsystemsComponent', () => {
   let component: NvmeofSubsystemsComponent;
   let fixture: ComponentFixture<NvmeofSubsystemsComponent>;
+  let queryParams$: BehaviorSubject<Record<string, string>>;
+  const activatedRouteMock = {
+    queryParams: null as any,
+    snapshot: { queryParams: {} as Record<string, string> }
+  };
 
   beforeEach(async () => {
+    const refresh$ = new Subject<void>();
+    queryParams$ = new BehaviorSubject<Record<string, string>>({});
+    activatedRouteMock.queryParams = queryParams$.asObservable();
+    activatedRouteMock.snapshot.queryParams = queryParams$.value;
+
     await TestBed.configureTestingModule({
-      declarations: [
-        NvmeofSubsystemsComponent,
-        NvmeofTabsComponent,
-        NvmeofSubsystemsDetailsComponent
+      declarations: [NvmeofSubsystemsComponent, NvmeofSubsystemsDetailsComponent],
+      imports: [
+        HttpClientModule,
+        RouterTestingModule,
+        SharedModule,
+        NvmeofGatewayGroupFilterComponent
       ],
-      imports: [HttpClientModule, RouterTestingModule, SharedModule, ComboBoxModule, GridModule],
       providers: [
         { provide: NvmeofService, useClass: MockNvmeOfService },
         { provide: AuthStorageService, useClass: MockAuthStorageService },
-        { provide: ModalService, useClass: MockModalService },
-        { provide: TaskWrapperService, useClass: MockTaskWrapperService }
+        { provide: ModalCdsService, useClass: MockModalService },
+        { provide: TaskWrapperService, useClass: MockTaskWrapperService },
+        { provide: ActivatedRoute, useValue: activatedRouteMock },
+        {
+          provide: NvmeofStateService,
+          useValue: { refresh$: refresh$.asObservable(), requestRefresh: jest.fn() }
+        }
       ]
     }).compileComponents();
+
+    const router = TestBed.inject(Router);
+    jest.spyOn(router, 'navigate').mockImplementation((_commands, extras?) => {
+      const group = extras?.queryParams?.['group'];
+      const params = group ? { group: String(group) } : {};
+      activatedRouteMock.snapshot.queryParams = params;
+      queryParams$.next(params);
+      return Promise.resolve(true);
+    });
 
     fixture = TestBed.createComponent(NvmeofSubsystemsComponent);
     component = fixture.componentInstance;
@@ -99,17 +135,38 @@ describe('NvmeofSubsystemsComponent', () => {
     expect(component).toBeTruthy();
   });
 
-  it('should retrieve subsystems', fakeAsync(() => {
+  it('should retrieve subsystems', (done) => {
+    const expected = mockSubsystems.map((s) => ({
+      ...s,
+      gw_group: component.groupHandler.group,
+      auth: 'No authentication',
+      initiator_count: 0
+    }));
+    component.subsystems$.pipe(take(1)).subscribe((subsystems) => {
+      expect(subsystems).toEqual(expected);
+      done();
+    });
     component.getSubsystems();
-    tick();
-    expect(component.subsystems).toEqual(mockSubsystems);
-  }));
-
-  it('should load gateway groups correctly', () => {
-    expect(component.gwGroups.length).toBe(2);
   });
 
   it('should set first group as default initially', () => {
-    expect(component.group).toBe(mockGroups[0][0].spec.group);
+    expect(component.groupHandler.group).toBe(mockGroups[0][0].spec.group);
+  });
+
+  it('should show subsystems across groups when dropdown selection is cleared', (done) => {
+    component.groupHandler.onGroupClear();
+    component.subsystems$.pipe(take(1)).subscribe((subsystems) => {
+      expect(subsystems.length).toBeGreaterThan(0);
+      done();
+    });
+    component.getSubsystems();
+  });
+
+  it('should clear selected group and stop fetching subsystems', () => {
+    component.groupHandler.group = 'default';
+
+    component.groupHandler.onGroupChange(null);
+
+    expect(component.groupHandler.group).toBeNull();
   });
 });

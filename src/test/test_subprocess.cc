@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph distributed storage system
  *
@@ -257,7 +258,7 @@ TEST(SubProcessTimed, SubshellNoTimeout)
 TEST(SubProcessTimed, SubshellKilled)
 {
   SubProcessTimed sh(SHELL, SubProcess::PIPE, SubProcess::PIPE, SubProcess::PIPE, 10);
-  sh.add_cmd_args("-c", SHELL "-c cat", NULL);
+  sh.add_cmd_args("-c", SHELL " -c cat", NULL);
   ASSERT_EQ(sh.spawn(), 0);
   std::string msg("etaoin shrdlu");
   int n = write(sh.get_stdin(), msg.c_str(), msg.size());

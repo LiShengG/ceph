@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph - scalable distributed file system
  *
@@ -15,6 +16,7 @@
 #include "PG.h"
 #include "messages/MOSDRepScrub.h"
 
+#include "common/debug.h"
 #include "common/errno.h"
 #include "common/ceph_releases.h"
 #include "common/config.h"
@@ -514,6 +516,8 @@ void PG::finish_recovery_op(const hobject_t& soid, bool dequeue)
 
 void PG::split_into(pg_t child_pgid, PG *child, unsigned split_bits)
 {
+  dout(10) << __func__ << " split_bits " << split_bits << dendl;
+
   recovery_state.split_into(child_pgid, &child->recovery_state, split_bits);
 
   child->update_snap_mapper_bits(split_bits);
@@ -1099,6 +1103,7 @@ void PG::read_state(ObjectStore *store)
 	info,
 	oss,
 	cct->_conf->osd_ignore_stale_divergent_priors,
+	pool.info.allows_ecoptimizations(),
 	cct->_conf->osd_debug_verify_missing_on_start);
 
       if (oss.tellp())
@@ -1210,6 +1215,17 @@ void PG::requeue_op(OpRequestRef op)
 
 void PG::requeue_ops(list<OpRequestRef> &ls)
 {
+  if (!waiting_for_readable.empty() && &ls != &waiting_for_peered &&
+      &ls != &waiting_for_flush && &ls != &waiting_for_active &&
+      &ls != &waiting_for_readable) {
+    dout(20) << __func__ << " not readable ops (count=" << ls.size() << ")"
+             << dendl;
+    for (auto& op : ls) {
+      op->mark_delayed("waiting for readable");
+    }
+    waiting_for_readable.splice(waiting_for_readable.begin(), ls);
+  }
+
   for (list<OpRequestRef>::reverse_iterator i = ls.rbegin();
        i != ls.rend();
        ++i) {
@@ -1286,25 +1302,12 @@ Scrub::schedule_result_t PG::start_scrubbing(
       candidate.level, osd_restrictions, pg_cond);
 }
 
-double PG::next_deepscrub_interval() const
-{
-  double deep_scrub_interval =
-    pool.info.opts.value_or(pool_opts_t::DEEP_SCRUB_INTERVAL, 0.0);
-  if (deep_scrub_interval <= 0.0)
-    deep_scrub_interval = cct->_conf->osd_deep_scrub_interval;
-  return info.history.last_deep_scrub_stamp + deep_scrub_interval;
-}
-
-void PG::on_scrub_schedule_input_change(Scrub::delay_ready_t delay_ready)
+void PG::on_scrub_schedule_input_change()
 {
   if (is_active() && is_primary() && !is_scrub_queued_or_active()) {
-    dout(10) << fmt::format(
-		    "{}: active/primary. delay_ready={:c}", __func__,
-		    (delay_ready == Scrub::delay_ready_t::delay_ready) ? 't'
-								       : 'f')
-	     << dendl;
+    dout(10) << fmt::format("{}: active/primary", __func__) << dendl;
     ceph_assert(m_scrubber);
-    m_scrubber->update_scrub_job(delay_ready);
+    m_scrubber->update_scrub_job();
   } else {
     dout(10) << fmt::format(
 		    "{}: inactive, non-primary - or already scrubbing",
@@ -1561,8 +1564,12 @@ void PG::on_backfill_reserved()
   queue_recovery();
 }
 
-void PG::on_backfill_canceled()
+void PG::on_backfill_suspended()
 {
+  // Scan replies asked before suspending this backfill should be ignored.
+  // See PrimaryLogPG::do_scan -  case MOSDPGScan::OP_SCAN_DIGEST.
+  // `waiting_on_backfill` will be re-refilled after the suspended backfill
+  // is resumed/restarted.
   if (!waiting_on_backfill.empty()) {
     waiting_on_backfill.clear();
     finish_recovery_op(hobject_t::get_max());
@@ -1738,7 +1745,7 @@ void PG::unreserve_recovery_space() {
   local_num_bytes.store(0);
 }
 
-void PG::_scan_rollback_obs(const vector<ghobject_t> &rollback_obs)
+bool PG::_scan_rollback_obs(const vector<ghobject_t> &rollback_obs)
 {
   ObjectStore::Transaction t;
   eversion_t trimmed_to = recovery_state.get_last_rollback_info_trimmed_to_applied();
@@ -1759,7 +1766,9 @@ void PG::_scan_rollback_obs(const vector<ghobject_t> &rollback_obs)
     derr << __func__ << ": queueing trans to clean up obsolete rollback objs"
 	 << dendl;
     osd->store->queue_transaction(ch, std::move(t), NULL);
+    return true; // a transaction was queued
   }
+  return false;
 }
 
 
@@ -1933,8 +1942,7 @@ bool PG::can_discard_op(OpRequestRef& op)
     return true;
   }
 
-  if ((m->get_flags() & (CEPH_OSD_FLAG_BALANCE_READS |
-			 CEPH_OSD_FLAG_LOCALIZE_READS)) &&
+  if ((m->get_flags() & CEPH_OSD_FLAGS_DIRECT_READ) &&
       !is_primary() &&
       m->get_map_epoch() < info.history.same_interval_since) {
     // Note: the Objecter will resend on interval change without the primary
@@ -2203,7 +2211,7 @@ void PG::handle_activate_map(PeeringCtx &rctx, epoch_t range_starts_at)
   // on_scrub_schedule_input_change() as pool.info contains scrub scheduling
   // parameters.
   if (pool.info.last_change >= range_starts_at) {
-    on_scrub_schedule_input_change(Scrub::delay_ready_t::delay_ready);
+    on_scrub_schedule_input_change();
   }
 }
 

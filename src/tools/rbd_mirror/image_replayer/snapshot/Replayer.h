@@ -1,5 +1,5 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
 
 #ifndef RBD_MIRROR_IMAGE_REPLAYER_SNAPSHOT_REPLAYER_H
 #define RBD_MIRROR_IMAGE_REPLAYER_SNAPSHOT_REPLAYER_H
@@ -47,17 +47,20 @@ public:
       Threads<ImageCtxT>* threads,
       InstanceWatcher<ImageCtxT>* instance_watcher,
       const std::string& local_mirror_uuid,
+      const std::string& local_mirror_peer_uuid,
       PoolMetaCache* pool_meta_cache,
       StateBuilder<ImageCtxT>* state_builder,
       ReplayerListener* replayer_listener) {
     return new Replayer(threads, instance_watcher, local_mirror_uuid,
-                        pool_meta_cache, state_builder, replayer_listener);
+                        local_mirror_peer_uuid, pool_meta_cache, state_builder,
+                        replayer_listener);
   }
 
   Replayer(
       Threads<ImageCtxT>* threads,
       InstanceWatcher<ImageCtxT>* instance_watcher,
       const std::string& local_mirror_uuid,
+      const std::string& local_mirror_peer_uuid,
       PoolMetaCache* pool_meta_cache,
       StateBuilder<ImageCtxT>* state_builder,
       ReplayerListener* replayer_listener);
@@ -115,10 +118,10 @@ private:
    * LOAD_LOCAL_IMAGE_META <----------------------------\
    *    |                                               |
    *    v (skip if not needed)                          |
-   * REFRESH_LOCAL_IMAGE                                |
+   * REFRESH_REMOTE_IMAGE                               |
    *    |                                               |
    *    v (skip if not needed)                          |
-   * REFRESH_REMOTE_IMAGE                               |
+   * REFRESH_LOCAL_IMAGE                                |
    *    |                                               |
    *    | (unused non-primary snapshot)                 |
    *    |\--------------> PRUNE_NON_PRIMARY_SNAPSHOT---/|
@@ -202,6 +205,7 @@ private:
   Threads<ImageCtxT>* m_threads;
   InstanceWatcher<ImageCtxT>* m_instance_watcher;
   std::string m_local_mirror_uuid;
+  std::string m_local_mirror_peer_uuid;
   PoolMetaCache* m_pool_meta_cache;
   StateBuilder<ImageCtxT>* m_state_builder;
   ReplayerListener* m_replayer_listener;
@@ -257,6 +261,8 @@ private:
 
   PerfCounters *m_perf_counters = nullptr;
 
+  bool is_remote_primary();
+
   void load_local_image_meta();
   void handle_load_local_image_meta(int r);
 
@@ -269,8 +275,8 @@ private:
   void scan_local_mirror_snapshots(std::unique_lock<ceph::mutex>* locker);
   void scan_remote_mirror_snapshots(std::unique_lock<ceph::mutex>* locker);
 
-  void prune_non_primary_snapshot(uint64_t snap_id);
-  void handle_prune_non_primary_snapshot(int r);
+  void prune_mirror_snapshot(uint64_t snap_id);
+  void handle_prune_mirror_snapshot(int r);
 
   void copy_snapshots();
   void handle_copy_snapshots(int r);

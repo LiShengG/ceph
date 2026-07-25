@@ -1,11 +1,15 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab ft=cpp
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab ft=cpp
 
 #pragma once
 
-#include <string>
-#include <include/types.h>
+#include <cstdint>
 #include <map>
+#include <string>
+
+#include "include/encoding.h"
+
+namespace ceph { class Formatter; }
 
 class RGWObjTags
 {
@@ -30,13 +34,39 @@ protected:
   }
 
   void decode(bufferlist::const_iterator &bl) {
-    DECODE_START_LEGACY_COMPAT_LEN(1, 1, 1, bl);
-    decode(tag_map,bl);
-    DECODE_FINISH(bl);
+    // Some older objects may have stored tags as a plain URL-encoded
+    // string (e.g. "key=value") rather than binary ENCODE_START format.
+    // Try binary decode first, fall back to set_from_string() on failure.
+    auto start_pos = bl;
+    try {
+      DECODE_START_LEGACY_COMPAT_LEN(1, 1, 1, bl);
+      decode(tag_map, bl);
+      DECODE_FINISH(bl);
+    } catch (buffer::error& e) {
+      // Failed binary decode. Try plain-text URL-encoded tag string.
+      tag_map.clear();
+      bl = start_pos;
+      std::string raw;
+      try {
+        auto remaining = bl.get_remaining();
+        if (remaining > 0) {
+          bl.copy(remaining, raw);
+          // strip trailing null bytes
+          while (!raw.empty() && raw.back() == '\0') {
+            raw.pop_back();
+          }
+        }
+      } catch (buffer::error&) {
+        throw e;
+      }
+      if (raw.empty() || set_from_string(raw) < 0) {
+        throw e;
+      }
+    }
   }
 
   void dump(Formatter *f) const;
-  static void generate_test_instances(std::list<RGWObjTags*>& o);
+  static std::list<RGWObjTags> generate_test_instances();
   void add_tag(const std::string& key, const std::string& val="");
   void emplace_tag(std::string&& key, std::string&& val);
   int check_and_add_tag(const std::string& key, const std::string& val="");

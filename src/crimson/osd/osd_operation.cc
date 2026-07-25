@@ -1,10 +1,13 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
 
 #include "osd_operation.h"
 #include "common/Formatter.h"
 #include "crimson/common/log.h"
 #include "crimson/osd/osd_operations/client_request.h"
+
+using namespace std::string_literals;
+SET_SUBSYS(osd);
 
 namespace {
   seastar::logger& logger() {
@@ -12,6 +15,7 @@ namespace {
   }
 }
 
+using namespace crimson::osd::scheduler;
 namespace crimson::osd {
 
 void OSDOperationRegistry::do_stop()
@@ -136,28 +140,148 @@ size_t OSDOperationRegistry::dump_slowest_historic_client_requests(ceph::Formatt
   return ops_count;
 }
 
+void OSDOperationRegistry::visit_ops_in_flight(std::function<void(const ClientRequest&)>&& visit)
+{
+  const auto& client_registry =
+    get_registry<static_cast<size_t>(OperationTypeCode::client_request)>();
+  auto it = std::begin(client_registry);
+  for (; it != std::end(client_registry); ++it) {
+    const auto& fastest_historic_op = static_cast<const ClientRequest&>(*it);
+    visit(fastest_historic_op);
+  }
+}
+
+void OperationThrottler::start()
+{
+  LOG_PREFIX(OperationThrottler::start);
+  if (started) {
+    DEBUG("OperationThrottler background task is already started, skipping.");
+    return;
+  }
+
+  started=true;
+  stopped=false;
+
+  INFO("Starting OperationThrottler background task");
+  bg_future.emplace(background_task());
+  return;
+}
+
+void OperationThrottler::register_metrics(const std::string &sched_type) {
+  namespace sm = seastar::metrics;
+
+  LOG_PREFIX(OperationThrottler::register_metrics);
+  INFO("registering metrics for scheduler {}", sched_type);
+  const std::string group_name =
+    (sched_type == "mclock_scheduler") ? "osd_mclock" : "osd_wpq";
+
+  for (auto& [op_class, name] : {
+    std::pair{SchedulerClass::background_recovery,    "background_recovery"},
+    std::pair{SchedulerClass::background_best_effort, "background_best_effort"},
+    std::pair{SchedulerClass::client,                 "client"},
+    std::pair{SchedulerClass::repop,                  "repop"},
+    std::pair{SchedulerClass::immediate,              "immediate"},
+  }) {
+    auto label = sm::label("op_class")(name);
+    metrics.add_group(group_name, {
+      sm::make_counter("throttled_ops",
+        [this, op_class] { return throttled_ops[op_class]; },
+        sm::description("ops delayed by mClock scheduler"), {label}),
+      sm::make_counter("total_wait_ms",
+        [this, op_class] { return total_wait_ms[op_class]; },
+        sm::description("total ms spent waiting in mClock"), {label}),
+      sm::make_gauge("max_wait_ms",
+        [this, op_class] { return max_wait_ms[op_class]; },
+        sm::description("max wait ms in mClock by op class"), {label}),
+      sm::make_histogram("throttle_wait_latency",
+        [this, op_class]() -> seastar::metrics::histogram& {
+          return wait_hist[op_class]; },
+        sm::description("mClock throttle wait distribution"), {label}),
+    });
+  }
+}
+
+
 OperationThrottler::OperationThrottler(ConfigProxy &conf)
-  : scheduler(crimson::osd::scheduler::make_scheduler(conf))
 {
   conf.add_observer(this);
+  for (auto op_class : {SchedulerClass::background_recovery,
+                        SchedulerClass::background_best_effort,
+                        SchedulerClass::client,
+                        SchedulerClass::repop,
+                        SchedulerClass::immediate}) {
+    wait_hist[op_class].buckets = {
+      {0, 1},
+      {0, 5},
+      {0, 10},
+      {0, 50},
+      {0, 100},
+      {0, 500},
+      {0, 1000},
+    };
+  }
+  register_metrics(conf.get_val<std::string>("osd_op_queue"));
+
+}
+
+void OperationThrottler::initialize_scheduler(CephContext *cct, ConfigProxy &conf, bool is_rotational, int whoami)
+{
+  scheduler = crimson::osd::scheduler::make_scheduler(cct, conf, whoami, seastar::smp::count,
+            seastar::this_shard_id(), is_rotational, true);
   update_from_config(conf);
 }
 
-void OperationThrottler::wake()
-{
-  while ((!max_in_progress || in_progress < max_in_progress) &&
-	 !scheduler->empty()) {
-    auto item = scheduler->dequeue();
-    item.wake.set_value();
-    ++in_progress;
-    --pending;
+seastar::future<> OperationThrottler::background_task() {
+  LOG_PREFIX(OperationThrottler::background_task);
+  while (!stopped) {
+    co_await cv.wait([this] {
+      return (available() && !scheduler->empty()) || stopped;
+    });
+
+    // It might be possible as mclock scheduler can return a timestamp in double means
+    // the work item is scheduled in the future, so in that case wait until
+    // the returned timestamp in the dequeue response before retrying.
+    while (available() && !scheduler->empty() && !stopped) {
+      WorkItem work_item = scheduler->dequeue();
+      if (auto when_ready = std::get_if<double>(&work_item)) {
+        ceph::real_clock::time_point future_time = ceph::real_clock::from_double(*when_ready);
+        auto now = ceph::real_clock::now();
+        ceph_assert(future_time > now);
+        auto wait_duration = std::chrono::duration_cast<std::chrono::milliseconds>(future_time - now);
+        INFO("No items ready. Retrying in {} ms", wait_duration.count());
+        co_await seastar::sleep(wait_duration);
+        continue;
+      }
+      if (auto *item = std::get_if<crimson::osd::scheduler::item_t>(&work_item)) {
+        DEBUG("Waking up a work item");
+        item->wake.set_value();
+        ++in_progress;
+        --pending;
+        DEBUG("Updated counters during background_task: in_progress={}, pending={}", in_progress, pending);
+      } else {
+        DEBUG("Unexpected variant in WorkItem — neither time nor item");
+      }
+    }
   }
+
+  DEBUG("Background task exiting cleanly");
+  co_return;
+}
+
+void OperationThrottler::wake() {
+  // Attempt to wakeup pending operation if resources are available.
+  // The mclock scheduler might return delay if item is not ready
+  // to process
+  cv.signal();
 }
 
 void OperationThrottler::release_throttle()
 {
+  LOG_PREFIX(OperationThrottler::release_throttle);
   ceph_assert(in_progress > 0);
   --in_progress;
+  DEBUG("Updated counters during release_throttle: in_progress={}, pending={}",
+        in_progress, pending);
   wake();
 }
 
@@ -167,13 +291,57 @@ seastar::future<> OperationThrottler::acquire_throttle(
   crimson::osd::scheduler::item_t item{params, seastar::promise<>()};
   auto fut = item.wake.get_future();
   scheduler->enqueue(std::move(item));
+  ++pending;
+  wake();
   return fut;
+}
+
+seastar::future<> OperationThrottler::stop()
+{
+  if (!started)
+    co_return;
+
+  stopped = true;
+  cv.broadcast();
+
+  if (bg_future && !bg_future->available()) {
+    co_await std::move(*bg_future);
+  }
+
+  bg_future.reset();
+  started = false;
+
+  co_return;
+}
+
+void OperationThrottler::record_throttle_wait(
+  SchedulerClass op_class, uint64_t wait_ms)
+{
+  if (wait_ms == 0) {
+    return;
+  }
+  throttled_ops[op_class]++;
+  total_wait_ms[op_class] += wait_ms;
+  max_wait_ms[op_class] = std::max(max_wait_ms[op_class], wait_ms);
+
+  auto& h = wait_hist[op_class];
+  h.sample_count++;
+  h.sample_sum += wait_ms;
+  for (auto& bucket : h.buckets) {
+    if (wait_ms <= bucket.upper_bound) {
+      bucket.count++;
+    }
+  }
 }
 
 void OperationThrottler::dump_detail(Formatter *f) const
 {
   f->dump_unsigned("max_in_progress", max_in_progress);
   f->dump_unsigned("in_progress", in_progress);
+  f->dump_unsigned("pending", pending);
+  f->dump_unsigned("background_task started", started);
+  f->dump_unsigned("background_task stopeed", stopped);
+
   f->open_object_section("scheduler");
   {
     scheduler->dump(*f);
@@ -187,13 +355,9 @@ void OperationThrottler::update_from_config(const ConfigProxy &conf)
   wake();
 }
 
-const char** OperationThrottler::get_tracked_conf_keys() const
+std::vector<std::string> OperationThrottler::get_tracked_keys() const noexcept
 {
-  static const char* KEYS[] = {
-    "crimson_osd_scheduler_concurrency",
-    NULL
-  };
-  return KEYS;
+  return {"crimson_osd_scheduler_concurrency"s};
 }
 
 void OperationThrottler::handle_conf_change(

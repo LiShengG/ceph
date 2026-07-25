@@ -1,11 +1,10 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab ft=cpp
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab ft=cpp
 
 #pragma once
 
 #include "rgw_rest.h"
 #include "rgw_rest_s3.h"
-#include "rgw_sal_rados.h"
 
 class RGWHandler_Ratelimit : public RGWHandler_Auth_S3 {
 protected:

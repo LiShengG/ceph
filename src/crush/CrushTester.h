@@ -1,5 +1,5 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
 
 #ifndef CEPH_CRUSH_TESTER_H
 #define CEPH_CRUSH_TESTER_H
@@ -31,6 +31,7 @@ class CrushTester {
   bool output_mappings;
   bool output_bad_mappings;
   bool output_choose_tries;
+  bool show_retry_exhaustion;
 
   bool output_data_file;
   bool output_csv;
@@ -182,6 +183,7 @@ public:
       output_mappings(false),
       output_bad_mappings(false),
       output_choose_tries(false),
+      show_retry_exhaustion(false),
       output_data_file(false),
       output_csv(false),
       output_data_file_name("")
@@ -249,6 +251,13 @@ public:
   }
   bool get_output_choose_tries() const {
     return output_choose_tries;
+  }
+
+  void set_show_retry_exhaustion(bool b) {
+    show_retry_exhaustion = b;
+  }
+  bool get_show_retry_exhaustion() const {
+    return show_retry_exhaustion;
   }
 
   void set_batches(int b) {

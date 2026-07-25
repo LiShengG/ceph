@@ -12,11 +12,12 @@ from datetime import datetime, timedelta
 from string import ascii_lowercase, ascii_uppercase, digits, punctuation
 from typing import List, Optional, Sequence
 
-import bcrypt
-from mgr_module import CLICheckNonemptyFileInput, CLIReadCommand, CLIWriteCommand
+from ceph.cryptotools.select import get_crypto_caller
+from mgr_module import CLICheckNonemptyFileInput
 from mgr_util import password_hash
 
 from .. import mgr
+from ..cli import DBCLICommand
 from ..exceptions import PasswordPolicyException, PermissionNotValid, \
     PwdExpirationDateNotValid, RoleAlreadyExists, RoleDoesNotExist, \
     RoleIsAssociatedWithUser, RoleNotInUser, ScopeNotInRole, ScopeNotValid, \
@@ -24,7 +25,7 @@ from ..exceptions import PasswordPolicyException, PermissionNotValid, \
 from ..security import Permission, Scope
 from ..settings import Settings
 
-logger = logging.getLogger('access_control')
+logger = logging.getLogger(__name__)
 DEFAULT_FILE_DESC = 'password/secret'
 
 
@@ -194,12 +195,12 @@ class Role(object):
                     r_dict['scopes_permissions'])
 
     @classmethod
-    def map_to_system_roles(cls, roles) -> List['Role']:
+    def map_to_system_roles(cls, roles: List[str]) -> List['Role']:
         matches = []
-        for rn in SYSTEM_ROLES_NAMES:
+        for sys_role in ROLE_MAPPER:
             for role in roles:
-                if role in SYSTEM_ROLES_NAMES[rn]:
-                    matches.append(rn)
+                if role in ROLE_MAPPER[sys_role]:
+                    matches.append(sys_role)
         return matches
 
 
@@ -217,9 +218,10 @@ ADMIN_ROLE = Role(
 # read-only role provides read-only permission for all scopes
 READ_ONLY_ROLE = Role(
     'read-only',
-    'allows read permission for all security scope except dashboard settings and config-opt', {
+    'allows read permission for all security scope except user, '
+    'dashboard settings and config-opt', {
         scope_name: [_P.READ] for scope_name in Scope.all_scopes()
-        if scope_name not in (Scope.DASHBOARD_SETTINGS, Scope.CONFIG_OPT)
+        if scope_name not in (Scope.USER, Scope.DASHBOARD_SETTINGS, Scope.CONFIG_OPT)
     })
 
 
@@ -230,8 +232,10 @@ BLOCK_MGR_ROLE = Role(
         Scope.POOL: [_P.READ],
         Scope.ISCSI: [_P.READ, _P.CREATE, _P.UPDATE, _P.DELETE],
         Scope.RBD_MIRRORING: [_P.READ, _P.CREATE, _P.UPDATE, _P.DELETE],
+        Scope.HOSTS: [_P.READ],
         Scope.GRAFANA: [_P.READ],
         Scope.NVME_OF: [_P.READ, _P.CREATE, _P.UPDATE, _P.DELETE],
+        Scope.PROMETHEUS: [_P.READ]
     })
 
 
@@ -240,6 +244,7 @@ RGW_MGR_ROLE = Role(
     'rgw-manager', 'allows full permissions for the rgw scope', {
         Scope.RGW: [_P.READ, _P.CREATE, _P.UPDATE, _P.DELETE],
         Scope.GRAFANA: [_P.READ],
+        Scope.PROMETHEUS: [_P.READ]
     })
 
 
@@ -250,11 +255,13 @@ CLUSTER_MGR_ROLE = Role(
     and config-opt scopes""", {
         Scope.HOSTS: [_P.READ, _P.CREATE, _P.UPDATE, _P.DELETE],
         Scope.OSD: [_P.READ, _P.CREATE, _P.UPDATE, _P.DELETE],
+        Scope.POOL: [_P.READ],
         Scope.MONITOR: [_P.READ, _P.CREATE, _P.UPDATE, _P.DELETE],
         Scope.MANAGER: [_P.READ, _P.CREATE, _P.UPDATE, _P.DELETE],
         Scope.CONFIG_OPT: [_P.READ, _P.CREATE, _P.UPDATE, _P.DELETE],
         Scope.LOG: [_P.READ, _P.CREATE, _P.UPDATE, _P.DELETE],
         Scope.GRAFANA: [_P.READ],
+        Scope.PROMETHEUS: [_P.READ]
     })
 
 
@@ -263,6 +270,7 @@ POOL_MGR_ROLE = Role(
     'pool-manager', 'allows full permissions for the pool scope', {
         Scope.POOL: [_P.READ, _P.CREATE, _P.UPDATE, _P.DELETE],
         Scope.GRAFANA: [_P.READ],
+        Scope.PROMETHEUS: [_P.READ]
     })
 
 # CephFS manager role provides all permissions for CephFS related scopes
@@ -270,6 +278,7 @@ CEPHFS_MGR_ROLE = Role(
     'cephfs-manager', 'allows full permissions for the cephfs scope', {
         Scope.CEPHFS: [_P.READ, _P.CREATE, _P.UPDATE, _P.DELETE],
         Scope.GRAFANA: [_P.READ],
+        Scope.PROMETHEUS: [_P.READ]
     })
 
 GANESHA_MGR_ROLE = Role(
@@ -278,16 +287,20 @@ GANESHA_MGR_ROLE = Role(
         Scope.CEPHFS: [_P.READ, _P.CREATE, _P.UPDATE, _P.DELETE],
         Scope.RGW: [_P.READ, _P.CREATE, _P.UPDATE, _P.DELETE],
         Scope.GRAFANA: [_P.READ],
-        Scope.SMB: [_P.READ]
+        Scope.SMB: [_P.READ],
+        Scope.PROMETHEUS: [_P.READ]
     })
 
 SMB_MGR_ROLE = Role(
     'smb-manager', 'allows full permissions for the smb scope', {
         Scope.SMB: [_P.READ, _P.CREATE, _P.UPDATE, _P.DELETE],
+        Scope.HOSTS: [_P.READ],
+        Scope.POOL: [_P.READ],
         Scope.CEPHFS: [_P.READ, _P.CREATE, _P.UPDATE, _P.DELETE],
         Scope.RGW: [_P.READ, _P.CREATE, _P.UPDATE, _P.DELETE],
         Scope.GRAFANA: [_P.READ],
-        Scope.NFS_GANESHA: [_P.READ]
+        Scope.NFS_GANESHA: [_P.READ],
+        Scope.PROMETHEUS: [_P.READ]
     })
 
 
@@ -304,9 +317,16 @@ SYSTEM_ROLES = {
 }
 
 # static name-like roles list for role mapping
-SYSTEM_ROLES_NAMES = {
+ROLE_MAPPER = {
     ADMIN_ROLE: [ADMIN_ROLE.name, 'admin'],
-    READ_ONLY_ROLE: [READ_ONLY_ROLE.name, 'read', 'guest', 'monitor']
+    READ_ONLY_ROLE: [READ_ONLY_ROLE.name, 'read', 'guest', 'monitor'],
+    BLOCK_MGR_ROLE: [BLOCK_MGR_ROLE.name, 'block', 'rbd'],
+    RGW_MGR_ROLE: [RGW_MGR_ROLE.name, 'object', 'rgw'],
+    CLUSTER_MGR_ROLE: [CLUSTER_MGR_ROLE.name, 'cluster'],
+    POOL_MGR_ROLE: [POOL_MGR_ROLE.name, 'pool'],
+    CEPHFS_MGR_ROLE: [CEPHFS_MGR_ROLE.name, 'cephfs'],
+    GANESHA_MGR_ROLE: [GANESHA_MGR_ROLE.name, 'ganesha', 'nfs'],
+    SMB_MGR_ROLE: [SMB_MGR_ROLE.name, 'smb']
 }
 
 
@@ -591,7 +611,7 @@ def load_access_control_db():
 
 # CLI dashboard access control scope commands
 
-@CLIWriteCommand('dashboard set-login-credentials')
+@DBCLICommand.Write('dashboard set-login-credentials')
 @CLICheckNonemptyFileInput(desc=DEFAULT_FILE_DESC)
 def set_login_credentials_cmd(_, username: str, inbuf: str):
     '''
@@ -615,7 +635,7 @@ def set_login_credentials_cmd(_, username: str, inbuf: str):
 Username and password updated''', ''
 
 
-@CLIReadCommand('dashboard ac-role-show')
+@DBCLICommand.Read('dashboard ac-role-show')
 def ac_role_show_cmd(_, rolename: Optional[str] = None):
     '''
     Show role info
@@ -634,7 +654,7 @@ def ac_role_show_cmd(_, rolename: Optional[str] = None):
     return 0, json.dumps(role.to_dict()), ''
 
 
-@CLIWriteCommand('dashboard ac-role-create')
+@DBCLICommand.Write('dashboard ac-role-create')
 def ac_role_create_cmd(_, rolename: str, description: Optional[str] = None):
     '''
     Create a new access control role
@@ -647,7 +667,7 @@ def ac_role_create_cmd(_, rolename: str, description: Optional[str] = None):
         return -errno.EEXIST, '', str(ex)
 
 
-@CLIWriteCommand('dashboard ac-role-delete')
+@DBCLICommand.Write('dashboard ac-role-delete')
 def ac_role_delete_cmd(_, rolename: str):
     '''
     Delete an access control role
@@ -665,7 +685,7 @@ def ac_role_delete_cmd(_, rolename: str):
         return -errno.EPERM, '', str(ex)
 
 
-@CLIWriteCommand('dashboard ac-role-add-scope-perms')
+@DBCLICommand.Write('dashboard ac-role-add-scope-perms')
 def ac_role_add_scope_perms_cmd(_,
                                 rolename: str,
                                 scopename: str,
@@ -694,7 +714,7 @@ def ac_role_add_scope_perms_cmd(_,
             .format(Permission.all_permissions())
 
 
-@CLIWriteCommand('dashboard ac-role-del-scope-perms')
+@DBCLICommand.Write('dashboard ac-role-del-scope-perms')
 def ac_role_del_scope_perms_cmd(_, rolename: str, scopename: str):
     '''
     Delete the scope permissions for a role
@@ -714,7 +734,7 @@ def ac_role_del_scope_perms_cmd(_, rolename: str, scopename: str):
         return -errno.ENOENT, '', str(ex)
 
 
-@CLIReadCommand('dashboard ac-user-show')
+@DBCLICommand.Read('dashboard ac-user-show')
 def ac_user_show_cmd(_, username: Optional[str] = None):
     '''
     Show user info
@@ -730,7 +750,7 @@ def ac_user_show_cmd(_, username: Optional[str] = None):
         return -errno.ENOENT, '', str(ex)
 
 
-@CLIWriteCommand('dashboard ac-user-create')
+@DBCLICommand.Write('dashboard ac-user-create')
 @CLICheckNonemptyFileInput(desc=DEFAULT_FILE_DESC)
 def ac_user_create_cmd(_, username: str, inbuf: str,
                        rolename: Optional[str] = None,
@@ -769,7 +789,7 @@ def ac_user_create_cmd(_, username: str, inbuf: str,
     return 0, json.dumps(user.to_dict()), ''
 
 
-@CLIWriteCommand('dashboard ac-user-enable')
+@DBCLICommand.Write('dashboard ac-user-enable')
 def ac_user_enable(_, username: str):
     '''
     Enable a user
@@ -785,7 +805,7 @@ def ac_user_enable(_, username: str):
         return -errno.ENOENT, '', str(ex)
 
 
-@CLIWriteCommand('dashboard ac-user-disable')
+@DBCLICommand.Write('dashboard ac-user-disable')
 def ac_user_disable(_, username: str):
     '''
     Disable a user
@@ -800,7 +820,7 @@ def ac_user_disable(_, username: str):
         return -errno.ENOENT, '', str(ex)
 
 
-@CLIWriteCommand('dashboard ac-user-delete')
+@DBCLICommand.Write('dashboard ac-user-delete')
 def ac_user_delete_cmd(_, username: str):
     '''
     Delete user
@@ -813,7 +833,7 @@ def ac_user_delete_cmd(_, username: str):
         return -errno.ENOENT, '', str(ex)
 
 
-@CLIWriteCommand('dashboard ac-user-set-roles')
+@DBCLICommand.Write('dashboard ac-user-set-roles')
 def ac_user_set_roles_cmd(_, username: str, roles: Sequence[str]):
     '''
     Set user roles
@@ -836,7 +856,7 @@ def ac_user_set_roles_cmd(_, username: str, roles: Sequence[str]):
         return -errno.ENOENT, '', str(ex)
 
 
-@CLIWriteCommand('dashboard ac-user-add-roles')
+@DBCLICommand.Write('dashboard ac-user-add-roles')
 def ac_user_add_roles_cmd(_, username: str, roles: Sequence[str]):
     '''
     Add roles to user
@@ -859,7 +879,7 @@ def ac_user_add_roles_cmd(_, username: str, roles: Sequence[str]):
         return -errno.ENOENT, '', str(ex)
 
 
-@CLIWriteCommand('dashboard ac-user-del-roles')
+@DBCLICommand.Write('dashboard ac-user-del-roles')
 def ac_user_del_roles_cmd(_, username: str, roles: Sequence[str]):
     '''
     Delete roles from user
@@ -884,7 +904,7 @@ def ac_user_del_roles_cmd(_, username: str, roles: Sequence[str]):
         return -errno.ENOENT, '', str(ex)
 
 
-@CLIWriteCommand('dashboard ac-user-set-password')
+@DBCLICommand.Write('dashboard ac-user-set-password')
 @CLICheckNonemptyFileInput(desc=DEFAULT_FILE_DESC)
 def ac_user_set_password(_, username: str, inbuf: str,
                          force_password: bool = False):
@@ -906,7 +926,7 @@ def ac_user_set_password(_, username: str, inbuf: str,
         return -errno.ENOENT, '', str(ex)
 
 
-@CLIWriteCommand('dashboard ac-user-set-password-hash')
+@DBCLICommand.Write('dashboard ac-user-set-password-hash')
 @CLICheckNonemptyFileInput(desc=DEFAULT_FILE_DESC)
 def ac_user_set_password_hash(_, username: str, inbuf: str):
     '''
@@ -915,7 +935,10 @@ def ac_user_set_password_hash(_, username: str, inbuf: str):
     hashed_password = inbuf
     try:
         # make sure the hashed_password is actually a bcrypt hash
-        bcrypt.checkpw(b'', hashed_password.encode('utf-8'))
+        # catch a ValueError if hashed_password is not valid.
+        cc = get_crypto_caller()
+        cc.verify_password('', hashed_password)
+
         user = mgr.ACCESS_CTRL_DB.get_user(username)
         user.set_password_hash(hashed_password)
 
@@ -927,7 +950,7 @@ def ac_user_set_password_hash(_, username: str, inbuf: str):
         return -errno.ENOENT, '', str(ex)
 
 
-@CLIWriteCommand('dashboard ac-user-set-info')
+@DBCLICommand.Write('dashboard ac-user-set-info')
 def ac_user_set_info(_, username: str, name: str, email: str):
     '''
     Set user info

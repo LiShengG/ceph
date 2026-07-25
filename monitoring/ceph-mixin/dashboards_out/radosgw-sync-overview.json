@@ -35,7 +35,20 @@
    "graphTooltip": 0,
    "hideControls": false,
    "id": null,
-   "links": [ ],
+   "links": [
+      {
+         "asDropdown": true,
+         "icon": "external link",
+         "includeVars": true,
+         "keepTime": true,
+         "tags": [ ],
+         "targetBlank": false,
+         "title": "Browse Dashboards",
+         "tooltip": "",
+         "type": "dashboards",
+         "url": ""
+      }
+   ],
    "panels": [
       {
          "aliasColors": { },
@@ -89,7 +102,7 @@
          "steppedLine": false,
          "targets": [
             {
-               "expr": "sum by (source_zone) (rate(ceph_data_sync_from_zone_fetch_bytes_sum{cluster=~\"$cluster\", }[$__rate_interval]))",
+               "expr": "sum by (source_zone) (rate(ceph_data_sync_from_zone_fetch_bytes_sum{cluster=~\"$cluster|\", }[$__rate_interval]))",
                "format": "time_series",
                "intervalFactor": 1,
                "legendFormat": "{{source_zone}}",
@@ -184,7 +197,7 @@
          "steppedLine": false,
          "targets": [
             {
-               "expr": "sum by (source_zone) (rate(ceph_data_sync_from_zone_fetch_bytes_count{cluster=~\"$cluster\", }[$__rate_interval]))",
+               "expr": "sum by (source_zone) (rate(ceph_data_sync_from_zone_fetch_bytes_count{cluster=~\"$cluster|\", }[$__rate_interval]))",
                "format": "time_series",
                "intervalFactor": 1,
                "legendFormat": "{{source_zone}}",
@@ -194,7 +207,7 @@
          "thresholds": [ ],
          "timeFrom": null,
          "timeShift": null,
-         "title": "Replication (objects) from Source Zone",
+         "title": "Replication Rate (Objects/s) from Source Zone",
          "tooltip": {
             "shared": true,
             "sort": 0,
@@ -279,7 +292,7 @@
          "steppedLine": false,
          "targets": [
             {
-               "expr": "sum by (source_zone) (rate(ceph_data_sync_from_zone_poll_latency_sum{cluster=~\"$cluster\", }[$__rate_interval]))",
+               "expr": "sum by (source_zone) (rate(ceph_data_sync_from_zone_poll_latency_sum{cluster=~\"$cluster|\", }[$__rate_interval]))",
                "format": "time_series",
                "intervalFactor": 1,
                "legendFormat": "{{source_zone}}",
@@ -374,7 +387,7 @@
          "steppedLine": false,
          "targets": [
             {
-               "expr": "sum by (source_zone) (rate(ceph_data_sync_from_zone_fetch_errors{cluster=~\"$cluster\", }[$__rate_interval]))",
+               "expr": "sum by (source_zone) (rate(ceph_data_sync_from_zone_fetch_errors{cluster=~\"$cluster|\", }[$__rate_interval]))",
                "format": "time_series",
                "intervalFactor": 1,
                "legendFormat": "{{source_zone}}",
@@ -419,6 +432,7 @@
       },
       {
          "datasource": "$datasource",
+         "description": "",
          "fieldConfig": {
             "defaults": {
                "color": {
@@ -496,10 +510,11 @@
             }
          },
          "pluginVersion": "9.1.3",
+         "seriesOverrides": [ ],
          "targets": [
             {
                "datasource": "$datasource",
-               "expr": "rate(ceph_rgw_sync_delta_sync_delta[$__rate_interval])",
+               "expr": "rate(ceph_rgw_sync_delta_sync_delta{cluster=~\"$cluster\", }[$__rate_interval])",
                "format": "time_series",
                "instant": false,
                "intervalFactor": 1,
@@ -555,26 +570,6 @@
             "tagsQuery": "",
             "type": "query",
             "useTags": false
-         },
-         {
-            "allValue": null,
-            "current": { },
-            "datasource": "$datasource",
-            "hide": 0,
-            "includeAll": true,
-            "label": null,
-            "multi": false,
-            "name": "rgw_servers",
-            "options": [ ],
-            "query": "label_values(ceph_rgw_metadata{cluster=~\"$cluster\", }, ceph_daemon)",
-            "refresh": 1,
-            "regex": "rgw.(.*)",
-            "sort": 1,
-            "tagValuesQuery": "",
-            "tags": [ ],
-            "tagsQuery": "",
-            "type": "query",
-            "useTags": false
          }
       ]
    },
@@ -608,7 +603,7 @@
       ]
    },
    "timezone": "",
-   "title": "RGW Sync Overview",
+   "title": "Ceph Object - Sync Overview",
    "uid": "rgw-sync-overview",
    "version": 0
 }

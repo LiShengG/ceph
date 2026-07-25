@@ -1,5 +1,5 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab ft=cpp
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab ft=cpp
 
 /*
  * Ceph - scalable distributed file system
@@ -435,6 +435,17 @@ std::unique_ptr<Lifecycle> FilterDriver::get_lifecycle(void)
   return std::make_unique<FilterLifecycle>(std::move(lc));
 }
 
+bool FilterDriver::process_expired_objects(const DoutPrefixProvider *dpp,
+	       			           optional_yield y) {
+  return next->process_expired_objects(dpp, y);
+}
+
+std::unique_ptr<Restore> FilterDriver::get_restore()
+{
+  std::unique_ptr<Restore> restore = next->get_restore();
+  return std::make_unique<FilterRestore>(std::move(restore));
+}
+
 std::unique_ptr<Notification> FilterDriver::get_notification(rgw::sal::Object* obj,
 				rgw::sal::Object* src_obj, req_state* s,
 				rgw::notify::EventType event_type, optional_yield y,
@@ -480,6 +491,11 @@ int FilterDriver::remove_persistent_topic(const DoutPrefixProvider* dpp,
 RGWLC* FilterDriver::get_rgwlc()
 {
   return next->get_rgwlc();
+}
+
+rgw::restore::Restore* FilterDriver::get_rgwrestore()
+{
+  return next->get_rgwrestore();
 }
 
 RGWCoroutinesManagerRegistry* FilterDriver::get_cr_registry()
@@ -657,18 +673,20 @@ int FilterDriver::list_roles(const DoutPrefixProvider *dpp,
 int FilterDriver::store_oidc_provider(const DoutPrefixProvider* dpp,
                                       optional_yield y,
                                       const RGWOIDCProviderInfo& info,
-                                      bool exclusive)
+                                      bool exclusive,
+                                      RGWObjVersionTracker* objv_tracker)
 {
-  return next->store_oidc_provider(dpp, y, info, exclusive);
+  return next->store_oidc_provider(dpp, y, info, exclusive, objv_tracker);
 }
 
 int FilterDriver::load_oidc_provider(const DoutPrefixProvider* dpp,
                                      optional_yield y,
                                      std::string_view tenant,
                                      std::string_view url,
-                                     RGWOIDCProviderInfo& info)
+                                     RGWOIDCProviderInfo& info,
+                                     RGWObjVersionTracker* objv_tracker)
 {
-  return next->load_oidc_provider(dpp, y, tenant, url, info);
+  return next->load_oidc_provider(dpp, y, tenant, url, info, objv_tracker);
 }
 
 int FilterDriver::delete_oidc_provider(const DoutPrefixProvider* dpp,
@@ -839,14 +857,14 @@ int FilterBucket::load_bucket(const DoutPrefixProvider* dpp, optional_yield y)
   return next->load_bucket(dpp, y);
 }
 
-int FilterBucket::read_stats(const DoutPrefixProvider *dpp,
+int FilterBucket::read_stats(const DoutPrefixProvider *dpp, optional_yield y,
 			     const bucket_index_layout_generation& idx_layout,
 			     int shard_id, std::string* bucket_ver,
 			     std::string* master_ver,
 			     std::map<RGWObjCategory, RGWStorageStats>& stats,
 			     std::string* max_marker, bool* syncstopped)
 {
-  return next->read_stats(dpp, idx_layout, shard_id, bucket_ver, master_ver,
+  return next->read_stats(dpp, y, idx_layout, shard_id, bucket_ver, master_ver,
 			  stats, max_marker, syncstopped);
 }
 
@@ -869,9 +887,11 @@ int FilterBucket::check_bucket_shards(const DoutPrefixProvider* dpp,
   return next->check_bucket_shards(dpp, num_objs, y);
 }
 
-int FilterBucket::chown(const DoutPrefixProvider* dpp, const rgw_owner& new_owner, optional_yield y)
-{
-  return next->chown(dpp, new_owner, y);
+int FilterBucket::chown(const DoutPrefixProvider* dpp,
+                        const rgw_owner& new_owner,
+                        const std::string& new_owner_name,
+                        optional_yield y) {
+  return next->chown(dpp, new_owner, new_owner_name, y);
 }
 
 int FilterBucket::put_info(const DoutPrefixProvider* dpp, bool exclusive,
@@ -930,21 +950,21 @@ int FilterBucket::remove_objs_from_index(const DoutPrefixProvider *dpp,
   return next->remove_objs_from_index(dpp, objs_to_unlink);
 }
 
-int FilterBucket::check_index(const DoutPrefixProvider *dpp,
+int FilterBucket::check_index(const DoutPrefixProvider *dpp, optional_yield y,
 			      std::map<RGWObjCategory, RGWStorageStats>& existing_stats,
 			      std::map<RGWObjCategory, RGWStorageStats>& calculated_stats)
 {
-  return next->check_index(dpp, existing_stats, calculated_stats);
+  return next->check_index(dpp, y, existing_stats, calculated_stats);
 }
 
-int FilterBucket::rebuild_index(const DoutPrefixProvider *dpp)
+int FilterBucket::rebuild_index(const DoutPrefixProvider *dpp, optional_yield y)
 {
-  return next->rebuild_index(dpp);
+  return next->rebuild_index(dpp, y);
 }
 
-int FilterBucket::set_tag_timeout(const DoutPrefixProvider *dpp, uint64_t timeout)
+int FilterBucket::set_tag_timeout(const DoutPrefixProvider *dpp, optional_yield y, uint64_t timeout)
 {
-  return next->set_tag_timeout(dpp, timeout);
+  return next->set_tag_timeout(dpp, y, timeout);
 }
 
 int FilterBucket::purge_instance(const DoutPrefixProvider* dpp, optional_yield y)
@@ -1027,6 +1047,7 @@ int FilterObject::copy_object(const ACLOwner& owner,
 			      std::string* etag,
 			      void (*progress_cb)(off_t, void *),
 			      void* progress_data,
+			      rgw::sal::DataProcessorFactory* dp_factory,
 			      const DoutPrefixProvider* dpp,
 			      optional_yield y)
 {
@@ -1038,12 +1059,23 @@ int FilterObject::copy_object(const ACLOwner& owner,
 			   mod_ptr, unmod_ptr, high_precision_time, if_match,
 			   if_nomatch, attrs_mod, copy_if_newer, attrs,
 			   category, olh_epoch, delete_at, version_id, tag,
-			   etag, progress_cb, progress_data, dpp, y);
+			   etag, progress_cb, progress_data, dp_factory, dpp, y);
 }
 
 RGWAccessControlPolicy& FilterObject::get_acl()
 {
   return next->get_acl();
+}
+
+int FilterObject::list_parts(const DoutPrefixProvider* dpp, CephContext* cct,
+			     int max_parts, int marker, int* next_marker,
+			     bool* truncated, list_parts_each_t&& each_func,
+			     optional_yield y)
+{
+  return next->list_parts(dpp, cct, max_parts, marker, next_marker,
+			  truncated,
+			  std::move(each_func),
+			  y);
 }
 
 int FilterObject::load_obj_state(const DoutPrefixProvider *dpp,
@@ -1057,16 +1089,15 @@ int FilterObject::set_obj_attrs(const DoutPrefixProvider* dpp, Attrs* setattrs,
   return next->set_obj_attrs(dpp, setattrs, delattrs, y, flags);
 }
 
-int FilterObject::get_obj_attrs(optional_yield y, const DoutPrefixProvider* dpp,
-				rgw_obj* target_obj)
+int FilterObject::get_obj_attrs(optional_yield y, const DoutPrefixProvider* dpp)
 {
-  return next->get_obj_attrs(y, dpp, target_obj);
+  return next->get_obj_attrs(y, dpp);
 }
 
 int FilterObject::modify_obj_attrs(const char* attr_name, bufferlist& attr_val,
-				   optional_yield y, const DoutPrefixProvider* dpp)
+				   optional_yield y, const DoutPrefixProvider* dpp, uint32_t flags)
 {
-  return next->modify_obj_attrs(attr_name, attr_val, y, dpp);
+  return next->modify_obj_attrs(attr_name, attr_val, y, dpp, flags);
 }
 
 int FilterObject::delete_obj_attrs(const DoutPrefixProvider* dpp,
@@ -1085,10 +1116,10 @@ void FilterObject::gen_rand_obj_instance_name()
   return next->gen_rand_obj_instance_name();
 }
 
-std::unique_ptr<MPSerializer> FilterObject::get_serializer(const DoutPrefixProvider *dpp,
+std::unique_ptr<MPSerializer> FilterObject::get_serializer(const DoutPrefixProvider *dpp, optional_yield y,
 							   const std::string& lock_name)
 {
-  std::unique_ptr<MPSerializer> s = next->get_serializer(dpp, lock_name);
+  std::unique_ptr<MPSerializer> s = next->get_serializer(dpp, y, lock_name);
   return std::make_unique<FilterMPSerializer>(std::move(s));
 }
 
@@ -1119,19 +1150,15 @@ int FilterObject::transition_to_cloud(Bucket* bucket,
 
 int FilterObject::restore_obj_from_cloud(Bucket* bucket,
 		          rgw::sal::PlacementTier* tier,
-		          rgw_placement_rule& placement_rule,
-		          rgw_bucket_dir_entry& o,
 		          CephContext* cct,
-		          RGWObjTier& tier_config,
-		          real_time& mtime,
-		          uint64_t olh_epoch,
 		          std::optional<uint64_t> days,
-		          const DoutPrefixProvider* dpp, 
-		          optional_yield y,
-		          uint32_t flags)
+			  bool& in_progress,
+		          uint64_t& size,
+		          const DoutPrefixProvider* dpp,
+		          optional_yield y)
 {
   return next->restore_obj_from_cloud(nextBucket(bucket), nextPlacementTier(tier),
-           placement_rule, o, cct, tier_config, mtime, olh_epoch, days, dpp, y, flags);
+           cct, days, in_progress, size, dpp, y);
 }
 
 bool FilterObject::placement_rules_match(rgw_placement_rule& r1, rgw_placement_rule& r2)
@@ -1210,7 +1237,12 @@ int FilterObject::FilterReadOp::prepare(optional_yield y, const DoutPrefixProvid
 {
   /* Copy params into next */
   next->params = params;
-  return next->prepare(y, dpp);
+  int ret = next->prepare(y, dpp);
+  if (ret < 0)
+    return ret;
+
+  params.parts_count = next->params.parts_count;
+  return 0;
 }
 
 int FilterObject::FilterReadOp::read(int64_t ofs, int64_t end, bufferlist& bl,
@@ -1264,6 +1296,9 @@ int FilterMultipartUpload::init(const DoutPrefixProvider *dpp, optional_yield y,
 				ACLOwner& owner, rgw_placement_rule& dest_placement,
 				rgw::sal::Attrs& attrs)
 {
+  next->obj_legal_hold = obj_legal_hold;
+  next->obj_retention = obj_retention;
+  next->cksum_type = cksum_type;
   return next->init(dpp, y, owner, dest_placement, attrs);
 }
 
@@ -1302,7 +1337,9 @@ int FilterMultipartUpload::complete(const DoutPrefixProvider *dpp,
 				    std::string& tag, ACLOwner& owner,
 				    uint64_t olh_epoch,
 				    rgw::sal::Object* target_obj,
-				    prefix_map_t& processed_prefixes)
+				    prefix_map_t& processed_prefixes,
+            const char *if_match,
+            const char *if_nomatch)
 {
   return next->complete(dpp, y, cct, part_etags, remove_objs, accounted_size,
 			compressed, cs_info, ofs, tag, owner, olh_epoch,
@@ -1322,7 +1359,15 @@ int FilterMultipartUpload::get_info(const DoutPrefixProvider *dpp,
 				    optional_yield y, rgw_placement_rule** rule,
 				    rgw::sal::Attrs* attrs)
 {
-  return next->get_info(dpp, y, rule, attrs);
+  auto ret = next->get_info(dpp, y, rule, attrs);
+  if (ret < 0) {
+    return ret;
+  }
+
+  this->obj_legal_hold = next->obj_legal_hold;
+  this->obj_retention = next->obj_retention;
+  this->cksum_type = next->cksum_type;
+  return 0;
 }
 
 std::unique_ptr<Writer> FilterMultipartUpload::get_writer(
@@ -1341,16 +1386,24 @@ std::unique_ptr<Writer> FilterMultipartUpload::get_writer(
   return std::make_unique<FilterWriter>(std::move(writer), obj);
 }
 
-int FilterMPSerializer::try_lock(const DoutPrefixProvider *dpp, utime_t dur,
+int FilterMPSerializer::try_lock(const DoutPrefixProvider *dpp, ceph::timespan dur,
 				 optional_yield y)
 {
   return next->try_lock(dpp, dur, y);
 }
+int FilterMPSerializer::unlock(const DoutPrefixProvider* dpp, optional_yield y)
+{
+  return next->unlock(dpp, y);
+}
 
-int FilterLCSerializer::try_lock(const DoutPrefixProvider *dpp, utime_t dur,
+int FilterLCSerializer::try_lock(const DoutPrefixProvider *dpp, ceph::timespan dur,
 				 optional_yield y)
 {
   return next->try_lock(dpp, dur, y);
+}
+int FilterLCSerializer::unlock(const DoutPrefixProvider* dpp, optional_yield y)
+{
+  return next->unlock(dpp, y);
 }
 
 int FilterLifecycle::get_entry(const DoutPrefixProvider* dpp, optional_yield y,
@@ -1410,6 +1463,46 @@ std::unique_ptr<LCSerializer> FilterLifecycle::get_serializer(
   return std::make_unique<FilterLCSerializer>(std::move(ns));
 }
 
+int FilterRestoreSerializer::try_lock(const DoutPrefixProvider *dpp, ceph::timespan dur,
+				 optional_yield y)
+{
+  return next->try_lock(dpp, dur, y);
+}
+
+std::unique_ptr<RestoreSerializer> FilterRestore::get_serializer(const std::string& lock_name,
+						       const std::string& oid,
+						       const std::string& cookie) {
+  std::unique_ptr<RestoreSerializer> ns;
+  ns = next->get_serializer(lock_name, oid, cookie);
+  return std::make_unique<FilterRestoreSerializer>(std::move(ns));
+}
+
+int FilterRestore::initialize(const DoutPrefixProvider* dpp, optional_yield y,
+		  int n_objs, std::vector<std::string>& obj_names) {
+  return next->initialize(dpp, y, n_objs, obj_names);
+}
+
+int FilterRestore::add_entries(const DoutPrefixProvider* dpp, optional_yield y,
+	       		       int index,
+			       const std::vector<rgw::restore::RestoreEntry>& restore_entries) {
+  return next->add_entries(dpp, y, index, restore_entries);
+}
+
+/** List all known entries */
+int FilterRestore::list(const DoutPrefixProvider *dpp, optional_yield y,
+	       	   int index, const std::string& marker, std::string* out_marker,
+		   uint32_t max_entries, std::vector<rgw::restore::RestoreEntry>& entries,
+		   bool* truncated) {
+  return next->list(dpp, y, index, marker, out_marker, max_entries,
+  		    entries, truncated);
+}
+
+int FilterRestore::trim_entries(const DoutPrefixProvider *dpp, optional_yield y,
+		 	        int index, const std::string_view& marker) {
+  return next->trim_entries(dpp, y, index, marker);
+}
+
+
 int FilterNotification::publish_reserve(const DoutPrefixProvider *dpp,
 					RGWObjTags* obj_tags)
 {
@@ -1448,6 +1541,12 @@ int FilterLuaManager::get_script(const DoutPrefixProvider* dpp, optional_yield y
 				const std::string& key, std::string& script)
 {
   return next->get_script(dpp, y, key, script);
+}
+
+std::tuple<rgw::lua::LuaCodeType, int> FilterLuaManager::get_script_or_bytecode(const DoutPrefixProvider* dpp, optional_yield y,
+				             const std::string& key)
+{
+  return next->get_script_or_bytecode(dpp, y, key);
 }
 
 int FilterLuaManager::put_script(const DoutPrefixProvider* dpp, optional_yield y,
@@ -1491,6 +1590,9 @@ const std::string& FilterLuaManager::luarocks_path() const {
 
 void FilterLuaManager::set_luarocks_path(const std::string& path) {
   next->set_luarocks_path(path);
+}
+void FilterLuaManager::set_lua_background(rgw::lua::Background* background) {
+  next->set_lua_background(background);
 }
 
 } } // namespace rgw::sal

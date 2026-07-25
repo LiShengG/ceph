@@ -2,11 +2,12 @@
 
 import logging
 
-from typing import Tuple, List, Optional
+from typing import Tuple, List
 
+from .constants import DISABLED_SERVICES
 from .context import CephadmContext
 from .call_wrappers import call, CallVerbosity
-from .packagers import Packager
+from .listing import DaemonEntry, daemons_matching
 
 logger = logging.getLogger()
 
@@ -55,18 +56,15 @@ def check_unit(ctx: CephadmContext, unit_name: str) -> Tuple[bool, str, bool]:
     return (enabled, state, installed)
 
 
-def check_units(
-    ctx: CephadmContext, units: List[str], enabler: Optional[Packager] = None
-) -> bool:
+def check_units(ctx: CephadmContext, units: List[str]) -> bool:
     for u in units:
         (enabled, state, installed) = check_unit(ctx, u)
         if enabled and state == 'running':
             logger.info('Unit %s is enabled and running' % u)
             return True
-        if enabler is not None:
-            if installed:
-                logger.info('Enabling unit %s' % u)
-                enabler.enable_service(u)
+        if installed:
+            logger.info('Enabling unit %s' % u)
+            enable_service(ctx, u)
     return False
 
 
@@ -86,3 +84,43 @@ def terminate_service(ctx: CephadmContext, service_name: str) -> None:
         ['systemctl', 'disable', service_name],
         verbosity=CallVerbosity.DEBUG,
     )
+
+
+def enable_service(ctx: CephadmContext, service_name: str) -> None:
+    """
+    Start and enable the service (typically using systemd).
+    """
+    call(
+        ctx,
+        ['systemctl', 'enable', '--now', service_name],
+        verbosity=CallVerbosity.DEBUG,
+    )
+
+
+def start_disabled_services_after_maintenance_exit(
+    ctx: CephadmContext,
+) -> None:
+    """Start nfs/keepalived units after host-maintenance exit."""
+    if not ctx.fsid:
+        return
+    for daemon_type in DISABLED_SERVICES:
+        for entry in daemons_matching(
+            ctx, fsid=ctx.fsid, daemon_type=daemon_type
+        ):
+            if isinstance(entry, DaemonEntry):
+                unit = entry.identity.unit_name
+            else:
+                unit = entry.status['systemd_unit']
+            _out, _err, code = call(
+                ctx,
+                ['systemctl', 'start', unit],
+                verbosity=CallVerbosity.DEBUG,
+            )
+            if code:
+                logger.warning(
+                    'Failed to start %s after maintenance exit: %s',
+                    unit,
+                    _err,
+                )
+            else:
+                logger.info('Started %s after maintenance exit', unit)

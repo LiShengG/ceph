@@ -1,21 +1,25 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
+
 #ifndef CEPH_OBJECTCACHER_H
 #define CEPH_OBJECTCACHER_H
 
 #include "include/types.h"
 #include "include/lru.h"
 #include "include/Context.h"
+#include "include/object.h"
 #include "include/xlist.h"
 #include "include/common_fwd.h"
 
 #include "common/Cond.h"
 #include "common/Finisher.h"
+#include "common/snap_types.h" // for class SnapContext
 #include "common/Thread.h"
 #include "common/zipkin_trace.h"
 
-#include "Objecter.h"
 #include "Striper.h"
+
+#include <unordered_map>
 
 class WritebackHandler;
 
@@ -56,6 +60,9 @@ class ObjectCacher {
   class Object;
   struct ObjectSet;
   class C_ReadFinish;
+
+  //pair is <offset, len>
+  using ObjHole = std::pair<uint64_t, uint64_t>;
 
   typedef void (*flush_set_callback_t) (void *p, ObjectSet *oset);
 
@@ -418,7 +425,7 @@ class ObjectCacher {
   void *flush_set_callback_arg;
 
   // indexed by pool_id
-  std::vector<ceph::unordered_map<sobject_t, Object*> > objects;
+  std::vector<std::unordered_map<sobject_t, Object*>> objects;
 
   std::list<Context*> waitfor_read;
 
@@ -541,7 +548,7 @@ class ObjectCacher {
 			    int64_t *amount, int *max_count);
 
   void trim();
-  void flush(ZTracer::Trace *trace, loff_t amount=0);
+  void flush(ZTracer::Trace *trace, loff_t amount=0, int max_bhs=0);
 
   /**
    * flush a range of buffers
@@ -563,7 +570,8 @@ class ObjectCacher {
   ceph::condition_variable read_cond;
 
   int _readx(OSDRead *rd, ObjectSet *oset, Context *onfinish,
-	     bool external_call, ZTracer::Trace *trace);
+	     bool external_call, ZTracer::Trace *trace,
+             std::vector<ObjHole> *holes);
   void retry_waiting_reads();
 
  public:
@@ -615,7 +623,8 @@ class ObjectCacher {
    * the return value is total bytes read
    */
   int readx(OSDRead *rd, ObjectSet *oset, Context *onfinish,
-	    ZTracer::Trace *parent_trace = nullptr);
+	    ZTracer::Trace *parent_trace = nullptr,
+            std::vector<ObjHole> *holes = nullptr);
   int writex(OSDWrite *wr, ObjectSet *oset, Context *onfreespace,
 	     ZTracer::Trace *parent_trace,
 	     bool block_writes_upfront);
@@ -703,6 +712,16 @@ public:
     Striper::file_to_extents(cct, oset->ino, layout, offset, len,
 			     oset->truncate_size, rd->extents);
     return readx(rd, oset, onfinish);
+  }
+
+  int file_read_ex(ObjectSet *oset, file_layout_t *layout, snapid_t snapid,
+                   loff_t offset, uint64_t len, ceph::buffer::list *bl, int flags,
+                   std::vector<ObjHole> *holes,
+                   Context *onfinish) {
+    OSDRead *rd = prepare_read(snapid, bl, flags);
+    Striper::file_to_extents(cct, oset->ino, layout, offset, len,
+			     oset->truncate_size, rd->extents);
+    return readx(rd, oset, onfinish, nullptr, holes);
   }
 
   int file_write(ObjectSet *oset, file_layout_t *layout,

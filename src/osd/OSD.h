@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph - scalable distributed file system
  *
@@ -45,8 +46,7 @@
 #include <map>
 #include <memory>
 #include <string>
-
-#include "include/unordered_map.h"
+#include <unordered_map>
 
 #include "common/intrusive_timer.h"
 #include "common/shared_cache.hpp"
@@ -152,6 +152,18 @@ public:
   }
 
   int get_nodeid() const final { return whoami; }
+
+  /// iterate over all PGs, summing their snap trim queue lengths
+  uint64_t calc_snap_trim_queue_total();
+  uint64_t get_snap_trim_queue_total() const {
+    // the cached value, calculated by calc_snap_trim_queue_total()
+    return snap_trim_queue_total;
+  }
+
+  // not atomic: both write (tick_without_osd_lock) and read (initiate_scrub,
+  // called from the same timer callback) are on the same thread
+  uint64_t snap_trim_queue_total{0};
+
 private:
   OSDMapRef osdmap;
 
@@ -1022,6 +1034,11 @@ struct OSDShard {
 
   ContextQueue context_queue;
 
+  //This is an extent cache for the erasure coding. Specifically, this acts as
+  //a least-recently-used cache invalidator, allowing for cache shards to last
+  //longer than the most recent IO in each object.
+  ECExtentCache::LRU ec_extent_cache_lru;
+
   void _attach_pg(OSDShardPGSlot *slot, PG *pg);
   void _detach_pg(OSDShardPGSlot *slot);
 
@@ -1050,7 +1067,6 @@ struct OSDShard {
 		    std::set<std::pair<spg_t,epoch_t>> *merge_pgs);
   void register_and_wake_split_child(PG *pg);
   void unprime_split_children(spg_t parent, unsigned old_pg_num);
-  void update_scheduler_config();
   op_queue_type_t get_op_queue_type() const;
 
   OSDShard(
@@ -1059,6 +1075,169 @@ struct OSDShard {
     OSD *osd,
     op_queue_type_t osd_op_queue,
     unsigned osd_op_queue_cut_off);
+};
+
+struct OSDBenchTest {
+  CephContext *cct;
+  ObjectStore *store;
+  ObjectStore::CollectionHandle ch;
+
+  // Input parameters
+  int64_t count;
+  int64_t bsize;
+  int64_t osize;
+  int64_t onum;
+
+  // Test metrics
+  double prefill_time;
+  double elapsed;
+  double bandwidth;
+  double iops;
+  std::ostringstream errmsg;
+
+  // Transaction to clean-up test objects
+  ObjectStore::Transaction cleanupt;
+
+  /**
+   * run_test()
+   *
+   * Run a bench test based on the set parameters.
+   *  - Test sequential writes to objects (from offset 0) if
+   *    only 'count' and 'bsize' are specified.
+   *  - Test random writes to objects if all input parameters
+   *    are specified.
+   *
+   * @return 0 on success. -ENOENT, -EINVAL or -EIO otherwise.
+   *
+   */
+  int run_test();
+
+  /**
+   * precheck()
+   *
+   * Performs multiple pre-checks for proper test execution.
+   * Note: Sets an error message in case of any failure which
+   *       can be accessed using get_errstr().
+   *
+   * @return 0 on success. -ENOENT or -EINVAL otherwise.
+   */
+  int precheck();
+
+  /**
+   * prefill_objects()
+   *
+   * Prefill objects for the write test only if
+   * 'osize' and 'onum' are specified.
+   */
+  void prefill_objects();
+
+  /**
+   * perform_write_test()
+   *
+   * Performs one of the following write tests based on the set
+   * parameters:
+   *  - write to a new object from offset 0, or,
+   *  - write to an already prefilled random object
+   *    (from a random offset).
+   */
+  void perform_write_test();
+
+  /**
+   * wait_for_flush_commit()
+   *
+   * Waits until all the writes to the ObjectStore are flushed
+   * and committed.
+   */
+  void wait_for_flush_commit();
+
+  /**
+   * cleanup()
+   *
+   * Removes all the objects that were created during the write test
+   * as part of a single transaction.
+   */
+  void cleanup();
+
+  /**
+   * flush_store_cache()
+   *
+   * Flushes the ObjectStore cache.
+   * Called before starting an ObjectStore transaction.
+   *
+   * @return 0 on successful flush.
+   */
+  int flush_store_cache() {
+    return store->flush_cache();
+  }
+
+  /**
+   * get_elapsed_time()
+   *
+   * Returns the time taken for the write test
+   * (including flush & commit).
+   *
+   * @return double indicating time taken for the test
+   */
+  double get_elapsed_time() {
+    return elapsed;
+  }
+
+  /**
+   * get_prefill_time()
+   *
+   * Returns the time taken to prefill objects for the test
+   * (including flush & commit).
+   *
+   * @return double indicating time taken for the prefill
+   */
+  double get_prefill_time() {
+    return prefill_time;
+  }
+
+  /**
+   * get_bandwidth_rate()
+   *
+   * Returns the bandwidth rate calculated during the test.
+   * @see run_test() implementation
+   *
+   * @return double indicating bandwidth measured during the test
+   */
+  double get_bandwidth_rate() {
+    return bandwidth;
+  }
+
+  /**
+   * get_iops_rate()
+   *
+   * Returns the iops rate calculated during the test.
+   * @see run_test() implementation
+   *
+   * @return double indicating the iops measured during the test
+   */
+  double get_iops_rate() {
+    return iops;
+  }
+
+  /**
+   * get_errstr()
+   *
+   * Returns the error message (if any) encountered at any stage during
+   * the course of the test.
+   *
+   * @return string indicating error(if any) during the test. Empty otherwise.
+   */
+  std::string get_errstr() {
+    return errmsg.str();
+  }
+
+  OSDBenchTest(
+    CephContext *cct,
+    ObjectStore *store,
+    ObjectStore::CollectionHandle& ch,
+    int64_t count,
+    int64_t bsize,
+    int64_t osize,
+    int64_t onum);
 };
 
 class OSD : public Dispatcher,
@@ -1073,11 +1252,12 @@ class OSD : public Dispatcher,
   // Tick timer for those stuff that do not need osd_lock
   ceph::mutex tick_timer_lock = ceph::make_mutex("OSD::tick_timer_lock");
   SafeTimer tick_timer_without_osd_lock;
+  uint_fast16_t trim_queue_length_countdown = 0;
   std::string gss_ktfile_client{};
 
 public:
   // config observer bits
-  const char** get_tracked_conf_keys() const override;
+  std::vector<std::string> get_tracked_keys() const noexcept override;
   void handle_conf_change(const ConfigProxy& conf,
                           const std::set <std::string> &changed) override;
   void update_log_config();
@@ -1207,6 +1387,12 @@ public:
    */
   static CompatSet get_osd_compat_set();
 
+  /**
+   * lookup_ec_extent_cache_lru()
+   * @param pgid -
+   * @return extent cache for LRU
+   */
+  ECExtentCache::LRU &lookup_ec_extent_cache_lru(spg_t pgid) const;
 
 private:
   class C_Tick;
@@ -1572,7 +1758,9 @@ protected:
       OpSchedulerItem&& qi);
 
     /// try to do some work
-    void _process(uint32_t thread_index, ceph::heartbeat_handle_d *hb) override;
+    void _process(uint32_t thread_index,
+                  uint32_t shard_index,
+                  ceph::heartbeat_handle_d *hb) override;
 
     void stop_for_fast_shutdown();
 
@@ -1616,8 +1804,7 @@ protected:
       }
     }
 
-    bool is_shard_empty(uint32_t thread_index) override {
-      uint32_t shard_index = thread_index % osd->num_shards;
+    bool is_shard_empty(uint32_t thread_index, uint32_t shard_index) override {
       auto &&sdata = osd->shards[shard_index];
       ceph_assert(sdata);
       std::lock_guard l(sdata->shard_lock);
@@ -1670,13 +1857,24 @@ protected:
  protected:
 
   // -- osd map --
-  // TODO: switch to std::atomic<OSDMapRef> when C++20 will be available.
-  OSDMapRef       _osdmap;
+#ifdef __cpp_lib_atomic_shared_ptr
+  std::atomic<OSDMapRef> _osdmap;
+#else
+  OSDMapRef _osdmap;
+#endif
   void set_osdmap(OSDMapRef osdmap) {
+#ifdef __cpp_lib_atomic_shared_ptr
+    _osdmap.store(osdmap);
+#else
     std::atomic_store(&_osdmap, osdmap);
+#endif
   }
   OSDMapRef get_osdmap() const {
+#ifdef __cpp_lib_atomic_shared_ptr
+    return _osdmap.load();
+#else
     return std::atomic_load(&_osdmap);
+#endif
   }
   epoch_t get_osdmap_epoch() const {
     // XXX: performance?
@@ -1861,6 +2059,7 @@ protected:
   // which pgs were scanned for min_lec
   std::vector<pg_t> min_last_epoch_clean_pgs;
   void send_beacon(const ceph::coarse_mono_clock::time_point& now);
+  void maybe_send_beacon();
 
   ceph_tid_t get_tid() {
     return service.get_tid();
@@ -1989,6 +2188,9 @@ private:
 		  int whoami,
 		  std::string osdspec_affinity);
 
+  static tl::expected<std::string, int>
+    run_osd_bench(CephContext *cct, ObjectStore *store);
+
   /* remove any non-user xattrs from a std::map of them */
   void filter_xattrs(std::map<std::string, ceph::buffer::ptr>& attrs) {
     for (std::map<std::string, ceph::buffer::ptr>::iterator iter = attrs.begin();
@@ -2001,7 +2203,7 @@ private:
   }
 
 private:
-  int mon_cmd_maybe_osd_create(std::string &cmd);
+  int mon_cmd_maybe_osd_create(std::string &&cmd);
   int update_crush_device_class();
   int update_crush_location();
 
@@ -2017,6 +2219,7 @@ private:
   int get_num_op_threads();
 
   float get_osd_recovery_sleep();
+  float get_osd_recovery_sleep_degraded();
   float get_osd_delete_sleep();
   float get_osd_snap_trim_sleep();
 

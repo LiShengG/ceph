@@ -5,7 +5,6 @@ import { RouterTestingModule } from '@angular/router/testing';
 
 import { NgbPopoverModule } from '@ng-bootstrap/ng-bootstrap';
 import moment from 'moment';
-import { ToastrModule } from 'ngx-toastr';
 
 import { NotificationService } from '~/app/shared/services/notification.service';
 import { SharedModule } from '~/app/shared/shared.module';
@@ -30,7 +29,6 @@ describe('RbdTrashMoveModalComponent', () => {
       HttpClientTestingModule,
       RouterTestingModule,
       SharedModule,
-      ToastrModule.forRoot(),
       NgbPopoverModule,
       ModalModule,
       CheckboxModule,
@@ -104,7 +102,7 @@ describe('RbdTrashMoveModalComponent', () => {
       component.moveImage();
       const req = httpTesting.expectOne('api/block/image/foo%2Fbar/move_trash');
       req.flush(null);
-      expect(req.request.body.delay).toBeGreaterThan(76390);
+      expect(req.request.body.delay).toBeGreaterThan(56666);
     });
   });
 });

@@ -1,15 +1,17 @@
 #pragma once
 
-#include "IoOp.h"
+#include <cstdint>
+#include <string>
 
 #include <boost/asio/io_context.hpp>
 
-#include "librados/librados_asio.h"
-
-#include "include/interval_set.h"
-#include "global/global_init.h"
-#include "global/global_context.h"
+#include "IoOp.h"
+#include "common/io_exerciser/IoSequence.h"
 #include "common/Thread.h"
+#include "global/global_context.h"
+#include "global/global_init.h"
+#include "include/interval_set.h"
+#include "librados/librados_asio.h"
 
 /* Overview
  *
@@ -21,29 +23,38 @@
  */
 
 namespace ceph {
-  namespace io_exerciser {
+namespace io_exerciser {
 
-    class Model
-    {
-    protected:
-      int num_io{0};
-      std::string oid;
-      uint64_t block_size;
+class IoOp;
 
-    public:
-      Model(const std::string& oid, uint64_t block_size);
-      virtual ~Model() = default;
+class Model {
+ protected:
+  int num_io{0};
+  std::string primary_oid_base;
+  std::string primary_oid;
+  std::string secondary_oid;
+  uint64_t block_size;
+  bool delete_objects;
+  int num_objects{0};
 
-      virtual bool readyForIoOp(IoOp& op) = 0;
-      virtual void applyIoOp(IoOp& op) = 0;
-      
-      const std::string get_oid() const;
-      const uint64_t get_block_size() const;
-      int get_num_io() const;
-    };
+  void set_primary_oid(const std::string& new_oid);
+  void set_secondary_oid(const std::string& new_oid);
 
-    /* Simple RADOS I/O generator */
+ public:
+  Model(const std::string& primary_oid, const std::string& secondary_oid,
+        uint64_t block_size, bool delete_objects);
+  virtual ~Model() = default;
 
-    
-  }
-}
+  virtual bool readyForIoOp(IoOp& op) = 0;
+  virtual void applyIoOp(IoOp& op) = 0;
+  const std::string get_primary_oid() const;
+  const std::string get_secondary_oid() const;
+  void swap_primary_secondary_oid();
+  const uint64_t get_block_size() const;
+  int get_num_io() const;
+};
+
+/* Simple RADOS I/O generator */
+
+}  // namespace io_exerciser
+}  // namespace ceph

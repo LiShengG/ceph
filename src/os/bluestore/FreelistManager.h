@@ -1,5 +1,5 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
 
 #ifndef CEPH_OS_BLUESTORE_FREELISTMANAGER_H
 #define CEPH_OS_BLUESTORE_FREELISTMANAGER_H
@@ -49,6 +49,7 @@ public:
   virtual uint64_t get_alloc_units() const = 0;
   virtual uint64_t get_alloc_size() const = 0;
 
+  virtual int expand(uint64_t new_size, KeyValueDB* db) = 0;
   virtual void get_meta(uint64_t target_size,
   std::vector<std::pair<std::string, std::string>>*) const = 0;
 

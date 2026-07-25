@@ -1,5 +1,5 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
-// vim: ts=8 sw=2 smarttab
+// vim: ts=8 sw=2 sts=2 expandtab
 
 #pragma once
 
@@ -7,10 +7,11 @@
 #include "include/cpp-btree/btree_map.h"
 #include "include/cpp-btree/btree_set.h"
 #include "Allocator.h"
+#include "AllocatorBase.h"
 #include "os/bluestore/bluestore_types.h"
 #include "include/mempool.h"
 
-class BtreeAllocator : public Allocator {
+class BtreeAllocator : public AllocatorBase, public AllocatorPerf {
   struct range_seg_t {
     uint64_t start;   ///< starting offset of this segment
     uint64_t end;     ///< ending offset (non-inclusive)
@@ -102,6 +103,7 @@ private:
   int _allocate(
     uint64_t size,
     uint64_t unit,
+    int64_t  hint,
     uint64_t *offset,
     uint64_t *length);
 

@@ -2,12 +2,18 @@
  Cache Tiering
 ===============
 
-.. warning:: Cache tiering has been deprecated in the Reef release as it
-             has lacked a maintainer for a very long time. This does not mean
-             it will be certainly removed, but we may choose to remove it
-             without much further notice.
+.. warning:: Cache tiering was deprecated in the Reef release and has lacked
+   a maintainer for a long time. It will be removed in a future release without
+   notice. **Do not deploy new cache tiers.** Migrate existing cache
+   tier deployments as soon as possible.
 
-A cache tier provides Ceph Clients with better I/O performance for a subset of
+.. note:: This documentation is retained for existing deployments only.
+   If you need to remove a cache tier, see :ref:`cache-tiering-removal`.
+   Some community members have adopted ``dm-cache`` (the Linux kernel's
+   device-mapper cache target) as a block-level caching alternative, though
+   this is not an officially supported or endorsed configuration.
+
+A cache tier provides Ceph clients with better I/O performance for a subset of
 the data stored in a backing storage tier. Cache tiering involves creating a
 pool of relatively fast/expensive storage devices (e.g., solid state drives)
 configured to act as a cache tier, and a backing pool of either erasure-coded
@@ -177,12 +183,12 @@ Setting up a backing storage pool typically involves one of two scenarios:
 In the standard storage scenario, you can setup a CRUSH rule to establish 
 the failure domain (e.g., osd, host, chassis, rack, row, etc.). Ceph OSD 
 Daemons perform optimally when all storage drives in the rule are of the 
-same size, speed (both RPMs and throughput) and type. See `CRUSH Maps`_ 
+same size, speed (both RPMs and throughput) and type. See :ref:`rados-crush-map`
 for details on creating a rule. Once you have created a rule, create 
 a backing storage pool. 
 
 In the erasure coding scenario, the pool creation arguments will generate the
-appropriate rule automatically. See `Create a Pool`_ for details.
+appropriate rule automatically. See :ref:`createpool` for details.
 
 In subsequent examples, we will refer to the backing storage pool 
 as ``cold-storage``.
@@ -201,9 +207,6 @@ that have the high performance drives while omitting the hosts that don't. See
 
 In subsequent examples, we will refer to the cache pool as ``hot-storage`` and
 the backing pool as ``cold-storage``.
-
-For cache tier configuration and default values, see 
-`Pools - Set Pool Values`_.
 
 
 Creating a Cache Tier
@@ -260,7 +263,7 @@ cache tier configuration options with the following usage:
 
    ceph osd pool set {cachepool} {key} {value}
    
-See `Pools - Set Pool Values`_ for details.
+See :ref:`setpoolvalues` for details.
 
 
 Target Size and Type
@@ -312,11 +315,10 @@ A similar parameter can be set for the write operation, which is
    ceph osd pool set {cachepool} min_write_recency_for_promote 2
 
 .. note:: The longer the period and the higher the
-   ``min_read_recency_for_promote`` and
-   ``min_write_recency_for_promote``values, the more RAM the ``ceph-osd``
-   daemon consumes. In particular, when the agent is active to flush
-   or evict cache objects, all ``hit_set_count`` HitSets are loaded
-   into RAM.
+   ``min_read_recency_for_promote`` and ``min_write_recency_for_promote``
+   values, the more RAM the ``ceph-osd`` daemon consumes. In particular, when
+   the agent is active to flush or evict cache objects, all ``hit_set_count``
+   HitSets are loaded into RAM.
 
 
 Cache Sizing
@@ -366,7 +368,7 @@ For example, to flush or evict at 1M objects, execute the following:
    agent will begin flushing or evicting when either threshold is triggered.
 
 .. note:: All client requests will be blocked only when  ``target_max_bytes`` or
-   ``target_max_objects`` reached
+   ``target_max_objects`` is reached.
 
 Relative Sizing
 ~~~~~~~~~~~~~~~
@@ -396,7 +398,7 @@ objects with a higher speed. To set the ``cache_target_dirty_high_ratio``:
    ceph osd pool set {cachepool} cache_target_dirty_high_ratio {0.0..1.0}
 
 For example, setting the value to ``0.6`` will begin aggressively flush dirty
-objects when they reach 60% of the cache pool's capacity. obviously, we'd
+objects when they reach 60% of the cache pool's capacity. Obviously, we'd
 better set the value between dirty_ratio and full_ratio:
 
 .. prompt:: bash $
@@ -441,7 +443,7 @@ cache tier:
 
 .. prompt:: bash $
 
-   ceph osd pool {cache-tier} cache_min_evict_age {#seconds}
+   ceph osd pool set {cache-tier} cache_min_evict_age {#seconds}
 
 For example, to evict objects after 30 minutes, execute the following:
 
@@ -450,10 +452,12 @@ For example, to evict objects after 30 minutes, execute the following:
    ceph osd pool set hot-storage cache_min_evict_age 1800
 
 
+.. _cache-tiering-removal:
+
 Removing a Cache Tier
 =====================
 
-Removing a cache tier differs depending on whether it is a writeback 
+Removing a cache tier differs depending on whether it is a writeback
 cache or a read-only cache.
 
 
@@ -607,8 +611,5 @@ See `Tracker Issue #44286 <https://tracker.ceph.com/issues/44286>`_ for the
 history of this issue.
 
 
-.. _Create a Pool: ../pools#create-a-pool
-.. _Pools - Set Pool Values: ../pools#set-pool-values
 .. _Bloom Filter: https://en.wikipedia.org/wiki/Bloom_filter
-.. _CRUSH Maps: ../crush-map
 .. _Absolute Sizing: #absolute-sizing

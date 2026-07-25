@@ -1,5 +1,5 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
-// vim: ts=8 sw=2 smarttab expandtab
+// vim: ts=8 sw=2 sts=2 expandtab expandtab
 
 #pragma once
 
@@ -61,9 +61,9 @@ class CircularJournalSpace : public JournalAllocator {
       return close_ertr::now();
     }).handle_error(
       Journal::open_for_mount_ertr::pass_further{},
-      crimson::ct_error::assert_all{
+      crimson::ct_error::assert_all(
 	"Invalid error write_header"
-      }
+      )
     );
   }
 
@@ -148,7 +148,7 @@ class CircularJournalSpace : public JournalAllocator {
     return convert_paddr_to_abs_addr(seq.offset);
   }
   void set_written_to(journal_seq_t seq) {
-    rbm_abs_addr addr = convert_paddr_to_abs_addr(seq.offset);
+    [[maybe_unused]] rbm_abs_addr addr = convert_paddr_to_abs_addr(seq.offset);
     assert(addr >= get_records_start());
     assert(addr < get_journal_end());
     written_to = seq;
@@ -220,6 +220,23 @@ class CircularJournalSpace : public JournalAllocator {
     return device->read(offset, bptr);
   }
 
+  void update_journal_tail_on_startup(
+    journal_seq_t dirty,
+    journal_seq_t alloc) {
+    LOG_PREFIX(CircularJournalSpace);
+    SUBDEBUG(seastore_journal,
+      "update tail during replay: dirty={} alloc={}",
+      dirty, alloc);
+    if (dirty > header.dirty_tail ||
+        header.dirty_tail == JOURNAL_SEQ_NULL) {
+      header.dirty_tail = dirty;
+    }
+    if (alloc >= header.alloc_tail ||
+        header.alloc_tail == JOURNAL_SEQ_NULL) {
+      header.alloc_tail = alloc;
+    }
+  }
+
   seastar::future<> update_journal_tail(
     journal_seq_t dirty,
     journal_seq_t alloc) {
@@ -227,9 +244,9 @@ class CircularJournalSpace : public JournalAllocator {
     header.alloc_tail = alloc;
     return write_header(
     ).handle_error(
-      crimson::ct_error::assert_all{
+      crimson::ct_error::assert_all(
       "encountered invalid error in update_journal_tail"
-    });
+    ));
   }
 
   void set_initialized(bool init) {

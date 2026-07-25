@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph - scalable distributed file system
  *
@@ -14,11 +15,20 @@
 
 #ifndef MON_OPREQUEST_H_
 #define MON_OPREQUEST_H_
+
 #include <iosfwd>
+#include <string>
+
 #include <stdint.h>
 
+#include <boost/intrusive_ptr.hpp>
+
+#include "common/Formatter.h"
+#include "common/RefCountedObj.h"
 #include "common/TrackedOp.h"
+#include "include/Context.h"
 #include "mon/Session.h"
+#include "msg/Connection.h"
 #include "msg/Message.h"
 
 struct MonOpRequest : public TrackedOp {

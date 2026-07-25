@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph - scalable distributed file system
  *
@@ -53,8 +54,9 @@ public:
 
 public:
   ActivePyModule(const PyModuleRef &py_module_,
-      LogChannelRef clog_)
-    : PyModuleRunner(py_module_, clog_),
+      LogChannelRef clog_,
+      ThreadMonitor* monitor_ = nullptr)
+    : PyModuleRunner(py_module_, clog_, monitor_),
       finisher(g_ceph_context, thread_name, fmt::format("m-fin-{}", py_module->get_name()).substr(0,15))
 
   {
@@ -66,10 +68,10 @@ public:
 
   bool method_exists(const std::string &method) const;
 
-  PyObject *dispatch_remote(
+  std::optional<std::vector<std::byte>> dispatch_remote(
       const std::string &method,
-      PyObject *args,
-      PyObject *kwargs,
+      std::span<std::byte const> pickled_args,
+      std::span<std::byte const> pickled_kwargs,
       std::string *err);
 
   int handle_command(

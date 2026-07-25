@@ -1,5 +1,5 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab ft=cpp
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab ft=cpp
 
 #pragma once
 
@@ -48,6 +48,7 @@ class RGWSI_Bucket;
 class RGWSI_BucketIndex;
 class RGWSI_Zone;
 class RGWBucketCtl;
+class RGWDataChangesLog;
 
 class RGWSyncModuleInstance {
 public:
@@ -67,7 +68,8 @@ public:
   virtual auto alloc_bucket_instance_meta_handler(rgw::sal::Driver* driver,
                                                   RGWSI_Zone* svc_zone,
                                                   RGWSI_Bucket* svc_bucket,
-                                                  RGWSI_BucketIndex* svc_bi)
+                                                  RGWSI_BucketIndex* svc_bi,
+                                                  RGWDataChangesLog *svc_datalog)
       -> std::unique_ptr<RGWMetadataHandler>;
 
   // indication whether the sync module start with full sync (default behavior)

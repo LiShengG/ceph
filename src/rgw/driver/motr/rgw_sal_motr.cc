@@ -1,5 +1,5 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=2 sw=2 expandtab ft=cpp
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=2 sw=2 sts=2 expandtab ft=cpp
 
 /*
  * Ceph - scalable distributed file system
@@ -557,12 +557,15 @@ int MotrBucket::remove(const DoutPrefixProvider *dpp, bool delete_children, opti
   params.list_versions = true;
   params.allow_unordered = true;
 
+  const bool own_bucket = store->get_zone()->get_zonegroup().get_id() == info.zonegroup;
+
   ListResults results;
+  results.is_truncated = own_bucket; // if we don't have the index, we're done
 
   // 1. Check if Bucket has objects.
   // If bucket contains objects and delete_children is true, delete all objects.
   // Else throw error that bucket is not empty.
-  do {
+  while (results.is_truncated) {
     results.objs.clear();
 
     // Check if bucket has objects.
@@ -591,12 +594,14 @@ int MotrBucket::remove(const DoutPrefixProvider *dpp, bool delete_children, opti
 	      return ret;
       }
     }
-  } while(results.is_truncated);
+  }
 
   // 2. Abort Mp uploads on the bucket.
-  ret = abort_multiparts(dpp, store->ctx());
-  if (ret < 0) {
-    return ret;
+  if (own_bucket) {
+    ret = abort_multiparts(dpp, store->ctx());
+    if (ret < 0) {
+      return ret;
+    }
   }
 
   // 3. Remove mp index??
@@ -608,9 +613,11 @@ int MotrBucket::remove(const DoutPrefixProvider *dpp, bool delete_children, opti
   }
 
   // 4. Sync user stats.
-  ret = this->sync_owner_stats(dpp, y);
-  if (ret < 0) {
-     ldout(store->ctx(), 1) << "WARNING: failed sync user stats before bucket delete. ret=" <<  ret << dendl;
+  if (own_bucket) {
+    ret = this->sync_owner_stats(dpp, y);
+    if (ret < 0) {
+      ldout(store->ctx(), 1) << "WARNING: failed sync user stats before bucket delete. ret=" <<  ret << dendl;
+    }
   }
 
   // 5. Remove the bucket from user info index. (unlink user)
@@ -1111,11 +1118,6 @@ bool MotrZone::get_redirect_endpoint(std::string* endpoint)
   return false;
 }
 
-bool MotrZone::has_zonegroup_api(const std::string& api) const
-{
-  return (zonegroup.group.api_name == api);
-}
-
 const std::string& MotrZone::get_current_period_id()
 {
   return current_period->get_id();
@@ -1229,16 +1231,16 @@ int MotrObject::get_obj_attrs(optional_yield y, const DoutPrefixProvider* dpp, r
   return 0;
 }
 
-int MotrObject::modify_obj_attrs(const char* attr_name, bufferlist& attr_val, optional_yield y, const DoutPrefixProvider* dpp)
+int MotrObject::modify_obj_attrs(const char* attr_name, bufferlist& attr_val, optional_yield y, const DoutPrefixProvider* dpp, uint32_t flags)
 {
   rgw_obj target = get_obj();
   int r = get_obj_attrs(y, dpp, &target);
   if (r < 0) {
     return r;
   }
-  set_atomic();
+  set_atomic(true);
   state.attrset[attr_name] = attr_val;
-  return set_obj_attrs(dpp, &state.attrset, nullptr, y, rgw::sal::FLAG_LOG_OP);
+  return set_obj_attrs(dpp, &state.attrset, nullptr, y, flags);
 }
 
 int MotrObject::delete_obj_attrs(const DoutPrefixProvider* dpp, const char* attr_name, optional_yield y)
@@ -1247,7 +1249,7 @@ int MotrObject::delete_obj_attrs(const DoutPrefixProvider* dpp, const char* attr
   Attrs rmattr;
   bufferlist bl;
 
-  set_atomic();
+  set_atomic(true);
   rmattr[attr_name] = bl;
   return set_obj_attrs(dpp, nullptr, &rmattr, y, rgw::sal::FLAG_LOG_OP);
 }
@@ -1540,6 +1542,7 @@ int MotrObject::copy_object(const ACLOwner& owner,
     std::string* tag,
     std::string* etag,
     void (*progress_cb)(off_t, void *),
+    rgw::sal::DataProcessorFactory* dp_factory,
     void* progress_data,
     const DoutPrefixProvider* dpp,
     optional_yield y)
@@ -2673,12 +2676,11 @@ int MotrMultipartUpload::complete(const DoutPrefixProvider *dpp,
 				   std::string& tag, ACLOwner& owner,
 				   uint64_t olh_epoch,
 				   rgw::sal::Object* target_obj,
-				   prefix_map_t& processed_prefixes)
+				   prefix_map_t& processed_prefixes,
+           const char *if_match,
+           const char *if_nomatch)
 {
   char final_etag[CEPH_CRYPTO_MD5_DIGESTSIZE];
-  char final_etag_str[CEPH_CRYPTO_MD5_DIGESTSIZE * 2 + 16];
-  std::string etag;
-  bufferlist etag_bl;
   MD5 hash;
   // Allow use of MD5 digest in FIPS mode for non-cryptographic purposes
   hash.SetFlags(EVP_MD_CTX_FLAG_NON_FIPS_ALLOW);
@@ -2817,13 +2819,13 @@ int MotrMultipartUpload::complete(const DoutPrefixProvider *dpp,
   } while (truncated);
   hash.Final((unsigned char *)final_etag);
 
-  buf_to_hex((unsigned char *)final_etag, sizeof(final_etag), final_etag_str);
-  snprintf(&final_etag_str[CEPH_CRYPTO_MD5_DIGESTSIZE * 2],
-	   sizeof(final_etag_str) - CEPH_CRYPTO_MD5_DIGESTSIZE * 2,
-           "-%lld", (long long)part_etags.size());
-  etag = final_etag_str;
-  ldpp_dout(dpp, 20) << "calculated etag: " << etag << dendl;
-  etag_bl.append(etag);
+  append_bl(etag_bl, CEPH_CRYPTO_MD5_DIGESTSIZE * 2 + 16, [&](auto iter) {
+    auto start = iter;
+    iter = buf_to_hex(final_etag, iter);
+    iter = fmt::format_to(iter, "-{}", part_etags.size());
+    ldpp_dout(dpp, 10) << "calculated etag: " << std::string_view{start, iter} << dendl;
+    return iter;
+  });
   attrs[RGW_ATTR_ETAG] = etag_bl;
 
   if (compressed) {
@@ -3087,7 +3089,8 @@ int MotrStore::list_roles(const DoutPrefixProvider *dpp,
 int DaosStore::store_oidc_provider(const DoutPrefixProvider* dpp,
                                    optional_yield y,
                                    const RGWOIDCProviderInfo& info,
-                                   bool exclusive)
+                                   bool exclusive,
+                                   RGWObjVersionTracker* objv_tracker)
 {
   return -ENOTSUP;
 }
@@ -3096,7 +3099,8 @@ int DaosStore::load_oidc_provider(const DoutPrefixProvider* dpp,
                                   optional_yield y,
                                   std::string_view tenant,
                                   std::string_view url,
-                                  RGWOIDCProviderInfo& info)
+                                  RGWOIDCProviderInfo& info,
+                                  RGWObjVersionTracker* objv_tracker)
 {
   return -ENOTSUP;
 }
@@ -3329,6 +3333,17 @@ int MotrStore::cluster_stat(RGWClusterStat& stats)
 }
 
 std::unique_ptr<Lifecycle> MotrStore::get_lifecycle(void)
+{
+  return 0;
+}
+
+std::unique_ptr<Restore> MotrStore::get_restore(const int n_objs,
+			const std::vector<std::string_view>& obj_names) {
+  return 0;
+}
+
+bool MotrStore::process_expired_objects(const DoutPrefixProvider *dpp,
+	       				optional_yield y)
 {
   return 0;
 }
@@ -3861,6 +3876,12 @@ int MotrStore::init_metadata_cache(const DoutPrefixProvider *dpp,
   int MotrLuaManager::get_script(const DoutPrefixProvider* dpp, optional_yield y, const std::string& key, std::string& script)
   {
     return -ENOENT;
+  }
+
+  std::tuple<rgw::lua::LuaCodeType, int> MotrLuaManager::get_script_or_bytecode(const DoutPrefixProvider* dpp, optional_yield y,
+                                                                                const std::string& key)
+  {
+    return std::make_tuple("", -ENOENT);
   }
 
   int MotrLuaManager::put_script(const DoutPrefixProvider* dpp, optional_yield y, const std::string& key, const std::string& script)

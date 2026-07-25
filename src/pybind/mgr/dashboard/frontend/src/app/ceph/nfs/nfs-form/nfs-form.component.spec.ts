@@ -5,13 +5,12 @@ import { ActivatedRoute, Router } from '@angular/router';
 import { RouterTestingModule } from '@angular/router/testing';
 
 import { NgbTypeaheadModule } from '@ng-bootstrap/ng-bootstrap';
-import { ToastrModule } from 'ngx-toastr';
+
 import { Observable, of } from 'rxjs';
 
 import { NfsFormClientComponent } from '~/app/ceph/nfs/nfs-form-client/nfs-form-client.component';
 import { NfsFormComponent } from '~/app/ceph/nfs/nfs-form/nfs-form.component';
 import { Directory } from '~/app/shared/api/nfs.service';
-import { LoadingPanelComponent } from '~/app/shared/components/loading-panel/loading-panel.component';
 import { SharedModule } from '~/app/shared/shared.module';
 import { ActivatedRouteStub } from '~/testing/activated-route-stub';
 import { configureTestBed, RgwHelper } from '~/testing/unit-test-helper';
@@ -23,26 +22,22 @@ describe('NfsFormComponent', () => {
   let activatedRoute: ActivatedRouteStub;
   let router: Router;
 
-  configureTestBed(
-    {
-      declarations: [NfsFormComponent, NfsFormClientComponent],
-      imports: [
-        HttpClientTestingModule,
-        ReactiveFormsModule,
-        RouterTestingModule,
-        SharedModule,
-        ToastrModule.forRoot(),
-        NgbTypeaheadModule
-      ],
-      providers: [
-        {
-          provide: ActivatedRoute,
-          useValue: new ActivatedRouteStub({ cluster_id: 'mynfs', export_id: '1' })
-        }
-      ]
-    },
-    [LoadingPanelComponent]
-  );
+  configureTestBed({
+    declarations: [NfsFormComponent, NfsFormClientComponent],
+    imports: [
+      HttpClientTestingModule,
+      ReactiveFormsModule,
+      RouterTestingModule,
+      SharedModule,
+      NgbTypeaheadModule
+    ],
+    providers: [
+      {
+        provide: ActivatedRoute,
+        useValue: new ActivatedRouteStub({ cluster_id: 'mynfs', export_id: '1' })
+      }
+    ]
+  });
 
   const matchSquash = (backendSquashValue: string, uiSquashValue: string) => {
     component.ngOnInit();
@@ -227,8 +222,8 @@ describe('NfsFormComponent', () => {
 
   describe('pathExistence', () => {
     beforeEach(() => {
-      component['nfsService']['lsDir'] = jest.fn(
-        (): Observable<Directory> => of({ paths: ['/path1'] })
+      component['nfsService']['lsDir'] = jest.fn((): Observable<Directory> =>
+        of({ paths: ['/path1'] })
       );
       component.nfsForm.get('name').setValue('CEPH');
       component.setPathValidation();

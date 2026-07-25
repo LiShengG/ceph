@@ -1,5 +1,5 @@
-import { Component, EventEmitter, OnInit, Output } from '@angular/core';
-import { Validators } from '@angular/forms';
+import { Component, EventEmitter, OnInit, Output, ViewChild } from '@angular/core';
+import { FormGroupDirective, Validators } from '@angular/forms';
 
 import { NgbActiveModal } from '@ng-bootstrap/ng-bootstrap';
 import _ from 'lodash';
@@ -17,13 +17,17 @@ import { TaskWrapperService } from '~/app/shared/services/task-wrapper.service';
 @Component({
   selector: 'cd-crush-rule-form-modal',
   templateUrl: './crush-rule-form-modal.component.html',
-  styleUrls: ['./crush-rule-form-modal.component.scss']
+  styleUrls: ['./crush-rule-form-modal.component.scss'],
+  standalone: false
 })
 export class CrushRuleFormModalComponent extends CrushNodeSelectionClass implements OnInit {
+  @ViewChild(FormGroupDirective)
+  formDir: FormGroupDirective;
+
   @Output()
   submitAction = new EventEmitter();
 
-  tooltips = this.crushRuleService.formTooltips;
+  tooltips!: Record<string, string>;
 
   form: CdFormGroup;
   names: string[];
@@ -58,7 +62,7 @@ export class CrushRuleFormModalComponent extends CrushNodeSelectionClass impleme
         ]
       ],
       // root: CrushNode
-      root: null, // Replaced with first root
+      root: 'default', // Replaced with first root
       // failure_domain: string
       failure_domain: '', // Replaced with most common type
       // device_class: string
@@ -67,6 +71,8 @@ export class CrushRuleFormModalComponent extends CrushNodeSelectionClass impleme
   }
 
   ngOnInit() {
+    this.tooltips = this.crushRuleService.formTooltips;
+
     this.crushRuleService
       .getInfo()
       .subscribe(({ names, nodes }: { names: string[]; nodes: CrushNode[] }) => {
@@ -74,7 +80,8 @@ export class CrushRuleFormModalComponent extends CrushNodeSelectionClass impleme
           nodes,
           this.form.get('root'),
           this.form.get('failure_domain'),
-          this.form.get('device_class')
+          this.form.get('device_class'),
+          false
         );
         this.names = names;
       });
@@ -100,7 +107,7 @@ export class CrushRuleFormModalComponent extends CrushNodeSelectionClass impleme
           this.form.setErrors({ cdSubmitButton: true });
         },
         complete: () => {
-          this.activeModal.close();
+          this.closeModal();
           this.submitAction.emit(rule);
         }
       });

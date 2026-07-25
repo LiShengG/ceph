@@ -6,7 +6,7 @@ import { forkJoin } from 'rxjs';
 import { RoleService } from '~/app/shared/api/role.service';
 import { ScopeService } from '~/app/shared/api/scope.service';
 import { ListWithDetails } from '~/app/shared/classes/list-with-details.class';
-import { CriticalConfirmationModalComponent } from '~/app/shared/components/critical-confirmation-modal/critical-confirmation-modal.component';
+import { DeleteConfirmationModalComponent } from '~/app/shared/components/delete-confirmation-modal/delete-confirmation-modal.component';
 import { FormModalComponent } from '~/app/shared/components/form-modal/form-modal.component';
 import { ActionLabelsI18n } from '~/app/shared/constants/app.constants';
 import { CellTemplate } from '~/app/shared/enum/cell-template.enum';
@@ -28,7 +28,8 @@ const BASE_URL = 'user-management/roles';
   selector: 'cd-role-list',
   templateUrl: './role-list.component.html',
   styleUrls: ['./role-list.component.scss'],
-  providers: [{ provide: URLBuilderService, useValue: new URLBuilderService(BASE_URL) }]
+  providers: [{ provide: URLBuilderService, useValue: new URLBuilderService(BASE_URL) }],
+  standalone: false
 })
 export class RoleListComponent extends ListWithDetails implements OnInit {
   permission: Permission;
@@ -134,7 +135,7 @@ export class RoleListComponent extends ListWithDetails implements OnInit {
 
   deleteRoleModal() {
     const name = this.selection.first().name;
-    this.modalRef = this.modalService.show(CriticalConfirmationModalComponent, {
+    this.modalRef = this.modalService.show(DeleteConfirmationModalComponent, {
       itemDescription: 'Role',
       itemNames: [name],
       submitAction: () => this.deleteRole(name)

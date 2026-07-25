@@ -10,7 +10,6 @@ from ceph.fs.earmarking import (
 if 'UNITTEST' in os.environ:
     import tests  # noqa
 
-import bcrypt
 import cephfs
 import contextlib
 import datetime
@@ -18,6 +17,7 @@ import errno
 import socket
 import time
 import logging
+import re
 import sys
 from ipaddress import ip_address
 from threading import Lock, Condition
@@ -33,6 +33,7 @@ else:
 from typing import Tuple, Any, Callable, Optional, Dict, TYPE_CHECKING, TypeVar, List, Iterable, Generator, Generic, Iterator
 
 from ceph.deployment.utils import wrap_ipv6
+from ceph.cryptotools.select import get_crypto_caller
 
 T = TypeVar('T')
 
@@ -61,6 +62,67 @@ BOLD_SEQ = "\033[1m"
 UNDERLINE_SEQ = "\033[4m"
 
 logger = logging.getLogger(__name__)
+
+# NAME and TAG are taken verbatim from the OCI distribution spec:
+#   https://github.com/opencontainers/distribution-spec/blob/main/spec.md
+# DIGEST is based on the OCI image-spec descriptor grammar:
+#   https://github.com/opencontainers/image-spec/blob/main/descriptor.md
+# REGISTRY is a practical heuristic, not defined by either spec.
+#
+# Catches malformed input.
+# Not a full OCI image reference parser.
+
+# distribution-spec, verbatim:
+NAME = r"[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*(\/[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*)*"
+
+# distribution-spec, verbatim:
+TAG = r"[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}"
+
+# image-spec descriptor grammar translated literally:
+GENERIC_DIGEST_RE = re.compile(
+    r"^[a-z0-9]+(?:[+._-][a-z0-9]+)*:[a-zA-Z0-9=_-]+$",
+    re.ASCII,
+)
+
+# Practical heuristic for hostname[:port].
+REGISTRY = r"(?:[a-zA-Z0-9.-]+(?::[0-9]+)?)"
+
+STRICT_KNOWN_DIGESTS = {
+    "sha256": re.compile(r"^[a-f0-9]{64}$", re.ASCII),
+    "sha512": re.compile(r"^[a-f0-9]{128}$", re.ASCII),
+    "blake3": re.compile(r"^[a-f0-9]{64}$", re.ASCII),
+}
+
+IMAGE_RE = re.compile(
+    rf"""
+        ^
+        (?:{REGISTRY}/)?
+        {NAME}
+        (?::{TAG})?
+        (?:@(?P<digest>[a-z0-9]+(?:[+._-][a-z0-9]+)*:[a-zA-Z0-9=_-]+))?
+        $
+    """,
+    re.VERBOSE | re.ASCII,
+)
+
+
+def is_valid_digest(digest: str) -> bool:
+    if not GENERIC_DIGEST_RE.fullmatch(digest):
+        return False
+    algorithm, encoded = digest.split(":", 1)
+    checker = STRICT_KNOWN_DIGESTS.get(algorithm)
+    if checker is None:
+        return True
+    return checker.fullmatch(encoded) is not None
+
+
+def is_valid_container_image_ref(ref: str) -> bool:
+    """Basic sanity check for OCI/Docker-style container image references."""
+    m = IMAGE_RE.fullmatch(ref)
+    if m is None:
+        return False
+    digest = m.group("digest")
+    return digest is None or is_valid_digest(digest)
 
 
 class PortAlreadyInUse(Exception):
@@ -180,6 +242,9 @@ class CephfsConnectionPool(object):
             self.fs.conf_set("client_mount_gid", "0")
             self.fs.conf_set("client_check_pool_perm", "false")
             self.fs.conf_set("client_quota", "false")
+            self.fs.conf_set("client_respect_subvolume_snapshot_visibility",
+                             "false")
+            self.fs.conf_set("client_fscrypt_as", "false")
             logger.debug("CephFS initializing...")
             self.fs.init()
             logger.debug("CephFS mounting...")
@@ -224,16 +289,20 @@ class CephfsConnectionPool(object):
 
     def cleanup_connections(self) -> None:
         with self.lock:
-            logger.info("scanning for idle connections..")
+            logger.debug("scanning for idle connections...")
             idle_conns = []
             for fs_name, connections in self.connections.items():
                 logger.debug(f'fs_name ({fs_name}) connections ({connections})')
                 for connection in connections:
                     if connection.is_connection_idle(CephfsConnectionPool.CONNECTION_IDLE_INTERVAL):
                         idle_conns.append((fs_name, connection))
-            logger.info(f'cleaning up connections: {idle_conns}')
-            for idle_conn in idle_conns:
-                self._del_connection(idle_conn[0], idle_conn[1])
+            # Log only if there are idle connections to clean up
+            if len(idle_conns) > 0:
+                logger.debug(f'cleaning up connections: {idle_conns}')
+                for idle_conn in idle_conns:
+                    self._del_connection(idle_conn[0], idle_conn[1])
+            else:
+                logger.debug("No idle connections to clean up.")
 
     def get_fs_handle(self, fs_name: str) -> "cephfs.LibCephFS":
         with self.lock:
@@ -437,6 +506,28 @@ class CephFSEarmarkResolver:
             return False
 
 
+class NvmeofMetadataPoolHelper:
+    def __init__(self, mgr: "MgrModule") -> None:
+        self.mgr = mgr
+
+    def is_module_enabled(self, module: str) -> bool:
+        mgr_map = self.mgr.get('mgr_map')
+        return (
+            module in mgr_map.get('modules', [])
+            or module in mgr_map.get('always_on_modules', {}).get(self.mgr.release_name, [])
+        )
+
+    def create_pool_if_needed(self) -> None:
+        from orchestrator import OrchestratorError
+
+        if not self.is_module_enabled('nvmeof'):
+            raise OrchestratorError(
+                'NVMe-oF support requires the nvmeof manager module to be enabled before proceeding. '
+                'Enable it with: ceph mgr module enable nvmeof'
+            )
+        self.mgr.remote('nvmeof', 'create_pool_if_not_exists')
+
+
 @contextlib.contextmanager
 def open_filesystem(fsc: CephfsClient, fs_name: str) -> Generator["cephfs.LibCephFS", None, None]:
     """
@@ -627,19 +718,8 @@ def create_self_signed_cert(organisation: str = 'Ceph',
 
     """
 
-    from OpenSSL import crypto
-    from uuid import uuid4
-
     # RDN = Relative Distinguished Name
     valid_RDN_list = ['C', 'ST', 'L', 'O', 'OU', 'CN', 'emailAddress']
-
-    # create a key pair
-    pkey = crypto.PKey()
-    pkey.generate_key(crypto.TYPE_RSA, 2048)
-
-    # Create a "subject" object
-    req = crypto.X509Req()
-    subj = req.get_subject()
 
     if dname:
         # dname received, so check it contains valid RDNs
@@ -648,43 +728,18 @@ def create_self_signed_cert(organisation: str = 'Ceph',
     else:
         dname = {"O": organisation, "CN": common_name}
 
-    # populate the subject with the dname settings
-    for k, v in dname.items():
-        setattr(subj, k, v)
-
-    # create a self-signed cert
-    cert = crypto.X509()
-    cert.set_subject(req.get_subject())
-    cert.set_serial_number(int(uuid4()))
-    cert.gmtime_adj_notBefore(0)
-    cert.gmtime_adj_notAfter(10 * 365 * 24 * 60 * 60)  # 10 years
-    cert.set_issuer(cert.get_subject())
-    cert.set_pubkey(pkey)
-    cert.sign(pkey, 'sha512')
-
-    cert = crypto.dump_certificate(crypto.FILETYPE_PEM, cert)
-    pkey = crypto.dump_privatekey(crypto.FILETYPE_PEM, pkey)
-
-    return cert.decode('utf-8'), pkey.decode('utf-8')
+    cc = get_crypto_caller()
+    pkey = cc.create_private_key()
+    cert = cc.create_self_signed_cert(dname, pkey)
+    return cert, pkey
 
 
-def verify_cacrt_content(crt):
-    # type: (str) -> None
-    from OpenSSL import crypto
+def certificate_days_to_expire(crt: str) -> int:
     try:
-        crt_buffer = crt.encode("ascii") if isinstance(crt, str) else crt
-        x509 = crypto.load_certificate(crypto.FILETYPE_PEM, crt_buffer)
-        if x509.has_expired():
-            org, cn = get_cert_issuer_info(crt)
-            no_after = x509.get_notAfter()
-            end_date = None
-            if no_after is not None:
-                end_date = datetime.datetime.strptime(no_after.decode('ascii'), '%Y%m%d%H%M%SZ')
-            msg = f'Certificate issued by "{org}/{cn}" expired on {end_date}'
-            logger.warning(msg)
-            raise ServerConfigException(msg)
-    except (ValueError, crypto.Error) as e:
-        raise ServerConfigException(f'Invalid certificate: {e}')
+        cc = get_crypto_caller()
+        return cc.certificate_days_to_expire(crt)
+    except ValueError as err:
+        raise ServerConfigException(f'Invalid certificate: {err}')
 
 
 def verify_cacrt(cert_fname):
@@ -698,7 +753,7 @@ def verify_cacrt(cert_fname):
 
     try:
         with open(cert_fname) as f:
-            verify_cacrt_content(f.read())
+            certificate_days_to_expire(f.read())
     except ValueError as e:
         raise ServerConfigException(
             'Invalid certificate {}: {}'.format(cert_fname, str(e)))
@@ -706,51 +761,22 @@ def verify_cacrt(cert_fname):
 
 def get_cert_issuer_info(crt: str) -> Tuple[Optional[str], Optional[str]]:
     """Basic validation of a ca cert"""
-
-    from OpenSSL import crypto, SSL  # noqa
+    cc = get_crypto_caller()
     try:
-        crt_buffer = crt.encode("ascii") if isinstance(crt, str) else crt
-        (org_name, cn) = (None, None)
-        cert = crypto.load_certificate(crypto.FILETYPE_PEM, crt_buffer)
-        components = cert.get_issuer().get_components()
-        for c in components:
-            if c[0].decode() == 'O':  # org comp
-                org_name = c[1].decode()
-            elif c[0].decode() == 'CN':  # common name comp
-                cn = c[1].decode()
-        return (org_name, cn)
-    except (ValueError, crypto.Error) as e:
-        raise ServerConfigException(f'Invalid certificate key: {e}')
+        return cc.get_cert_issuer_info(crt)
+    except ValueError as err:
+        raise ServerConfigException(f'Invalid certificate key: {err}')
 
 
 def verify_tls(crt, key):
-    # type: (str, str) -> None
-    verify_cacrt_content(crt)
-
-    from OpenSSL import crypto, SSL
+    # type: (str, str) -> int
+    cc = get_crypto_caller()
     try:
-        _key = crypto.load_privatekey(crypto.FILETYPE_PEM, key)
-        _key.check()
-    except (ValueError, crypto.Error) as e:
-        raise ServerConfigException(
-            'Invalid private key: {}'.format(str(e)))
-    try:
-        crt_buffer = crt.encode("ascii") if isinstance(crt, str) else crt
-        _crt = crypto.load_certificate(crypto.FILETYPE_PEM, crt_buffer)
-    except ValueError as e:
-        raise ServerConfigException(
-            'Invalid certificate key: {}'.format(str(e))
-        )
-
-    try:
-        context = SSL.Context(SSL.TLSv1_METHOD)
-        context.use_certificate(_crt)
-        context.use_privatekey(_key)
-        context.check_privatekey()
-    except crypto.Error as e:
-        logger.warning('Private key and certificate do not match up: {}'.format(str(e)))
-    except SSL.Error as e:
-        raise ServerConfigException(f'Invalid cert/key pair: {e}')
+        days_to_expiration = cc.certificate_days_to_expire(crt)
+        cc.verify_tls(crt, key)
+    except ValueError as err:
+        raise ServerConfigException(str(err))
+    return days_to_expiration
 
 
 def verify_tls_files(cert_fname, pkey_fname):
@@ -778,24 +804,14 @@ def verify_tls_files(cert_fname, pkey_fname):
     if not os.path.isfile(pkey_fname):
         raise ServerConfigException('private key %s does not exist' % pkey_fname)
 
-    from OpenSSL import crypto, SSL
+    if not os.path.isfile(cert_fname):
+        raise ServerConfigException('certificate %s does not exist' % cert_fname)
 
     try:
-        with open(pkey_fname) as f:
-            pkey = crypto.load_privatekey(crypto.FILETYPE_PEM, f.read())
-            pkey.check()
-    except (ValueError, crypto.Error) as e:
-        raise ServerConfigException(
-            'Invalid private key {}: {}'.format(pkey_fname, str(e)))
-    try:
-        context = SSL.Context(SSL.TLSv1_METHOD)
-        context.use_certificate_file(cert_fname, crypto.FILETYPE_PEM)
-        context.use_privatekey_file(pkey_fname, crypto.FILETYPE_PEM)
-        context.check_privatekey()
-    except crypto.Error as e:
-        logger.warning(
-            'Private key {} and certificate {} do not match up: {}'.format(
-                pkey_fname, cert_fname, str(e)))
+        with open(pkey_fname) as key_file, open(cert_fname) as cert_file:
+            verify_tls(cert_file.read(), key_file.read())
+    except (ServerConfigException) as e:
+        raise ServerConfigException({e})
 
 
 def get_most_recent_rate(rates: Optional[List[Tuple[float, float]]]) -> float:
@@ -975,11 +991,31 @@ def profile_method(skip_attribute: bool = False) -> Callable[[Callable[..., T]],
     return outer
 
 
+def parse_combined_pem_file(pem_data: str) -> Tuple[Optional[str], Optional[str]]:
+
+    # Extract the certificate
+    cert_start = "-----BEGIN CERTIFICATE-----"
+    cert_end = "-----END CERTIFICATE-----"
+    cert = None
+    if cert_start in pem_data and cert_end in pem_data:
+        cert = pem_data[pem_data.index(cert_start):pem_data.index(cert_end) + len(cert_end)]
+
+    # Extract the private key
+    key_start = "-----BEGIN PRIVATE KEY-----"
+    key_end = "-----END PRIVATE KEY-----"
+    private_key = None
+    if key_start in pem_data and key_end in pem_data:
+        private_key = pem_data[pem_data.index(key_start):pem_data.index(key_end) + len(key_end)]
+
+    return cert, private_key
+
+
 def password_hash(password: Optional[str], salt_password: Optional[str] = None) -> Optional[str]:
     if not password:
         return None
+
     if not salt_password:
-        salt = bcrypt.gensalt()
-    else:
-        salt = salt_password.encode('utf8')
-    return bcrypt.hashpw(password.encode('utf8'), salt).decode('utf8')
+        salt_password = ''
+
+    cc = get_crypto_caller()
+    return cc.password_hash(password, salt_password)

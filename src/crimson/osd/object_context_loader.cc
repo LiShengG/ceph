@@ -22,15 +22,18 @@ ObjectContextLoader::load_and_lock_head(Manager &manager, RWState::State lock_ty
     auto [obc, _] = obc_registry.get_cached_obc(manager.target);
     manager.set_state_obc(manager.head_state, obc);
   }
-  ceph_assert(manager.target_state.is_empty());
-  manager.set_state_obc(manager.target_state, manager.head_state.obc);
+  if (manager.target_state.is_empty()) {
+    manager.set_state_obc(manager.target_state, manager.head_state.obc);
+  }
 
   if (manager.target_state.obc->loading_started) {
     co_await manager.target_state.lock_to(lock_type);
   } else {
     manager.target_state.lock_excl_sync();
     manager.target_state.obc->loading_started = true;
-    co_await load_obc(manager.target_state.obc);
+    co_await load_obc(
+      manager.target_state.obc,
+      backend.load_metadata(manager.target_state.obc->get_oid()));
     manager.target_state.demote_excl_to(lock_type);
   }
   releaser.cancel();
@@ -45,7 +48,6 @@ ObjectContextLoader::load_and_lock_clone(
   auto releaser = manager.get_releaser();
 
   ceph_assert(!manager.target.is_head());
-  ceph_assert(manager.target_state.is_empty());
 
   if (manager.head_state.is_empty()) {
     auto [obc, _] = obc_registry.get_cached_obc(manager.target.get_head());
@@ -58,13 +60,18 @@ ObjectContextLoader::load_and_lock_clone(
     ceph_assert(lock_head);
     manager.head_state.lock_excl_sync();
     manager.head_state.obc->loading_started = true;
-    co_await load_obc(manager.head_state.obc);
+    co_await load_obc(
+      manager.head_state.obc,
+      backend.load_metadata(manager.head_state.obc->get_oid()));
     manager.head_state.demote_excl_to(RWState::RWREAD);
   } else if (lock_head) {
     co_await manager.head_state.lock_to(RWState::RWREAD);
   }
 
   if (manager.options.resolve_clone) {
+    // target_state must be empty because we won't know which object to load
+    // until now
+    ceph_assert(manager.target_state.is_empty());
     auto resolved_oid = resolve_oid(
       manager.head_state.obc->get_head_ss(),
       manager.target);
@@ -91,6 +98,8 @@ ObjectContextLoader::load_and_lock_clone(
      * actually can mutate a clone do not set resolve_clone, so target will not
      * become head here.
      */
+    ceph_assert(manager.options.resolve_clone);
+    ceph_assert(manager.target_state.is_empty());
     manager.set_state_obc(manager.target_state, manager.head_state.obc);
     if (lock_type != manager.head_state.state) {
       // This case isn't actually possible at the moment for the above reason.
@@ -101,20 +110,33 @@ ObjectContextLoader::load_and_lock_clone(
       manager.head_state.state = RWState::RWNONE;
     }
   } else {
-    auto [obc, _] = obc_registry.get_cached_obc(manager.target);
-    manager.set_state_obc(manager.target_state, obc);
+    // caller may have already populated this if !resolve_clone
+    if (manager.target_state.is_empty()) {
+      auto [obc, _] = obc_registry.get_cached_obc(manager.target);
+      manager.set_state_obc(manager.target_state, obc);
+    }
 
     if (manager.target_state.obc->loading_started) {
       co_await manager.target_state.lock_to(RWState::RWREAD);
+      if (!manager.target_state.obc->ssc) {
+	// A cached clone obc may have a null ssc if created via
+	// create_cached_obc_from_push_data.  This interface
+	// is responsible for fixing that if found.
+	manager.target_state.obc->ssc = manager.head_state.obc->ssc;
+      }
     } else {
       manager.target_state.lock_excl_sync();
       manager.target_state.obc->loading_started = true;
-      co_await load_obc(manager.target_state.obc);
+      co_await load_obc(
+        manager.target_state.obc,
+        backend.load_metadata(manager.target_state.obc->get_oid()));
       manager.target_state.obc->set_clone_ssc(manager.head_state.obc->ssc);
       manager.target_state.demote_excl_to(RWState::RWREAD);
     }
   }
 
+  ceph_assert(manager.target_state.obc->ssc);
+  ceph_assert(manager.head_state.obc->ssc);
   releaser.cancel();
 }
 
@@ -131,31 +153,41 @@ ObjectContextLoader::load_and_lock(Manager &manager, RWState::State lock_type)
 }
 
 ObjectContextLoader::load_obc_iertr::future<>
-ObjectContextLoader::load_obc(ObjectContextRef obc)
+ObjectContextLoader::load_obc(
+  ObjectContextRef obc,
+  PGBackend::load_metadata_iertr::future<PGBackend::loaded_object_md_t::ref> _md)
 {
   LOG_PREFIX(ObjectContextLoader::load_obc);
-  return backend.load_metadata(obc->get_oid())
-    .safe_then_interruptible(
-      [FNAME, this, obc=std::move(obc)](auto md)
-      -> load_obc_ertr::future<> {
-	const hobject_t& oid = md->os.oi.soid;
-	DEBUGDPP("loaded obs {} for {}", dpp, md->os.oi, oid);
-	if (oid.is_head()) {
-	  if (!md->ssc) {
-	    ERRORDPP("oid {} missing snapsetcontext", dpp, oid);
-	    return crimson::ct_error::object_corrupted::make();
-	  }
-	  obc->set_head_state(std::move(md->os),
-			      std::move(md->ssc));
-	} else {
-	  // we load and set the ssc only for head obc.
-	  // For clones, the head's ssc will be referenced later.
-	  // See set_clone_ssc
-	  obc->set_clone_state(std::move(md->os));
-	}
-	DEBUGDPP("loaded obc {} for {}", dpp, obc->obs.oi, obc->obs.oi.soid);
-	return seastar::now();
-      });
+  auto md = co_await std::move(_md);
+  if (md->os.oi.soid.is_head() && !md->ssc) {
+	  ERRORDPP("oid {} missing snapsetcontext",
+               dpp, md->os.oi.soid);
+	  co_await load_obc_iertr::future<>(
+          crimson::ct_error::object_corrupted::make());
+  }
+  load_obc(obc, std::move(md));
+}
+
+void
+ObjectContextLoader::load_obc(
+  ObjectContextRef obc,
+  PGBackend::loaded_object_md_t::ref md)
+{
+  const hobject_t& oid = md->os.oi.soid;
+  LOG_PREFIX(ObjectContextLoader::load_obc);
+  DEBUGDPP("loaded obs {} for {}", dpp, md->os.oi, oid);
+  if (oid.is_head()) {
+    ceph_assert(md->ssc);
+    obc->set_head_state(std::move(md->os),
+		      std::move(md->ssc));
+  } else {
+    // we load and set the ssc only for head obc.
+    // For clones, the head's ssc will be referenced later.
+    // See set_clone_ssc
+    obc->set_clone_state(std::move(md->os));
+  }
+  obc->attr_cache = std::move(md->attr_cache);
+  DEBUGDPP("loaded obc {} for {}", dpp, obc->obs.oi, obc->obs.oi.soid);
 }
 
 void ObjectContextLoader::notify_on_change(bool is_primary)

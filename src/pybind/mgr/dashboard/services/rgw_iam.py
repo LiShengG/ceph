@@ -1,5 +1,5 @@
 from subprocess import SubprocessError
-from typing import List, Optional
+from typing import List
 
 from .. import mgr
 from ..exceptions import DashboardException
@@ -21,72 +21,28 @@ class RgwAccounts:
             raise DashboardException(e, component='rgw')
 
     @classmethod
-    def get_accounts(cls, detailed: bool = False):
-        """
-        Query account Id's, optionally returning full details.
-
-        :param detailed: Boolean to indicate if full account details are required.
-        """
+    def get_accounts(cls):
         get_accounts_cmd = ['account', 'list']
-        account_list = cls.send_rgw_cmd(get_accounts_cmd)
-        detailed_account_list = []
-        if detailed:
-            for account in account_list:
-                detailed_account_list.append(cls.get_account(account))
-            return detailed_account_list
-        return account_list
+        return cls.send_rgw_cmd(get_accounts_cmd)
 
     @classmethod
-    def get_account(cls, account_id: str):
-        get_account_cmd = ['account', 'get', '--account-id', account_id]
+    def get_account_by_name(cls, account_name: str):
+        """
+        Get account info by account name
+        Returns account info if found, raises exception otherwise
+        """
+        get_account_cmd = ['account', 'info', '--account-name', account_name]
         return cls.send_rgw_cmd(get_account_cmd)
 
     @classmethod
-    def create_account(cls, account_name: Optional[str] = None,
-                       account_id: Optional[str] = None, email: Optional[str] = None):
-        create_accounts_cmd = ['account', 'create']
-
-        if account_name:
-            create_accounts_cmd += ['--account-name', account_name]
-
-        if account_id:
-            create_accounts_cmd += ['--account_id', account_id]
-
-        if email:
-            create_accounts_cmd += ['--email', email]
-
-        return cls.send_rgw_cmd(create_accounts_cmd)
-
-    @classmethod
-    def modify_account(cls, account_id: str, account_name: Optional[str] = None,
-                       email: Optional[str] = None):
-        modify_accounts_cmd = ['account', 'modify', '--account-id', account_id]
-
-        if account_name:
-            modify_accounts_cmd += ['--account-name', account_name]
-
-        if email:
-            modify_accounts_cmd += ['--email', email]
-
-        return cls.send_rgw_cmd(modify_accounts_cmd)
-
-    @classmethod
-    def delete_account(cls, account_id: str):
-        modify_accounts_cmd = ['account', 'rm', '--account-id', account_id]
-
-        return cls.send_rgw_cmd(modify_accounts_cmd)
-
-    @classmethod
-    def get_account_stats(cls, account_id: str):
-        account_stats_cmd = ['account', 'stats', '--account-id', account_id]
-
-        return cls.send_rgw_cmd(account_stats_cmd)
-
-    @classmethod
-    def set_quota(cls, quota_type: str, account_id: str, max_size: str, max_objects: str):
+    def set_quota(cls, quota_type: str, account_id: str, max_size: str, max_objects: str,
+                  enabled: bool):
         set_quota_cmd = ['quota', 'set', '--quota-scope', quota_type, '--account-id', account_id,
                          '--max-size', max_size, '--max-objects', max_objects]
-
+        if enabled:
+            cls.set_quota_status(quota_type, account_id, 'enable')
+        else:
+            cls.set_quota_status(quota_type, account_id, 'disable')
         return cls.send_rgw_cmd(set_quota_cmd)
 
     @classmethod
@@ -95,3 +51,43 @@ class RgwAccounts:
                                 '--account-id', account_id]
 
         return cls.send_rgw_cmd(set_quota_status_cmd)
+
+    @classmethod
+    def attach_managed_policy(cls, userId, policy_arn):
+        radosgw_attach_managed_policies = ['user', 'policy', 'attach',
+                                           '--uid', userId, '--policy-arn', policy_arn]
+        try:
+            exit_code, _, err = mgr.send_rgwadmin_command(radosgw_attach_managed_policies,
+                                                          stdout_as_json=False)
+            if exit_code > 0:
+                raise DashboardException(e=err, msg='Unable to attach managed policies',
+                                         http_status_code=500, component='rgw')
+        except SubprocessError as error:
+            raise DashboardException(error, http_status_code=500, component='rgw')
+
+    @classmethod
+    def detach_managed_policy(cls, userId, policy_arn):
+        radosgw_detach_managed_policy = ['user', 'policy', 'detach',
+                                         '--uid', userId, '--policy-arn', policy_arn]
+        try:
+            exit_code, _, err = mgr.send_rgwadmin_command(radosgw_detach_managed_policy,
+                                                          stdout_as_json=False)
+            if exit_code > 0:
+                raise DashboardException(e=err, msg='Unable to detach managed policies',
+                                         http_status_code=500, component='rgw')
+
+        except SubprocessError as error:
+            raise DashboardException(error, http_status_code=500, component='rgw')
+
+    @classmethod
+    def list_managed_policy(cls, userId):
+        radosgw_list_managed_policies = ['user', 'policy', 'list', 'attached',
+                                         '--uid', userId]
+        try:
+            exit_code, out, err = mgr.send_rgwadmin_command(radosgw_list_managed_policies)
+            if exit_code > 0:
+                raise DashboardException(e=err, msg='Unable to get managed policies',
+                                         http_status_code=500, component='rgw')
+            return out
+        except SubprocessError as error:
+            raise DashboardException(error, http_status_code=500, component='rgw')

@@ -9,9 +9,10 @@ import logging
 
 from configparser import ConfigParser
 
-from typing import Dict, Any, Optional, Iterable, List
+from typing import Dict, Any, Optional, Iterable, List, Union
 
 from .constants import DATEFMT, DEFAULT_REGISTRY
+from .context import CephadmContext
 from .exceptions import Error
 
 
@@ -53,51 +54,6 @@ def dict_get_join(d: Dict[str, Any], key: str) -> Any:
     if isinstance(value, list):
         value = '\n'.join(map(str, value))
     return value
-
-
-def bytes_to_human(num, mode='decimal'):
-    # type: (float, str) -> str
-    """Convert a bytes value into it's human-readable form.
-
-    :param num: number, in bytes, to convert
-    :param mode: Either decimal (default) or binary to determine divisor
-    :returns: string representing the bytes value in a more readable format
-    """
-    unit_list = ['', 'KB', 'MB', 'GB', 'TB', 'PB', 'EB', 'ZB']
-    divisor = 1000.0
-    yotta = 'YB'
-
-    if mode == 'binary':
-        unit_list = ['', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB', 'EiB', 'ZiB']
-        divisor = 1024.0
-        yotta = 'YiB'
-
-    for unit in unit_list:
-        if abs(num) < divisor:
-            return '%3.1f%s' % (num, unit)
-        num /= divisor
-    return '%.1f%s' % (num, yotta)
-
-
-def with_units_to_int(v: str) -> int:
-    if v.endswith('iB'):
-        v = v[:-2]
-    elif v.endswith('B'):
-        v = v[:-1]
-    mult = 1
-    if v[-1].upper() == 'K':
-        mult = 1024
-        v = v[:-1]
-    elif v[-1].upper() == 'M':
-        mult = 1024 * 1024
-        v = v[:-1]
-    elif v[-1].upper() == 'G':
-        mult = 1024 * 1024 * 1024
-        v = v[:-1]
-    elif v[-1].upper() == 'T':
-        mult = 1024 * 1024 * 1024 * 1024
-        v = v[:-1]
-    return int(float(v) * mult)
 
 
 def read_config(fn):
@@ -203,6 +159,30 @@ def get_legacy_config_fsid(
         ):
             return config.get('global', 'fsid')
     return None
+
+
+def get_legacy_daemon_fsid(
+    ctx: CephadmContext,
+    cluster: str,
+    daemon_type: str,
+    daemon_id: Union[int, str],
+    legacy_dir: Optional[str] = None,
+) -> Optional[str]:
+    fsid = None
+    if daemon_type == 'osd':
+        try:
+            fsid_file = os.path.join(
+                ctx.data_dir, daemon_type, 'ceph-%s' % daemon_id, 'ceph_fsid'
+            )
+            if legacy_dir is not None:
+                fsid_file = os.path.abspath(legacy_dir + fsid_file)
+            with open(fsid_file, 'r') as f:
+                fsid = f.read().strip()
+        except IOError:
+            pass
+    if not fsid:
+        fsid = get_legacy_config_fsid(cluster, legacy_dir=legacy_dir)
+    return fsid
 
 
 def _extract_host_info_from_applied_spec(

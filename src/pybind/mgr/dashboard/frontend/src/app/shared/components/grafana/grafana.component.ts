@@ -7,7 +7,8 @@ import { Icons } from '~/app/shared/enum/icons.enum';
 @Component({
   selector: 'cd-grafana',
   templateUrl: './grafana.component.html',
-  styleUrls: ['./grafana.component.scss']
+  styleUrls: ['./grafana.component.scss'],
+  standalone: false
 })
 export class GrafanaComponent implements OnInit, OnChanges {
   grafanaSrc: SafeUrl;
@@ -39,8 +40,13 @@ export class GrafanaComponent implements OnInit, OnChanges {
   uid: string;
   @Input()
   title: string;
+  @Input()
+  scrollable: string = 'yes';
 
-  constructor(private sanitizer: DomSanitizer, private settingsService: SettingsService) {
+  constructor(
+    private sanitizer: DomSanitizer,
+    private settingsService: SettingsService
+  ) {
     this.grafanaTimes = [
       {
         name: $localize`Last 5 minutes`,
@@ -155,7 +161,8 @@ export class GrafanaComponent implements OnInit, OnChanges {
       one: 'grafana_one',
       two: 'grafana_two',
       three: 'grafana_three',
-      four: 'grafana_four'
+      four: 'grafana_four',
+      five: 'grafana_five'
     };
 
     this.datasource = this.type === 'metrics' ? 'Dashboard1' : 'Loki';

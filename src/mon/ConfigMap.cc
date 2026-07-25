@@ -1,15 +1,18 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
-
-#include <boost/algorithm/string/split.hpp>
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
 
 #include "ConfigMap.h"
 #include "crush/CrushWrapper.h"
 #include "common/entity_name.h"
 
+#include <boost/algorithm/string/split.hpp>
+#include <boost/algorithm/string/trim.hpp>
+
 #define dout_subsys ceph_subsys_mon
 #undef dout_prefix
 #include "common/dout.h"
+
+#include <iomanip>
 
 using namespace std::literals;
 
@@ -35,7 +38,6 @@ using ceph::bufferlist;
 using ceph::decode;
 using ceph::encode;
 using ceph::Formatter;
-using ceph::JSONFormatter;
 using ceph::mono_clock;
 using ceph::mono_time;
 using ceph::timespan_str;
@@ -206,6 +208,7 @@ bool ConfigMap::parse_mask(
   boost::split(split, who, [](char c){ return c == '/'; });
   for (unsigned j = 0; j < split.size(); ++j) {
     auto& i = split[j];
+    boost::algorithm::trim(i);
     if (i == "global") {
       *section = "global";
       continue;

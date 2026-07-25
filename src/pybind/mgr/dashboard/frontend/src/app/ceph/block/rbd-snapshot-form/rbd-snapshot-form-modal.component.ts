@@ -17,7 +17,8 @@ import { TaskManagerService } from '~/app/shared/services/task-manager.service';
 @Component({
   selector: 'cd-rbd-snapshot-form-modal',
   templateUrl: './rbd-snapshot-form-modal.component.html',
-  styleUrls: ['./rbd-snapshot-form-modal.component.scss']
+  styleUrls: ['./rbd-snapshot-form-modal.component.scss'],
+  standalone: false
 })
 export class RbdSnapshotFormModalComponent extends BaseModal implements OnInit {
   snapshotForm: CdFormGroup;
@@ -61,6 +62,15 @@ export class RbdSnapshotFormModalComponent extends BaseModal implements OnInit {
 
   ngOnInit(): void {
     this.peerConfigured$ = this.rbdMirrorService.getPeerForPool(this.poolName);
+
+    this.peerConfigured$.subscribe((peers) => {
+      const control = this.snapshotForm.get('mirrorImageSnapshot');
+      if (peers && peers.length > 0) {
+        control.enable();
+      } else {
+        control.disable();
+      }
+    });
   }
 
   setSnapName(snapName: string) {

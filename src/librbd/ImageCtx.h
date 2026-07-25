@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
+
 #ifndef CEPH_LIBRBD_IMAGECTX_H
 #define CEPH_LIBRBD_IMAGECTX_H
 
@@ -366,7 +367,11 @@ namespace librbd {
                                    ceph::mutex **timer_lock);
 
   private:
+#ifdef __cpp_lib_atomic_shared_ptr
+    std::atomic<std::shared_ptr<neorados::IOContext>> data_io_context;
+#else
     std::shared_ptr<neorados::IOContext> data_io_context;
+#endif
   };
 }
 

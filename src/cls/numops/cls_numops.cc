@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph - scalable distributed file system
  *
@@ -23,10 +24,13 @@
 
 #include "objclass/objclass.h"
 #include <errno.h>
+#include <iomanip>
 #include <string>
 #include <sstream>
 #include <cstdio>
 #include <include/compat.h>
+
+#include "cls_numops_ops.h"
 
 #define DECIMAL_PRECISION 10
 
@@ -156,13 +160,10 @@ CLS_INIT(numops)
   cls_method_handle_t h_add;
   cls_method_handle_t h_mul;
 
-  cls_register("numops", &h_class);
+  using namespace rados::cls::numops;
+  cls_register(ClassId::name, &h_class);
+  ClassRegistrar<ClassId> cls(h_class);
 
-  cls_register_cxx_method(h_class, "add",
-                          CLS_METHOD_RD | CLS_METHOD_WR,
-                          add, &h_add);
-
-  cls_register_cxx_method(h_class, "mul",
-                          CLS_METHOD_RD | CLS_METHOD_WR,
-                          mul, &h_mul);
+  cls.register_cxx_method(method::add, add, &h_add);
+  cls.register_cxx_method(method::mul, mul, &h_mul);
 }

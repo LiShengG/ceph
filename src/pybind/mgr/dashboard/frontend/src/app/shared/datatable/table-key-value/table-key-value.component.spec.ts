@@ -3,7 +3,6 @@ import { FormsModule } from '@angular/forms';
 import { RouterTestingModule } from '@angular/router/testing';
 
 import { NgbDropdownModule, NgbTooltipModule } from '@ng-bootstrap/ng-bootstrap';
-import { NgxPipeFunctionModule } from 'ngx-pipe-function';
 
 import { ComponentsModule } from '~/app/shared/components/components.module';
 import { CellTemplate } from '~/app/shared/enum/cell-template.enum';
@@ -27,8 +26,7 @@ describe('TableKeyValueComponent', () => {
       RouterTestingModule,
       NgbDropdownModule,
       PipesModule,
-      NgbTooltipModule,
-      NgxPipeFunctionModule
+      NgbTooltipModule
     ]
   });
 
@@ -65,6 +63,21 @@ describe('TableKeyValueComponent', () => {
     component.hideKeys = ['a'];
     component.ngOnInit();
     expect(component.tableData).toEqual([{ key: 'b', value: 2 }]);
+  });
+
+  it('should preserve the order of array data when requested', () => {
+    component.data = [
+      ['Plugin', 'isa'],
+      ['Data chunks (k)', 4],
+      ['Coding chunks (m)', 2]
+    ];
+    component.preserveOrder = true;
+    component.ngOnInit();
+    expect(component.tableData).toEqual([
+      { key: 'Plugin', value: 'isa' },
+      { key: 'Data chunks (k)', value: 4 },
+      { key: 'Coding chunks (m)', value: 2 }
+    ]);
   });
 
   it('should remove items with objects as values', () => {

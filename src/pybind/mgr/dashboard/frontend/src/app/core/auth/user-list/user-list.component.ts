@@ -4,9 +4,10 @@ import { NgbModalRef } from '@ng-bootstrap/ng-bootstrap';
 
 import { SettingsService } from '~/app/shared/api/settings.service';
 import { UserService } from '~/app/shared/api/user.service';
-import { CriticalConfirmationModalComponent } from '~/app/shared/components/critical-confirmation-modal/critical-confirmation-modal.component';
-import { ActionLabelsI18n } from '~/app/shared/constants/app.constants';
+import { DeleteConfirmationModalComponent } from '~/app/shared/components/delete-confirmation-modal/delete-confirmation-modal.component';
+import { ActionLabelsI18n, USER } from '~/app/shared/constants/app.constants';
 import { CellTemplate } from '~/app/shared/enum/cell-template.enum';
+import { DeletionImpact } from '~/app/shared/enum/delete-confirmation-modal-impact.enum';
 import { Icons } from '~/app/shared/enum/icons.enum';
 import { NotificationType } from '~/app/shared/enum/notification-type.enum';
 import { CdTableAction } from '~/app/shared/models/cd-table-action';
@@ -25,7 +26,8 @@ const BASE_URL = 'user-management/users';
   selector: 'cd-user-list',
   templateUrl: './user-list.component.html',
   styleUrls: ['./user-list.component.scss'],
-  providers: [{ provide: URLBuilderService, useValue: new URLBuilderService(BASE_URL) }]
+  providers: [{ provide: URLBuilderService, useValue: new URLBuilderService(BASE_URL) }],
+  standalone: false
 })
 export class UserListComponent implements OnInit {
   @ViewChild('userRolesTpl', { static: true })
@@ -67,7 +69,8 @@ export class UserListComponent implements OnInit {
       permission: 'update',
       icon: Icons.edit,
       routerLink: () =>
-        this.selection.first() && this.urlBuilder.getEdit(this.selection.first().username),
+        this.selection.first() &&
+        this.urlBuilder.getEdit(encodeURIComponent(this.selection.first().username)),
       name: this.actionLabels.EDIT
     };
     const deleteAction: CdTableAction = {
@@ -173,8 +176,9 @@ export class UserListComponent implements OnInit {
       return;
     }
 
-    this.modalRef = this.modalService.show(CriticalConfirmationModalComponent, {
-      itemDescription: 'User',
+    this.modalRef = this.modalService.show(DeleteConfirmationModalComponent, {
+      impact: DeletionImpact.high,
+      itemDescription: USER,
       itemNames: [username],
       submitAction: () => this.deleteUser(username)
     });

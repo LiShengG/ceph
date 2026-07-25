@@ -29,12 +29,18 @@ support the new file system. The deployment technology used, e.g. cephadm, will
 also configure the MDS affinity (see: :ref:`mds-join-fs`) of new MDS daemons to
 operate the new file system.
 
+If the data and metadata pools for the volume are already present, the names of
+these pool(s) can be passed as follows::
+
+    ceph fs volume create <vol-name> --meta-pool <meta-pool-name> --data-pool <data-pool-name>
+
+
 
 Securing access
 ---------------
 
 The ``fs authorize`` command allows configuring the client's access to a
-particular file system. See also in :ref:`fs-authorize-multifs`. The client will
+particular file system. See also :ref:`fs-authorize-multifs`. The client will
 only have visibility of authorized file systems and the Monitors/MDS will
 reject access to clients without authorization.
 

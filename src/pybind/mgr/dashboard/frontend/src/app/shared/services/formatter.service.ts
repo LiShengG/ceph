@@ -1,6 +1,10 @@
 import { Injectable } from '@angular/core';
-
+import { AbstractControl, ValidationErrors } from '@angular/forms';
 import _ from 'lodash';
+import { isEmptyInputValue } from '../forms/cd-validators';
+
+const BINARY_UNITS = ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB', 'EiB', 'ZiB', 'YiB'];
+const BINARY_FACTOR = 1024;
 
 @Injectable({
   providedIn: 'root'
@@ -85,13 +89,16 @@ export class FormatterService {
   toBytes(value: string, error_value: number = null): number | null {
     const base = 1024;
     const units = ['b', 'k', 'm', 'g', 't', 'p', 'e', 'z', 'y'];
-    const m = RegExp('^(\\d+(.\\d+)?) ?([' + units.join('') + ']?(b|ib|B/s)?)?$', 'i').exec(value);
-    if (m === null) {
+    const bytesRegexMatch = RegExp(
+      '^(\\d+(.\\d+)?) ?([' + units.join('') + ']?(b|ib|B/s|B/m|iB/m)?)?$',
+      'i'
+    ).exec(value);
+    if (bytesRegexMatch === null) {
       return error_value;
     }
-    let bytes = parseFloat(m[1]);
-    if (_.isString(m[3])) {
-      bytes = bytes * Math.pow(base, units.indexOf(m[3].toLowerCase()[0]));
+    let bytes = parseFloat(bytesRegexMatch[1]);
+    if (_.isString(bytesRegexMatch[3])) {
+      bytes = bytes * Math.pow(base, units.indexOf(bytesRegexMatch[3].toLowerCase()[0]));
     }
     return Math.round(bytes);
   }
@@ -140,5 +147,88 @@ export class FormatterService {
       octalMode += scopeValue.toString();
     }
     return octalMode;
+  }
+  /**
+   * Validate the input maximum size as per regrex passed.
+   */
+  performValidation(
+    control: AbstractControl,
+    regex: string,
+    errorObject: object,
+    type?: string
+  ): ValidationErrors | null {
+    if (isEmptyInputValue(control.value)) {
+      return null;
+    }
+    const matchResult = RegExp(regex, 'i').exec(control.value);
+    if (matchResult === null) {
+      return errorObject;
+    }
+    if (type == 'quota') {
+      const bytes = new FormatterService().toBytes(control.value);
+      return bytes < 1024 ? errorObject : null;
+    }
+    return null;
+  }
+
+  iopmMaxSizeValidator(control: AbstractControl): ValidationErrors | null {
+    const pattern = /^\s*(\d+)$/i;
+    const testResult = pattern.exec(control.value);
+    if (isEmptyInputValue(control.value)) {
+      return null;
+    }
+    if (testResult == null) {
+      return { rateOpsMaxSize: true };
+    }
+    return control.value.toString()?.length > 18 ? { rateOpsMaxSize: true } : null;
+  }
+
+  formatToBinary(num: any, split: false, decimals?: number): string;
+  formatToBinary(num: any, split: true, decimals?: number): [number, string];
+  formatToBinary(
+    num: any,
+    split: boolean = false,
+    decimals: number = 1
+  ): string | [number, string] {
+    const convertedString = this.format_number(num, BINARY_FACTOR, BINARY_UNITS, decimals);
+    const FALLBACK: [number, string] = [NaN, BINARY_UNITS[0]]; // when convertedString is 'N/A', '-', or 'NaN', return [NaN, 'B']
+    if (!split) return convertedString;
+
+    const parts = convertedString.trim().split(/\s+/);
+
+    if (parts.length < 2) {
+      return FALLBACK;
+    }
+
+    const value = this.convertToNumber(parts[0]);
+    const unit = parts[1];
+
+    if (!Number.isFinite(value) || !unit) {
+      return FALLBACK;
+    }
+
+    return [value, unit];
+  }
+
+  convertToUnit(
+    value: number | string,
+    fromUnit: string,
+    toUnit: string,
+    decimals: number = 1
+  ): number {
+    if (!value) return 0;
+    const convertedString = this.formatNumberFromTo(
+      value,
+      fromUnit,
+      toUnit,
+      BINARY_FACTOR,
+      BINARY_UNITS,
+      decimals
+    );
+    return this.convertToNumber(convertedString.split(/\s+/)[0]);
+  }
+
+  convertToNumber(num: string) {
+    return Number(num.replace(/,/g, '').trim());
   }
 }

@@ -14,6 +14,8 @@
 #include "librados_fwd.hpp"
 #include "rados_types.hpp"
 
+#include "cls_traits.hpp"
+
 namespace libradosstriper
 {
   class RadosStriper;
@@ -202,6 +204,8 @@ inline namespace v14_2_0 {
     int set_complete_callback(void *cb_arg, callback_t cb);
     int set_safe_callback(void *cb_arg, callback_t cb)
       __attribute__ ((deprecated));
+    /// Request immediate cancellation as if by IoCtx::aio_cancel().
+    int cancel();
     int wait_for_complete();
     int wait_for_safe() __attribute__ ((deprecated));
     int wait_for_complete_and_cb();
@@ -304,6 +308,7 @@ inline namespace v14_2_0 {
     ALLOC_HINT_FLAG_LONGLIVED = 128,
     ALLOC_HINT_FLAG_COMPRESSIBLE = 256,
     ALLOC_HINT_FLAG_INCOMPRESSIBLE = 512,
+    ALLOC_HINT_FLAG_LOG = 1024,
   };
 
   /*
@@ -337,9 +342,32 @@ inline namespace v14_2_0 {
     void cmpext(uint64_t off, const bufferlist& cmp_bl, int *prval);
     void cmpxattr(const char *name, uint8_t op, const bufferlist& val);
     void cmpxattr(const char *name, uint8_t op, uint64_t v);
-    void exec(const char *cls, const char *method, bufferlist& inbl);
-    void exec(const char *cls, const char *method, bufferlist& inbl, bufferlist *obl, int *prval);
-    void exec(const char *cls, const char *method, bufferlist& inbl, ObjectOperationCompletion *completion);
+   protected:
+    void exec_impl(const char *cls, const char *method, bufferlist& inbl);
+    void exec_impl(const char *cls, const char *method, bufferlist& inbl, bufferlist *obl, int *prval);
+    void exec_impl(const char *cls, const char *method, bufferlist& inbl, ObjectOperationCompletion *completion);
+   public:
+
+    /**
+     * Execute an OSD class method on an object
+     * See IoCtx::exec() for general description.
+     *
+     * Add an exec to read OR write operation. Only read-only methods may be
+     * added this way. Use ObjectWriteOperation::exec() for write methods.
+     *
+     * @param method the method as defined in cls/<class>/cls_<class>_ops.h
+     * @param inbl where to find input
+     * @param obl (optional) where to store output
+     * @param prval (optional) storage for return value.
+     * @param completion (optional) completion callback.
+     */
+    template <typename Tag, typename ClassID, typename... Args>
+    void exec(const ClsMethod<Tag, ClassID>& method, Args&&... args) {
+      static_assert(FlagTraits<Tag>::is_readonly,
+          "Attempt to call a non-readonly class method as part of read. ");
+      exec_impl(method.cls, method.name, std::forward<Args>(args)...);
+    }
+
     /**
      * Guard operation with a check that object version == ver
      *
@@ -454,6 +482,14 @@ inline namespace v14_2_0 {
     void omap_rm_keys(const std::set<std::string> &to_rm);
 
     /**
+     * Clears keys in the range [start, end)
+     * 
+     * @param start [in] start of key range to remove (inclusive)
+     * @param end [in] end of key range to remove (exclusive)
+     */
+    void omap_rm_range(const std::string &start, const std::string &end);
+
+    /**
      * Copy an object
      *
      * Copies an object from another location.  The operation is atomic in that
@@ -527,6 +563,24 @@ inline namespace v14_2_0 {
     void unset_manifest();
 
     friend class IoCtx;
+
+    /**
+     * Execute an OSD class method on an object
+     * See IoCtx::exec() for general description.
+     *
+     * Add an exec to write operation. Read or Write exec methods are permitted.
+     *
+     * @param method the method as defined in cls/<class>/cls_<class>_ops.h
+     * @param inbl where to find input
+     * @param obl (optional) where to store output
+     * @param prval (optional) storage for return value.
+     * @param completion (optional) completion callback.
+     */
+    template <typename Tag, typename ClassID, typename... Args>
+    void exec(const ClsMethod<Tag, ClassID>& method, Args&&... args) {
+      // Read or write operations are permitted, so allow this.
+      exec_impl(method.cls, method.name, std::forward<Args>(args)...);
+    }
   };
 
   /*
@@ -772,17 +826,30 @@ inline namespace v14_2_0 {
     void tier_evict();
   };
 
-  /* IoCtx : This is a context in which we can perform I/O.
-   * It includes a Pool,
+  /**
+   * @brief A handle to a RADOS pool used to perform I/O operations.
    *
    * Typical use (error checking omitted):
-   *
+   * @code
    * IoCtx p;
    * rados.ioctx_create("my_pool", p);
-   * p->stat(&stats);
-   * ... etc ...
+   * p.stat("my_object", &size, &mtime);
+   * @endcode
    *
-   * NOTE: be sure to call watch_flush() prior to destroying any IoCtx
+   * IoCtx holds a pointer to its underlying implementation. The dup()
+   * method performs a deep copy of this implementation, but the copy
+   * construction and assignment operations perform shallow copies by
+   * sharing that pointer.
+   *
+   * Function names starting with aio_ are asynchronous operations that
+   * return immediately after submitting a request, and whose completions
+   * are managed by the given AioCompletion pointer. The IoCtx's underlying
+   * implementation is involved in the delivery of these completions, so
+   * the caller must guarantee that its lifetime is preserved until then -
+   * if not by preserving the IoCtx instance that submitted the request,
+   * then by a copied/moved instance that shares the same implementation.
+   *
+   * @note Be sure to call watch_flush() prior to destroying any IoCtx
    * that is used for watch events to ensure that racing callbacks
    * have completed.
    */
@@ -791,9 +858,13 @@ inline namespace v14_2_0 {
   public:
     IoCtx();
     static void from_rados_ioctx_t(rados_ioctx_t p, IoCtx &pool);
+    /// Construct a shallow copy of rhs, sharing its underlying implementation.
     IoCtx(const IoCtx& rhs);
+    /// Assign a shallow copy of rhs, sharing its underlying implementation.
     IoCtx& operator=(const IoCtx& rhs);
+    /// Move construct from rhs, transferring its underlying implementation.
     IoCtx(IoCtx&& rhs) noexcept;
+    /// Move assign from rhs, transferring its underlying implementation.
     IoCtx& operator=(IoCtx&& rhs) noexcept;
 
     ~IoCtx();
@@ -868,8 +939,37 @@ inline namespace v14_2_0 {
     int rmxattr(const std::string& oid, const char *name);
     int stat(const std::string& oid, uint64_t *psize, time_t *pmtime);
     int stat2(const std::string& oid, uint64_t *psize, struct timespec *pts);
-    int exec(const std::string& oid, const char *cls, const char *method,
-	     bufferlist& inbl, bufferlist& outbl);
+   protected:
+    // IoCtx needs a distinction between ro and rw to pick the correct flags
+    // for the operate call.
+    int exec_impl(const std::string& oid, const char *cls, const char *method,
+                  bufferlist& inbl, bufferlist& outbl);
+   public:
+    /**
+     * Execute an OSD class method on an object
+     *
+     * The OSD has a plugin mechanism for performing complicated
+     * operations on an object atomically. These plugins are called
+     * classes. This function allows librados users to call the custom
+     * methods. The input and output formats are defined by the class.
+     * Classes in ceph.git can be found in src/cls subdirectories
+     *
+     * Synchronous variant of exec. Only reads are permitted through this
+     * interface.
+     *
+     * @param oid the object name
+     * @param method the method as defined in cls/<class>/cls_<class>_ops.h
+     * @param inbl where to find input
+     * @param outbl where to store output
+     * @returns return code (>=0 for success, otherwise stanard OSD errors)
+     */
+    template <typename Tag, typename ClassID>
+    int exec(const std::string& oid, const ClsMethod<Tag, ClassID>& method, bufferlist& inbl, bufferlist& outbl) {
+      static_assert(FlagTraits<Tag>::is_readonly,
+          "Attempt to call a non-readonly class method as part of read. ");
+      return exec_impl(oid, method.cls, method.name, inbl, outbl);
+    }
+
     /**
      * modify object tmap based on encoded update sequence
      *
@@ -918,6 +1018,9 @@ inline namespace v14_2_0 {
     int omap_clear(const std::string& oid);
     int omap_rm_keys(const std::string& oid,
                      const std::set<std::string>& keys);
+    int omap_rm_range(const std::string& oid,
+                      const std::string& start,
+                      const std::string& end);
 
     void snap_set_read(snap_t seq);
     int selfmanaged_snap_set_write_ctx(snap_t seq, std::vector<snap_t>& snaps);
@@ -1150,15 +1253,39 @@ inline namespace v14_2_0 {
     int aio_stat2(const std::string& oid, AioCompletion *c, uint64_t *psize, struct timespec *pts);
 
     /**
-     * Cancel aio operation
+     * Request immediate cancellation with error code -ECANCELED
+     * if the operation hasn't already completed.
      *
      * @param c completion handle
      * @returns 0 on success, negative error code on failure
      */
     int aio_cancel(AioCompletion *c);
 
-    int aio_exec(const std::string& oid, AioCompletion *c, const char *cls, const char *method,
-	         bufferlist& inbl, bufferlist *outbl);
+
+  private:
+    int aio_exec_impl(const std::string& oid, AioCompletion *c, const char *cls, const char *method,
+            bufferlist& inbl, bufferlist *outbl);
+  public:
+    /**
+     * Execute an OSD class method on an object
+     * See exec() for general description.
+     *
+     * Asynchronous variant of exec. Only exec reads are permitted.
+     *
+     * @param oid the object name
+     * @param c aio completion
+     * @param method the method as defined in cls/<class>/cls_<class>_ops.h
+     * @param inbl where to find input
+     * @param outbl where to store output
+     */
+    template <typename Tag, typename ClassID>
+    int aio_exec(const std::string& oid, AioCompletion *c,
+          const ClsMethod<Tag, ClassID>& method, bufferlist& inbl, bufferlist *outbl) {
+      static_assert(FlagTraits<Tag>::is_readonly,
+          "Attempt to call a non-readonly class method as part of read. ");
+
+      return aio_exec_impl(oid, c, method.cls, method.name, inbl, outbl);
+    }
 
     /*
      * asynchronous version of unlock
@@ -1372,6 +1499,8 @@ inline namespace v14_2_0 {
     int application_metadata_list(const std::string& app_name,
                                   std::map<std::string, std::string> *values);
 
+    void set_no_version_on_read(bool b);
+
   private:
     /* You can only get IoCtx instances from Rados */
     IoCtx(IoCtxImpl *io_ctx_impl_);
@@ -1452,13 +1581,13 @@ inline namespace v14_2_0 {
     int get_min_compatible_client(int8_t* min_compat_client,
                                   int8_t* require_min_compat_client);
 
-    int mon_command(std::string cmd, const bufferlist& inbl,
+    int mon_command(std::string&& cmd, bufferlist&& inbl,
 		    bufferlist *outbl, std::string *outs);
-    int mgr_command(std::string cmd, const bufferlist& inbl,
+    int mgr_command(std::string&& cmd, bufferlist&& inbl,
 		    bufferlist *outbl, std::string *outs);
-    int osd_command(int osdid, std::string cmd, const bufferlist& inbl,
+    int osd_command(int osdid, std::string&& cmd, bufferlist&& inbl,
                     bufferlist *outbl, std::string *outs);
-    int pg_command(const char *pgstr, std::string cmd, const bufferlist& inbl,
+    int pg_command(const char *pgstr, std::string&& cmd, bufferlist&& inbl,
                    bufferlist *outbl, std::string *outs);
 
     int ioctx_create(const char *name, IoCtx &pioctx);

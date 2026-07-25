@@ -1,7 +1,11 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
+
 #ifndef ROCKS_DB_STORE_H
 #define ROCKS_DB_STORE_H
+
+#include <sys/types.h>
+#include <dirent.h>
 
 #include "include/types.h"
 #include "include/buffer_fwd.h"
@@ -17,6 +21,7 @@
 #include "rocksdb/statistics.h"
 #include "rocksdb/table.h"
 #include "rocksdb/db.h"
+#include "rocksdb/utilities/backup_engine.h"
 #include "kv/rocksdb_cache/BinnedLRUCache.h"
 #include <errno.h>
 #include "common/errno.h"
@@ -77,6 +82,7 @@ inline rocksdb::Slice make_slice(const std::optional<std::string>& bound) {
 /**
  * Uses RocksDB to implement the KeyValueDB interface
  */
+struct RocksWBHandler;
 class RocksDBStore : public KeyValueDB {
   CephContext *cct;
   PerfCounters *logger;
@@ -95,6 +101,7 @@ class RocksDBStore : public KeyValueDB {
   friend class ShardMergeIteratorImpl;
   friend class CFIteratorImpl;
   friend class WholeMergeIteratorImpl;
+  friend struct RocksWBHandler;
   /*
    *  See RocksDB's definition of a column family(CF) and how to use it.
    *  The interfaces of KeyValueDB is extended, when a column family is created.
@@ -111,11 +118,13 @@ public:
 		 uint32_t hash_l, uint32_t hash_h)
       : name(name), shard_cnt(shard_cnt), options(options), hash_l(hash_l), hash_h(hash_h) {}
   };
+
 private:
   friend std::ostream& operator<<(std::ostream& out, const ColumnFamily& cf);
 
   bool must_close_default_cf = false;
   rocksdb::ColumnFamilyHandle *default_cf = nullptr;
+  ceph::mutex backup_lock = ceph::make_mutex("RocksDBStore::Backup");
 
   /// column families in use, name->handles
   struct prefix_shards {
@@ -143,6 +152,7 @@ private:
   int do_open(std::ostream &out, bool create_if_missing, bool open_readonly,
 	      const std::string& cfs="");
   int load_rocksdb_options(bool create_if_missing, rocksdb::Options& opt);
+  void remove_corrupted_backups(rocksdb::BackupEngine *engine, KeyValueDB::BackupCleanupStats *result);
 public:
   static bool parse_sharding_def(const std::string_view text_def,
 				std::vector<ColumnFamily>& sharding_def,
@@ -164,7 +174,9 @@ private:
 		      std::vector<std::pair<size_t, RocksDBStore::ColumnFamily> >& existing_cfs_shard,
 		      std::vector<rocksdb::ColumnFamilyDescriptor>& missing_cfs,
 		      std::vector<std::pair<size_t, RocksDBStore::ColumnFamily> >& missing_cfs_shard);
-  std::shared_ptr<rocksdb::Cache> create_block_cache(const std::string& cache_type, size_t cache_size, double cache_prio_high = 0.0);
+  std::shared_ptr<rocksdb::Cache> create_block_cache(
+    const std::string& name,
+    const std::string& cache_type, size_t cache_size, double cache_prio_high = 0.0);
   int split_column_family_options(const std::string& opts_str,
 				  std::unordered_map<std::string, std::string>* column_opts_map,
 				  std::string* block_cache_opt);
@@ -205,6 +217,23 @@ public:
   uint64_t get_delete_range_threshold() const {
     return cct->_conf.get_val<uint64_t>("rocksdb_delete_range_threshold");
   }
+
+  KeyValueDB::BackupStats backup(const std::string &path) override;
+  KeyValueDB::BackupCleanupStats backup_cleanup(const std::string &path,
+                                                uint64_t keep_last,
+                                                uint64_t keep_hourly,
+                                                uint64_t keep_daily) override;
+
+  /// Restore a backup into @p path. @p version is the rocksdb backup id, or
+  /// nullopt for the most recent. Must be called on a closed store.
+  static bool restore_backup(CephContext *cct, const std::string &path,
+                             const std::string &backup_location,
+                             const std::optional<uint32_t> &version);
+
+  /// List backups at @p backup_location, newest first.
+  /// Returns nullopt if the BackupEngine could not be opened.
+  static std::optional<std::vector<BackupStats>> list_backups(
+    CephContext *cct, const std::string &backup_location);
 
   void compact() override;
 
@@ -285,7 +314,9 @@ public:
 
   int64_t estimate_prefix_size(const std::string& prefix,
 			       const std::string& key_prefix) override;
-  struct RocksWBHandler;
+  int64_t estimate_range_size(const std::string& prefix,
+                              const std::string& key_from,
+                              const std::string& key_to) override;
   class RocksDBTransactionImpl : public KeyValueDB::TransactionImpl {
   public:
     rocksdb::WriteBatch bat;
@@ -298,6 +329,7 @@ public:
       rocksdb::ColumnFamilyHandle *cf,
       const std::string &k,
       const ceph::bufferlist &to_set_bl);
+
   public:
     size_t get_count() const override {
       return bat.Count();
@@ -305,6 +337,7 @@ public:
     size_t get_size_bytes() const override {
       return bat.GetDataSize();
     }
+    std::string get_summary_string(bool verbose) const override;
     void set(
       const std::string &prefix,
       const std::string &k,
@@ -386,10 +419,13 @@ public:
     int next() override;
     int prev() override;
     std::string key() override;
+    std::string_view key_as_sv() override;
     std::pair<std::string,std::string> raw_key() override;
+    std::pair<std::string_view,std::string_view> raw_key_as_sv() override;
     bool raw_key_is_prefixed(const std::string &prefix) override;
     ceph::bufferlist value() override;
     ceph::bufferptr value_as_ptr() override;
+    std::string_view value_as_sv() override;
     int status() override;
     size_t key_size() override;
     size_t value_size() override;
@@ -419,6 +455,7 @@ public:
   }
 
   static int split_key(rocksdb::Slice in, std::string *prefix, std::string *key);
+  static int split_key(rocksdb::Slice in, std::string_view *prefix, std::string_view *key);
 
   static std::string past_prefix(const std::string &prefix);
 
@@ -553,7 +590,79 @@ public:
   };
   int reshard(const std::string& new_sharding, const resharding_ctrl* ctrl = nullptr);
   bool get_sharding(std::string& sharding);
+  void util_divide_key_range(
+    const std::string& prefix,        // Table to operate on.
+    const std::string& starting_key,  // Included if exists.
+    const std::string& guardrail_key, // Excluded if exists; but "" means up until table end
+    uint64_t chunk_count,             // Desired chunk count, can produce fewer when not enough data.
+    uint64_t min_chunk_size,          // Do not produce chunk smaller than this bytes.
+    float accepted_variance,          // +/- fluctuation of produced chunk size,
+                                      // there is a limit to prediction quality, recommended 0.05.
+    std::vector<keyrange_t>& chunks) override;
+};
 
+class RocksWBHandler : public rocksdb::WriteBatch::Handler
+{
+  const RocksDBStore& db;
+  std::stringstream seen;
+  size_t num_seen = 0;
+  size_t num_skipped = 0;
+  bool verbose = true;
+  size_t max = 0;
+  std::unordered_map<std::string, size_t> seen_counts;
+
+  void _finalize_seen(bool sorted);
+  void _dump(const char* op_name, const char* op_short,
+	     uint32_t column_family_id,
+	     const rocksdb::Slice& key_in,
+	     const rocksdb::Slice* value = nullptr);
+public:
+  RocksWBHandler(const RocksDBStore& db, bool verbose, size_t _max = 0)
+   : db(db), verbose(verbose), max(_max) {
+     if (max == 0) {
+       max = verbose ? 128 : 64;
+     }
+   }
+
+  std::string get_seen(bool sorted = false) {
+    _finalize_seen(sorted);
+    return seen.str();
+  }
+  void Put(const rocksdb::Slice& key,
+	   const rocksdb::Slice& value) override {
+    _dump("Put", "P", 0, key, &value);
+  }
+  rocksdb::Status PutCF(uint32_t column_family_id, const rocksdb::Slice& key,
+			const rocksdb::Slice& value) override {
+    _dump("PutCF", "PF", column_family_id, key, &value);
+    return rocksdb::Status::OK();
+  }
+  void SingleDelete(const rocksdb::Slice& key) override {
+    _dump("SingleDelete", "d", 0, key);
+  }
+  rocksdb::Status SingleDeleteCF(uint32_t column_family_id, const rocksdb::Slice& key) override {
+    _dump("SingleDeleteCF", "df", column_family_id, key);
+    return rocksdb::Status::OK();
+  }
+  void Delete(const rocksdb::Slice& key) override {
+    _dump("Delete", "D", 0, key);
+  }
+  rocksdb::Status DeleteCF(uint32_t column_family_id, const rocksdb::Slice& key) override {
+    _dump("DeleteCF", "DF", column_family_id, key);
+    return rocksdb::Status::OK();
+  }
+  void Merge(const rocksdb::Slice& key,
+	     const rocksdb::Slice& value) override {
+    _dump("Merge", "M", 0, key, &value);
+  }
+  rocksdb::Status MergeCF(uint32_t column_family_id, const rocksdb::Slice& key,
+			  const rocksdb::Slice& value) override {
+    _dump("MergeCF", "MF", column_family_id, key, &value);
+    return rocksdb::Status::OK();
+  }
+  bool Continue() override {
+    return true;
+  }
 };
 
 #endif

@@ -59,7 +59,7 @@ add_executable(unittest_lruset
   test_lruset.cc
   )
 add_ceph_unittest(unittest_lruset)
-target_link_libraries(unittest_lruset)
+target_link_libraries(unittest_lruset ceph-common)
 
 # unittest_histogram
 add_executable(unittest_histogram
@@ -113,6 +113,22 @@ add_executable(unittest_shared_cache
   )
 add_ceph_unittest(unittest_shared_cache)
 target_link_libraries(unittest_shared_cache global)
+
+# unittest_web_cache
+add_executable(unittest_web_cache
+  test_web_cache.cc
+  )
+add_ceph_unittest(unittest_web_cache)
+target_link_libraries(unittest_web_cache ceph-common)
+
+if(HAVE_KEYUTILS)
+  # unittest_web_cache
+  add_executable(unittest_keyring
+    test_keyring.cc
+    )
+  add_ceph_unittest(unittest_keyring)
+  target_link_libraries(unittest_keyring global keyring)
+endif()
 
 # unittest_sloppy_crc_map
 add_executable(unittest_sloppy_crc_map
@@ -256,6 +272,20 @@ add_executable(unittest_interval_set
 add_ceph_unittest(unittest_interval_set)
 target_link_libraries(unittest_interval_set ceph-common GTest::Main)
 
+# unittest_mini_flat_map
+add_executable(unittest_mini_flat_map
+  test_mini_flat_map.cc
+)
+add_ceph_unittest(unittest_mini_flat_map)
+target_link_libraries(unittest_mini_flat_map ceph-common GTest::Main)
+
+# unittest_bitset_set
+add_executable(unittest_bitset_set
+  test_bitset_set.cc
+)
+add_ceph_unittest(unittest_bitset_set)
+target_link_libraries(unittest_bitset_set ceph-common GTest::Main)
+
 # unittest_weighted_priority_queue
 add_executable(unittest_weighted_priority_queue
   test_weighted_priority_queue.cc
@@ -302,13 +332,13 @@ add_ceph_unittest(unittest_perf_counters_key)
 target_link_libraries(unittest_perf_counters_key ceph-common)
 
 # unittest_global_doublefree
-if(WITH_CEPHFS)
+if(WITH_LIBCEPHFS)
   add_executable(unittest_global_doublefree
     test_global_doublefree.cc
     )
   add_ceph_unittest(unittest_global_doublefree)
   target_link_libraries(unittest_global_doublefree cephfs librados ceph-common)
-endif(WITH_CEPHFS)
+endif()
 
 if(NOT WIN32)
 add_executable(unittest_dns_resolve
@@ -363,40 +393,50 @@ add_executable(unittest_hobject test_hobject.cc
 target_link_libraries(unittest_hobject global ceph-common)
 add_ceph_unittest(unittest_hobject)
 
+add_executable(unittest_async_call_once test_async_call_once.cc)
+add_ceph_unittest(unittest_async_call_once)
+target_link_libraries(unittest_async_call_once ceph-common Boost::context)
+
 add_executable(unittest_async_completion test_async_completion.cc)
 add_ceph_unittest(unittest_async_completion)
-target_link_libraries(unittest_async_completion ceph-common Boost::system)
+target_link_libraries(unittest_async_completion ceph-common Boost::headers)
 
 
 add_executable(unittest_async_max_concurrent_for_each test_async_max_concurrent_for_each.cc)
 add_ceph_unittest(unittest_async_max_concurrent_for_each)
-target_link_libraries(unittest_async_max_concurrent_for_each ceph-common Boost::system Boost::context)
+target_link_libraries(unittest_async_max_concurrent_for_each ceph-common Boost::boost Boost::context)
 
 if(NOT WIN32)
 add_executable(unittest_async_co_spawn_group test_async_co_spawn_group.cc)
 add_ceph_unittest(unittest_async_co_spawn_group)
-target_link_libraries(unittest_async_co_spawn_group ceph-common Boost::system)
+target_link_libraries(unittest_async_co_spawn_group ceph-common Boost::boost)
 
 add_executable(unittest_async_co_throttle test_async_co_throttle.cc)
 add_ceph_unittest(unittest_async_co_throttle)
-target_link_libraries(unittest_async_co_throttle ceph-common Boost::system)
+target_link_libraries(unittest_async_co_throttle ceph-common Boost::boost)
 endif(NOT WIN32)
 
 add_executable(unittest_async_shared_mutex test_async_shared_mutex.cc)
 add_ceph_unittest(unittest_async_shared_mutex)
-target_link_libraries(unittest_async_shared_mutex ceph-common Boost::system)
+target_link_libraries(unittest_async_shared_mutex ceph-common Boost::boost)
+
 
 add_executable(unittest_async_spawn_throttle test_async_spawn_throttle.cc)
 add_ceph_unittest(unittest_async_spawn_throttle)
-target_link_libraries(unittest_async_spawn_throttle ceph-common Boost::system Boost::context)
+target_link_libraries(unittest_async_spawn_throttle ceph-common Boost::boost Boost::context)
 
 add_executable(unittest_async_yield_waiter test_async_yield_waiter.cc)
 add_ceph_unittest(unittest_async_yield_waiter)
-target_link_libraries(unittest_async_yield_waiter ceph-common Boost::system Boost::context)
+target_link_libraries(unittest_async_yield_waiter ceph-common Boost::boost Boost::context)
+
 
 add_executable(unittest_async_parallel_for_each test_async_parallel_for_each.cc)
 add_ceph_unittest(unittest_async_parallel_for_each)
-target_link_libraries(unittest_async_parallel_for_each ceph-common Boost::system)
+target_link_libraries(unittest_async_parallel_for_each ceph-common Boost::boost)
+
+add_executable(unittest_async_spawn_group test_async_spawn_group.cc)
+add_ceph_unittest(unittest_async_spawn_group)
+target_link_libraries(unittest_async_spawn_group ceph-common Boost::boost)
 
 add_executable(unittest_cdc test_cdc.cc
   $<TARGET_OBJECTS:unit-main>)
@@ -411,14 +451,13 @@ add_executable(unittest_option test_option.cc)
 target_link_libraries(unittest_option ceph-common GTest::Main)
 add_ceph_unittest(unittest_option)
 
-add_executable(unittest_fault_injector test_fault_injector.cc
-  $<TARGET_OBJECTS:unit-main>)
-target_link_libraries(unittest_fault_injector global)
+add_executable(unittest_fault_injector test_fault_injector.cc)
+target_link_libraries(unittest_fault_injector global GTest::Main)
 add_ceph_unittest(unittest_fault_injector)
 
 add_executable(unittest_blocked_completion test_blocked_completion.cc)
 add_ceph_unittest(unittest_blocked_completion)
-target_link_libraries(unittest_blocked_completion Boost::system GTest::GTest)
+target_link_libraries(unittest_blocked_completion Boost::boost GTest::GTest)
 
 add_executable(unittest_allocate_unique test_allocate_unique.cc)
 add_ceph_unittest(unittest_allocate_unique)
@@ -432,3 +471,61 @@ if(WITH_SYSTEMD)
   target_link_libraries(unittest_journald_logger ceph-common)
   add_ceph_unittest(unittest_journald_logger)
 endif()
+
+# XXX: disabled for https://tracker.ceph.com/issues/70700
+if(0)
+# Validation of the DECODE_START's struct_v compile-time checker.
+# First, ensure buildability of the test program itself. This is
+# useful to avoid false positives coming from other-than-the-assert
+# build failures.
+add_executable(unittest_decode_start_v_checker
+  test_decode_start_v_checker.cpp)
+target_link_libraries(unittest_decode_start_v_checker global)
+set_target_properties(unittest_decode_start_v_checker
+  PROPERTIES
+  EXCLUDE_FROM_ALL TRUE
+  EXCLUDE_FROM_DEFAULT_BUILD TRUE)
+add_test(
+  NAME unittest_decode_start_v_checker
+  COMMAND ${CMAKE_COMMAND} --build . --target unittest_decode_start_v_checker --config $<CONFIGURATION>
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+# Second, ensure that adding a single, wrongly versioned comparison
+# fails the build.
+add_executable(unittest_decode_start_v_checker_expect_failure
+  test_decode_start_v_checker.cpp)
+target_link_libraries(unittest_decode_start_v_checker_expect_failure global)
+target_compile_definitions(unittest_decode_start_v_checker_expect_failure
+  PRIVATE SHOULD_FAIL)
+set_target_properties(
+  unittest_decode_start_v_checker_expect_failure
+  PROPERTIES
+  EXCLUDE_FROM_ALL TRUE
+  EXCLUDE_FROM_DEFAULT_BUILD TRUE)
+# Add the test bypassing the macros from AddCephTest.cmake. The idea is to
+# invoke "cmake --build ..." as the actual test and check whether it fails.
+add_test(NAME unittest_decode_start_v_checker_expect_failure
+         COMMAND ${CMAKE_COMMAND} --build . --target unittest_decode_start_v_checker_expect_failure --config $<CONFIGURATION>
+         WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(unittest_decode_start_v_checker_expect_failure
+  PROPERTIES WILL_FAIL TRUE)
+endif(0)
+
+add_executable(unittest_async_call test_async_call.cc)
+target_link_libraries(unittest_async_call ceph-common Boost::boost
+  GTest::GTest)
+add_ceph_unittest(unittest_async_call)
+
+
+add_executable(unittest_librados_completion test_librados_completion.cc)
+target_link_libraries(unittest_librados_completion librados ceph-common
+  Boost::boost GTest::GTest)
+add_ceph_unittest(unittest_librados_completion)
+
+add_executable(unittest_async_cond test_async_cond.cc)
+target_link_libraries(unittest_async_cond GTest::GTest)
+add_ceph_unittest(unittest_async_cond)
+
+add_executable(unittest_async_redirect_error test_async_redirect_error.cc)
+target_link_libraries(unittest_async_redirect_error GTest::GTest)
+add_ceph_unittest(unittest_async_redirect_error)

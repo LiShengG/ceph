@@ -9,16 +9,24 @@
     CephNodeNetworkPacketDropsPerSec: 10,
     CephRBDMirrorImageTransferBandwidthThreshold: 0.8,
     CephRBDMirrorImagesPerDaemonThreshold: 100,
-    NVMeoFMaxGatewaysPerGroup: 4,
-    NVMeoFMaxGatewaysPerCluster: 4,
+    NVMeoFMaxGatewaysPerGroup: 8,
+    NVMeoFMaxGatewayGroups: 4,
+    NVMeoFMaxGatewaysPerCluster: 32,
     NVMeoFHighGatewayCPU: 80,
     NVMeoFMaxSubsystemsPerGateway: 128,
-    NVMeoFMaxNamespaces: 1024,
-    NVMeoFHighClientCount: 32,
+    NVMeoFMaxNamespaces: 4096,
+    NVMeoFHighClientCount: 128,
+    NVMeoFHostKeepAliveTimeoutTrackDurationHours: 24,
     NVMeoFHighHostCPU: 80,
     //
     // Read/Write latency is defined in ms
     NVMeoFHighClientReadLatency: 10,
     NVMeoFHighClientWriteLatency: 20,
+    //
+    // Hardware temperature thresholds in Celsius
+    HWTempMotherboardWarning: 60,
+    HWTempDIMMWarning: 80,
+    HWTempProcessorWarning: 80,
+    HWTempNVMeWarning: 70,
   },
 }

@@ -12,7 +12,8 @@ import { AuthStorageService } from '~/app/shared/services/auth-storage.service';
 @Component({
   selector: 'cd-cephfs-tabs',
   templateUrl: './cephfs-tabs.component.html',
-  styleUrls: ['./cephfs-tabs.component.scss']
+  styleUrls: ['./cephfs-tabs.component.scss'],
+  standalone: false
 })
 export class CephfsTabsComponent implements OnChanges, OnDestroy {
   @Input()
@@ -112,8 +113,8 @@ export class CephfsTabsComponent implements OnChanges, OnDestroy {
   softRefresh() {
     const data = _.cloneDeep(this.data); // Forces update of tab tables on tab switch
     // Clients tab
-    this.clients = data.clients;
-    this.clients.status = new TableStatusViewCache(this.clients.status);
+    this.clients = data?.clients;
+    this.clients.status = new TableStatusViewCache(this.clients?.status);
     // Details tab
     this.details = {
       standbys: data.standbys,

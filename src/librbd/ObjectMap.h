@@ -1,5 +1,5 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
 
 #ifndef CEPH_LIBRBD_OBJECT_MAP_H
 #define CEPH_LIBRBD_OBJECT_MAP_H
@@ -13,6 +13,8 @@
 #include "common/RefCountedObj.h"
 #include "librbd/Utils.h"
 #include <boost/optional.hpp>
+
+#include <shared_mutex> // for std::shared_lock
 
 class Context;
 namespace ZTracer { struct Trace; }

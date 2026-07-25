@@ -1,5 +1,5 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
 
 #include <boost/iterator/counting_iterator.hpp>
 #include <fmt/format.h>
@@ -168,7 +168,7 @@ seastar::future<bufferlist> FSDriver::read(
       bl.append_zero(size);
       return seastar::make_ready_future<bufferlist>(std::move(bl));
     }),
-    crimson::ct_error::assert_all{"Unrecoverable error in FSDriver::read"}
+    crimson::ct_error::assert_all("Unrecoverable error in FSDriver::read")
   ).then([size](auto &&bl) {
     if (bl.length() < size) {
       bl.append_zero(size - bl.length());
@@ -185,12 +185,10 @@ seastar::future<> FSDriver::mkfs()
     uuid_d uuid;
     uuid.generate_random();
     return fs->mkfs(uuid).handle_error(
-      crimson::stateful_ec::assert_failure([] (const auto& ec) {
-        crimson::get_logger(ceph_subsys_test)
-          .error("error creating empty object store in {}: ({}) {}",
-          crimson::common::local_conf().get_val<std::string>("osd_data"),
-          ec.value(), ec.message());
-      }));
+      crimson::stateful_ec::assert_failure(fmt::format(
+        "error creating empty object store in {}",
+        crimson::common::local_conf().get_val<std::string>("osd_data")).c_str())
+);
   }).then([this] {
     return fs->stop();
   }).then([this] {
@@ -198,15 +196,10 @@ seastar::future<> FSDriver::mkfs()
   }).then([this] {
     return fs->mount(
     ).handle_error(
-      crimson::stateful_ec::assert_failure([] (const auto& ec) {
-        crimson::get_logger(
-	  ceph_subsys_test
-	).error(
-	  "error mounting object store in {}: ({}) {}",
-	  crimson::common::local_conf().get_val<std::string>("osd_data"),
-	  ec.value(),
-	  ec.message());
-      }));
+      crimson::stateful_ec::assert_failure(fmt::format(
+        "error creating empty object store in {}",
+        crimson::common::local_conf().get_val<std::string>("osd_data")).c_str())
+    );
   }).then([this] {
     return seastar::do_for_each(
       boost::counting_iterator<unsigned>(0),
@@ -239,15 +232,10 @@ seastar::future<> FSDriver::mount()
   }).then([this] {
     return fs->mount(
     ).handle_error(
-      crimson::stateful_ec::assert_failure([] (const auto& ec) {
-        crimson::get_logger(
-	  ceph_subsys_test
-	).error(
-	  "error mounting object store in {}: ({}) {}",
-	  crimson::common::local_conf().get_val<std::string>("osd_data"),
-	  ec.value(),
-	  ec.message());
-      }));
+      crimson::stateful_ec::assert_failure(fmt::format(
+        "error creating empty object store in {}",
+        crimson::common::local_conf().get_val<std::string>("osd_data")).c_str())
+    );
   }).then([this] {
     return seastar::do_for_each(
       boost::counting_iterator<unsigned>(0),
@@ -301,7 +289,7 @@ seastar::future<> FSDriver::init()
     *config.path,
     crimson::common::local_conf().get_config_values()
   );
-  return fs->start().then([this] {
+  return fs->start().then([this](uint32_t store_shard_nums) {
     sharded_fs = &(fs->get_sharded_store());
   });
 }

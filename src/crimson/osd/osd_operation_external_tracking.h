@@ -1,5 +1,5 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
 
 #pragma once
 
@@ -7,7 +7,9 @@
 #include "crimson/osd/osdmap_gate.h"
 #include "crimson/osd/osd_operations/background_recovery.h"
 #include "crimson/osd/osd_operations/client_request.h"
+#include "crimson/osd/osd_operations/ecrep_request.h"
 #include "crimson/osd/osd_operations/peering_event.h"
+#include "crimson/osd/osd_operations/pgpct_request.h"
 #include "crimson/osd/osd_operations/pg_advance_map.h"
 #include "crimson/osd/osd_operations/recovery_subrequest.h"
 #include "crimson/osd/osd_operations/replicated_request.h"
@@ -38,7 +40,10 @@ struct LttngBackend
     CommonOBCPipeline::WaitRepop::BlockingEvent::Backend,
     CommonOBCPipeline::WaitRepop::BlockingEvent::ExitBarrierEvent::Backend,
     CommonOBCPipeline::SendReply::BlockingEvent::Backend,
-    PGRepopPipeline::Process::BlockingEvent::Backend
+    PGRepopPipeline::Process::BlockingEvent::Backend,
+    PGRepopPipeline::WaitCommit::BlockingEvent::Backend,
+    PGRepopPipeline::WaitCommit::BlockingEvent::ExitBarrierEvent::Backend,
+    PGRepopPipeline::SendReply::BlockingEvent::Backend
 {
   void handle(ClientRequest::StartEvent&,
               const Operation&) override {}
@@ -126,6 +131,20 @@ struct LttngBackend
               const PGRepopPipeline::Process& blocker) override {
   }
 
+  void handle(PGRepopPipeline::WaitCommit::BlockingEvent& ev,
+              const Operation& op,
+              const PGRepopPipeline::WaitCommit& blocker) override {
+  }
+
+  void handle(PGRepopPipeline::WaitCommit::BlockingEvent::ExitBarrierEvent& ev,
+              const Operation& op) override {
+  }
+
+  void handle(PGRepopPipeline::SendReply::BlockingEvent& ev,
+              const Operation& op,
+              const PGRepopPipeline::SendReply& blocker) override {
+  }
+
   void handle(ClientRequest::CompletionEvent&,
               const Operation&) override {}
 
@@ -150,7 +169,10 @@ struct HistoricBackend
     CommonOBCPipeline::WaitRepop::BlockingEvent::Backend,
     CommonOBCPipeline::WaitRepop::BlockingEvent::ExitBarrierEvent::Backend,
     CommonOBCPipeline::SendReply::BlockingEvent::Backend,
-    PGRepopPipeline::Process::BlockingEvent::Backend
+    PGRepopPipeline::Process::BlockingEvent::Backend,
+    PGRepopPipeline::WaitCommit::BlockingEvent::Backend,
+    PGRepopPipeline::WaitCommit::BlockingEvent::ExitBarrierEvent::Backend,
+    PGRepopPipeline::SendReply::BlockingEvent::Backend
 {
   void handle(ClientRequest::StartEvent&,
               const Operation&) override {}
@@ -246,6 +268,21 @@ struct HistoricBackend
               const PGRepopPipeline::Process& blocker) override {
   }
 
+  void handle(PGRepopPipeline::WaitCommit::BlockingEvent& ev,
+              const Operation& op,
+              const PGRepopPipeline::WaitCommit& blocker) override {
+  }
+
+  void handle(PGRepopPipeline::WaitCommit::BlockingEvent::ExitBarrierEvent& ev,
+              const Operation& op) override {
+  }
+
+  void handle(PGRepopPipeline::SendReply::BlockingEvent& ev,
+              const Operation& op,
+              const PGRepopPipeline::SendReply& blocker) override {
+  }
+
+
   void handle(ClientRequest::CompletionEvent&, const Operation& op) override {
     if (crimson::common::local_conf()->osd_op_history_size) {
       to_client_request(op).put_historic();
@@ -256,6 +293,13 @@ struct HistoricBackend
 } // namespace crimson::osd
 
 namespace crimson {
+
+template <>
+struct EventBackendRegistry<osd::ECRepRequest> {
+  static std::tuple<> get_backends() {
+    return {/* no extenral backends */};
+  }
+};
 
 template <>
 struct EventBackendRegistry<osd::ClientRequest> {
@@ -301,16 +345,17 @@ struct EventBackendRegistry<osd::LogMissingRequestReply> {
 };
 
 template <>
-struct EventBackendRegistry<osd::RecoverySubRequest> {
+struct EventBackendRegistry<osd::PGPCTRequest> {
   static std::tuple<> get_backends() {
     return {/* no extenral backends */};
   }
 };
 
+
 template <>
-struct EventBackendRegistry<osd::BackfillRecovery> {
+struct EventBackendRegistry<osd::RecoverySubRequest> {
   static std::tuple<> get_backends() {
-    return {};
+    return {/* no extenral backends */};
   }
 };
 

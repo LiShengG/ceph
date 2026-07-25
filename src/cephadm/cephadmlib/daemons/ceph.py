@@ -12,10 +12,14 @@ from ..context_getters import (
 )
 from ..daemon_form import register as register_daemon_form
 from ..daemon_identity import DaemonIdentity
-from ..constants import DEFAULT_IMAGE
+from ..constants import (
+    DEFAULT_IMAGE,
+    DATA_DIR_MODE,
+)
 from ..context import CephadmContext
 from ..deployment_utils import to_deployment_container
 from ..exceptions import Error
+from ..call_wrappers import call_throws
 from ..file_utils import (
     make_run_dir,
     pathify,
@@ -48,7 +52,10 @@ class Ceph(ContainerDaemonForm):
     @classmethod
     def for_daemon_type(cls, daemon_type: str) -> bool:
         # TODO: figure out a way to un-special-case osd
-        return daemon_type in cls._daemons and daemon_type != 'osd'
+        return daemon_type in cls._daemons and daemon_type not in (
+            'osd',
+            'crash',
+        )
 
     def __init__(self, ctx: CephadmContext, ident: DaemonIdentity) -> None:
         self.ctx = ctx
@@ -90,6 +97,14 @@ class Ceph(ContainerDaemonForm):
                 # but that doesn't seem to persist in the object after it's passed
                 # in further function calls
                 ctr.args = ctr.args + ['--set-crush-location', c_loc]
+        if self.identity.daemon_type == 'rgw' and config_json is not None:
+            if 'rgw_exit_timeout_secs' in config_json:
+                stop_timeout = config_json['rgw_exit_timeout_secs']
+                ctr.args = ctr.args + [f'--stop-timeout={stop_timeout}']
+        if self.identity.daemon_type == 'osd' and config_json is not None:
+            if 'objectstore' in config_json:
+                objectstore = config_json['objectstore']
+                ctr.args = ctr.args + [f'--osd-objectstore={objectstore}']
         return ctr
 
     _uid_gid: Optional[Tuple[int, int]] = None
@@ -188,10 +203,78 @@ class Ceph(ContainerDaemonForm):
         )
         mounts.update(cm)
 
+        if self.identity.daemon_type == 'rgw':
+            config_json = fetch_configs(ctx) or {}
+            d3n_cache = config_json.get('d3n_cache')
+
+            if d3n_cache:
+                if not isinstance(d3n_cache, dict):
+                    raise Error(
+                        f'Invalid d3n_cache config: expected dict got {type(d3n_cache).__name__}'
+                    )
+
+                cache_path = d3n_cache.get('cache_path')
+                if cache_path and isinstance(cache_path, str):
+                    mounts[cache_path] = f'{cache_path}:z'
+
+    def setup_qat_args(self, ctx: CephadmContext, args: List[str]) -> None:
+        try:
+            out, _, _ = call_throws(ctx, ['ls', '-1', '/dev/vfio/devices'])
+            devices = [d for d in out.split('\n') if d]
+
+            args.extend(
+                [
+                    '--cap-add=SYS_ADMIN',
+                    '--cap-add=SYS_PTRACE',
+                    '--cap-add=IPC_LOCK',
+                    '--security-opt',
+                    'seccomp=unconfined',
+                    '--ulimit',
+                    'memlock=209715200:209715200',
+                    '--device=/dev/qat_adf_ctl:/dev/qat_adf_ctl',
+                    '--device=/dev/vfio/vfio:/dev/vfio/vfio',
+                    '-v',
+                    '/dev:/dev',
+                    '--volume=/etc/sysconfig/qat:/etc/sysconfig/qat:ro',
+                ]
+            )
+
+            for dev in devices:
+                args.append(
+                    f'--device=/dev/vfio/devices/{dev}:/dev/vfio/devices/{dev}'
+                )
+
+            os.makedirs('/etc/sysconfig', exist_ok=True)
+            with open('/etc/sysconfig/qat', 'w') as f:
+                f.write('ServicesEnabled=dc\nPOLICY=8\nQAT_USER=ceph\n')
+
+            logger.info(
+                f'[QAT] Successfully injected container args for {self.identity.daemon_name}'
+            )
+        except RuntimeError:
+            logger.exception('[QAT] Could not list /dev/vfio/devices')
+            devices = []
+
     def customize_container_args(
         self, ctx: CephadmContext, args: List[str]
     ) -> None:
         args.append(ctx.container_engine.unlimited_pids_option)
+        config_json = fetch_configs(ctx)
+        qat_raw: Any = config_json.get('qat', {})
+        if qat_raw is None:
+            qat_config: Dict[str, Any] = {}
+        elif isinstance(qat_raw, dict):
+            qat_config = qat_raw
+        else:
+            raise Error(
+                f'Invalid qat config: expected dict got {type(qat_raw.__name__)}'
+            )
+
+        if (
+            self.identity.daemon_type == 'rgw'
+            and qat_config.get('compression') == 'hw'
+        ):
+            self.setup_qat_args(ctx, args)
 
     def customize_process_args(
         self, ctx: CephadmContext, args: List[str]
@@ -258,7 +341,7 @@ class OSD(Ceph):
     def get_sysctl_settings() -> List[str]:
         return [
             '# allow a large number of OSDs',
-            'fs.aio-max-nr = 1048576',
+            'fs.aio-max-nr = 2097152',
             'kernel.pid_max = 4194304',
         ]
 
@@ -268,6 +351,44 @@ class OSD(Ceph):
     @property
     def osd_fsid(self) -> Optional[str]:
         return self._osd_fsid
+
+    def default_entrypoint(self) -> str:
+        config_json = fetch_configs(self.ctx)
+        if (
+            config_json is not None
+            and config_json.get('osd_type') == 'crimson'
+        ):
+            return '/usr/bin/ceph-osd-crimson'
+        return '/usr/bin/ceph-osd'
+
+
+@register_daemon_form
+class Crash(Ceph):
+    @classmethod
+    def for_daemon_type(cls, daemon_type: str) -> bool:
+        return daemon_type == 'crash'
+
+    def __init__(
+        self,
+        ctx: CephadmContext,
+        ident: DaemonIdentity,
+    ) -> None:
+        super().__init__(ctx, ident)
+
+    @classmethod
+    def create(cls, ctx: CephadmContext, ident: DaemonIdentity) -> 'Ceph':
+        (uid, gid) = extract_uid_gid(ctx)
+        data_dir_base = f'{ctx.data_dir}/{ident.fsid}'
+        makedirs(
+            os.path.join(data_dir_base, 'crash'), uid, gid, DATA_DIR_MODE
+        )
+        makedirs(
+            os.path.join(data_dir_base, 'crash', 'posted'),
+            uid,
+            gid,
+            DATA_DIR_MODE,
+        )
+        return cls(ctx, ident)
 
 
 @register_daemon_form
@@ -343,13 +464,9 @@ class CephExporter(ContainerDaemonForm):
             )
         return args
 
-    def validate(self) -> None:
-        if not os.path.isdir(self.sock_dir):
-            raise Error(
-                f'Desired sock dir for ceph-exporter is not directory: {self.sock_dir}'
-            )
-
     def container(self, ctx: CephadmContext) -> CephContainer:
+        uid, gid = self.uid_gid(ctx)
+        make_run_dir(ctx.fsid, uid, gid)
         ctr = daemon_to_container(ctx, self)
         return to_deployment_container(ctx, ctr)
 
@@ -366,6 +483,9 @@ class CephExporter(ContainerDaemonForm):
     ) -> None:
         cm = Ceph.get_ceph_mounts(ctx, self.identity)
         mounts.update(cm)
+        # we want to always mount /var/run/ceph/<fsid> to the sock
+        # dir within the container. See https://tracker.ceph.com/issues/69475
+        mounts.update({f'/var/run/ceph/{ctx.fsid}': self.sock_dir})
         if self.https_enabled:
             data_dir = self.identity.data_dir(ctx.data_dir)
             mounts.update({os.path.join(data_dir, 'etc/certs'): '/etc/certs'})
@@ -389,13 +509,6 @@ class CephExporter(ContainerDaemonForm):
 
     def default_entrypoint(self) -> str:
         return self.entrypoint
-
-    def prepare_data_dir(self, data_dir: str, uid: int, gid: int) -> None:
-        if not os.path.exists(self.sock_dir):
-            os.mkdir(self.sock_dir)
-        # part of validation is for the sock dir, so we postpone
-        # it until now
-        self.validate()
 
     def create_daemon_dirs(self, data_dir: str, uid: int, gid: int) -> None:
         """Create files under the container data dir"""
@@ -466,7 +579,7 @@ def get_ceph_mounts_for_type(
                 mounts[selinux_folder] = '/sys/fs/selinux:ro'
             else:
                 logger.error(
-                    f'Cluster direcotry {cluster_dir} does not exist.'
+                    f'Cluster directory {cluster_dir} does not exist.'
                 )
     if daemon_type == 'osd':
         mounts['/'] = '/rootfs'
@@ -487,13 +600,13 @@ def get_ceph_mounts_for_type(
                 mounts[cephadm_binary] = '/usr/sbin/cephadm'
                 mounts[
                     ceph_folder + '/src/ceph-volume/ceph_volume'
-                ] = '/usr/lib/python3.9/site-packages/ceph_volume'
+                ] = '/usr/lib/python3.12/site-packages/ceph_volume'
                 mounts[
                     ceph_folder + '/src/pybind/mgr'
                 ] = '/usr/share/ceph/mgr'
                 mounts[
                     ceph_folder + '/src/python-common/ceph'
-                ] = '/usr/lib/python3.9/site-packages/ceph'
+                ] = '/usr/lib/python3.12/site-packages/ceph'
                 mounts[
                     ceph_folder + '/monitoring/ceph-mixin/dashboards_out'
                 ] = '/etc/grafana/dashboards/ceph-dashboard'

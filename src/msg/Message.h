@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*- 
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*- 
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph - scalable distributed file system
  *
@@ -18,9 +19,12 @@
 #include <concepts>
 #include <cstdlib>
 #include <ostream>
+#include <sstream>
 #include <string_view>
 
 #include <boost/intrusive/list.hpp>
+
+#include <fmt/core.h> // for FMT_VERSION
 #if FMT_VERSION >= 90000
 #include <fmt/ostream.h>
 #endif
@@ -30,15 +34,17 @@
 #include "common/ThrottleInterface.h"
 #include "common/config.h"
 #include "common/ref.h"
-#include "common/debug.h"
 #include "common/zipkin_trace.h"
 #include "common/tracer.h"
 #include "include/ceph_assert.h" // Because intrusive_ptr clobbers our assert...
 #include "include/buffer.h"
-#include "include/types.h"
-#include "msg/Connection.h"
+#include "include/utime.h"
 #include "msg/MessageRef.h"
 #include "msg_types.h"
+
+#ifndef WITH_CRIMSON
+#include "msg/Connection.h"
+#endif
 
 // monitor internal
 #define MSG_MON_SCRUB              64
@@ -146,6 +152,7 @@
 #define MSG_OSD_SCRUB2          121
 
 #define MSG_OSD_PG_READY_TO_MERGE 122
+#define MSG_OSD_PG_STOP_MERGE     124
 
 #define MSG_OSD_PG_LEASE        133
 #define MSG_OSD_PG_LEASE_ACK    134
@@ -256,7 +263,7 @@
 
 class Message : public RefCountedObject {
 public:
-#ifdef WITH_SEASTAR
+#ifdef WITH_CRIMSON
   // In crimson, conn is independently maintained outside Message.
   using ConnectionRef = void*;
 #else
@@ -357,13 +364,13 @@ protected:
   }
 public:
   const ConnectionRef& get_connection() const {
-#ifdef WITH_SEASTAR
+#ifdef WITH_CRIMSON
     ceph_abort("In crimson, conn is independently maintained outside Message");
 #endif
     return connection;
   }
   void set_connection(ConnectionRef c) {
-#ifdef WITH_SEASTAR
+#ifdef WITH_CRIMSON
     // In crimson, conn is independently maintained outside Message.
     ceph_assert(c == nullptr);
 #endif
@@ -439,6 +446,7 @@ public:
       byte_throttler->take(middle.length());
   }
   ceph::buffer::list& get_middle() { return middle; }
+  const ceph::buffer::list& get_middle() const { return middle; }
 
   void set_data(const ceph::buffer::list &bl) {
     if (byte_throttler)
@@ -503,7 +511,7 @@ public:
     return entity_name_t(header.src);
   }
   entity_addr_t get_source_addr() const {
-#ifdef WITH_SEASTAR
+#ifdef WITH_CRIMSON
     ceph_abort("In crimson, conn is independently maintained outside Message");
 #else
     if (connection)
@@ -512,7 +520,7 @@ public:
     return entity_addr_t();
   }
   entity_addrvec_t get_source_addrs() const {
-#ifdef WITH_SEASTAR
+#ifdef WITH_CRIMSON
     ceph_abort("In crimson, conn is independently maintained outside Message");
 #else
     if (connection)
@@ -548,6 +556,16 @@ public:
   void encode(uint64_t features, int crcflags, bool skip_header_crc = false);
 };
 
+inline void intrusive_ptr_add_ref(Message* m)
+{
+  m->get();
+}
+
+inline void intrusive_ptr_release(Message* m)
+{
+  m->put();
+}
+
 extern Message *decode_message(CephContext *cct,
                                int crcflags,
                                ceph_msg_header& header,
@@ -575,7 +593,7 @@ class SafeMessage : public Message {
 public:
   using Message::Message;
   bool is_a_client() const {
-#ifdef WITH_SEASTAR
+#ifdef WITH_CRIMSON
     ceph_abort("In crimson, conn is independently maintained outside Message");
 #else
     return get_connection()->get_peer_type() == CEPH_ENTITY_TYPE_CLIENT;

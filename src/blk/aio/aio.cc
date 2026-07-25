@@ -1,5 +1,5 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
 
 #include <algorithm>
 #include "aio.h"
@@ -17,11 +17,11 @@ std::ostream& operator<<(std::ostream& os, const aio_t& aio)
 
 int aio_queue_t::submit_batch(aio_iter begin, aio_iter end, 
 			      void *priv,
-			      int *retries)
+			      int *retries, int submit_retries, int initial_delay_us)
 {
-  // 2^16 * 125us = ~8 seconds, so max sleep is ~16 seconds
-  int attempts = 16;
-  int delay = 125;
+  // 2^16 * 125us = ~8 seconds, so default max sleep is ~16 seconds
+  int attempts = submit_retries;
+  uint64_t delay = initial_delay_us;
   int r;
 
   aio_iter cur = begin;
@@ -48,7 +48,7 @@ int aio_queue_t::submit_batch(aio_iter begin, aio_iter end,
     }
 #elif defined(HAVE_POSIXAIO)
     cur->priv = priv;
-    if ((cur->n_aiocb == 1) {
+    if (cur->n_aiocb == 1) {
       // TODO: consider batching multiple reads together with lio_listio
       cur->aio.aiocb.aio_sigevent.sigev_notify = SIGEV_KEVENT;
       cur->aio.aiocb.aio_sigevent.sigev_notify_kqueue = ctx;
@@ -74,8 +74,8 @@ int aio_queue_t::submit_batch(aio_iter begin, aio_iter end,
     }
     ceph_assert(r > 0);
     done += r;
-    attempts = 16;
-    delay = 125;
+    attempts = submit_retries;
+    delay = initial_delay_us;
     pushed = pulled = 0;
   }
   return done;

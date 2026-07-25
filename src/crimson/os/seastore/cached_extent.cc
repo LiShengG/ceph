@@ -1,5 +1,5 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
 
 #include "crimson/os/seastore/cached_extent.h"
 #include "crimson/os/seastore/transaction.h"
@@ -7,12 +7,18 @@
 #include "crimson/common/log.h"
 
 #include "crimson/os/seastore/btree/fixed_kv_node.h"
+#include "crimson/os/seastore/lba_mapping.h"
+#include "crimson/os/seastore/logical_child_node.h"
+#include "crimson/os/seastore/lba/lba_btree_node.h"
+#include "crimson/os/seastore/backref/backref_tree_node.h"
 
 namespace {
   [[maybe_unused]] seastar::logger& logger() {
     return crimson::get_logger(ceph_subsys_seastore_tm);
   }
 }
+
+SET_SUBSYS(seastore_cache);
 
 namespace crimson::os::seastore {
 
@@ -45,8 +51,6 @@ std::ostream &operator<<(std::ostream &out, CachedExtent::extent_state_t state)
     return out << "INITIAL_WRITE_PENDING";
   case CachedExtent::extent_state_t::MUTATION_PENDING:
     return out << "MUTATION_PENDING";
-  case CachedExtent::extent_state_t::CLEAN_PENDING:
-    return out << "CLEAN_PENDING";
   case CachedExtent::extent_state_t::CLEAN:
     return out << "CLEAN";
   case CachedExtent::extent_state_t::DIRTY:
@@ -70,46 +74,43 @@ std::ostream &operator<<(std::ostream &out, const CachedExtent &ext)
 CachedExtent::~CachedExtent()
 {
   if (parent_index) {
-    assert(is_linked());
+    assert(is_linked_to_index());
     parent_index->erase(*this);
   }
 }
-CachedExtent* CachedExtent::get_transactional_view(Transaction &t) {
-  return get_transactional_view(t.get_trans_id());
-}
-
-CachedExtent* CachedExtent::get_transactional_view(transaction_id_t tid) {
-  auto it = mutation_pendings.find(tid, trans_spec_view_t::cmp_t());
-  if (it != mutation_pendings.end()) {
-    return (CachedExtent*)&(*it);
-  } else {
+CachedExtent* CachedExtent::maybe_get_transactional_view(Transaction &t) {
+  if (t.is_weak()) {
     return this;
   }
-}
 
-std::ostream &operator<<(std::ostream &out, const parent_tracker_t &tracker) {
-  return out << "tracker_ptr=" << (void*)&tracker
-	     << ", parent_ptr=" << (void*)tracker.get_parent().get();
-}
-
-std::ostream &ChildableCachedExtent::print_detail(std::ostream &out) const {
-  if (parent_tracker) {
-    out << ", parent_tracker(" << *parent_tracker << ")";
-  } else {
-    out << ", parent_tracker(nullptr)";
+  auto tid = t.get_trans_id();
+  if (is_pending()) {
+    ceph_assert(is_pending_in_trans(tid));
+    return this;
   }
-  _print_detail(out);
-  return out;
+
+  if (!mutation_pending_extents.empty()) {
+    auto it = mutation_pending_extents.find(tid, trans_spec_view_t::cmp_t());
+    if (it != mutation_pending_extents.end()) {
+      return (CachedExtent*)&(*it);
+    }
+  }
+
+  if (!retired_transactions.empty()) {
+    auto it = retired_transactions.find(tid, trans_spec_view_t::cmp_t());
+    if (it != retired_transactions.end()) {
+      return nullptr;
+    }
+  }
+
+  return this;
 }
 
-std::ostream &LogicalCachedExtent::_print_detail(std::ostream &out) const
+std::ostream &LogicalCachedExtent::print_detail(std::ostream &out) const
 {
-  out << ", laddr=" << laddr;
+  out << ", laddr=" << laddr
+      << ", seen=" << seen_by_users;
   return print_detail_l(out);
-}
-
-void child_pos_t::link_child(ChildableCachedExtent *c) {
-  get_parent<FixedKVNode<laddr_t>>()->link_child(c, pos);
 }
 
 void CachedExtent::set_invalid(Transaction &t) {
@@ -120,60 +121,51 @@ void CachedExtent::set_invalid(Transaction &t) {
   on_invalidated(t);
 }
 
-LogicalCachedExtent::~LogicalCachedExtent() {
-  if (has_parent_tracker() && is_valid() && !is_pending()) {
-    assert(get_parent_node());
-    auto parent = get_parent_node<FixedKVNode<laddr_t>>();
-    auto off = parent->lower_bound_offset(laddr);
-    assert(parent->get_key_from_idx(off) == laddr);
-    assert(parent->children[off] == this);
-    parent->children[off] = nullptr;
+std::pair<bool, CachedExtent::viewable_state_t>
+CachedExtent::is_viewable_by_trans(Transaction &t) {
+  ceph_assert(is_valid());
+
+  auto trans_id = t.get_trans_id();
+  if (is_pending()) {
+    ceph_assert(is_pending_in_trans(trans_id));
+    return std::make_pair(true, viewable_state_t::pending);
   }
-}
 
-void LogicalCachedExtent::on_replace_prior() {
-  assert(is_mutation_pending());
-  take_prior_parent_tracker();
-  assert(get_parent_node());
-  auto parent = get_parent_node<FixedKVNode<laddr_t>>();
-  //TODO: can this search be avoided?
-  auto off = parent->lower_bound_offset(laddr);
-  assert(parent->get_key_from_idx(off) == laddr);
-  parent->children[off] = this;
-}
+  // shared by multiple transactions
+  assert(t.is_in_read_set(this));
+  assert(is_stable_ready());
 
-parent_tracker_t::~parent_tracker_t() {
-  // this is parent's tracker, reset it
-  auto &p = (FixedKVNode<laddr_t>&)*parent;
-  if (p.my_tracker == this) {
-    p.my_tracker = nullptr;
+  auto cmp = trans_spec_view_t::cmp_t();
+  if (mutation_pending_extents.find(trans_id, cmp) !=
+      mutation_pending_extents.end()) {
+    return std::make_pair(false, viewable_state_t::stable_become_pending);
   }
+
+  if (retired_transactions.find(trans_id, cmp) !=
+      retired_transactions.end()) {
+    assert(t.is_stable_extent_retired(get_paddr(), get_length()));
+    return std::make_pair(false, viewable_state_t::stable_become_retired);
+  }
+
+  return std::make_pair(true, viewable_state_t::stable);
 }
 
-std::ostream &operator<<(std::ostream &out, const LBAMapping &rhs)
+std::ostream &operator<<(
+  std::ostream &out,
+  CachedExtent::viewable_state_t state)
 {
-  out << "LBAMapping(" << rhs.get_key()
-      << "~0x" << std::hex << rhs.get_length() << std::dec
-      << "->" << rhs.get_val();
-  if (rhs.is_indirect()) {
-    out << ",indirect(" << rhs.get_intermediate_base()
-        << "~0x" << std::hex << rhs.get_intermediate_length()
-        << "@0x" << rhs.get_intermediate_offset() << std::dec
-        << ")";
+  switch(state) {
+  case CachedExtent::viewable_state_t::stable:
+    return out << "stable";
+  case CachedExtent::viewable_state_t::pending:
+    return out << "pending";
+  case CachedExtent::viewable_state_t::stable_become_retired:
+    return out << "stable_become_retired";
+  case CachedExtent::viewable_state_t::stable_become_pending:
+    return out << "stable_become_pending";
+  default:
+    __builtin_unreachable();
   }
-  out << ")";
-  return out;
-}
-
-std::ostream &operator<<(std::ostream &out, const lba_pin_list_t &rhs)
-{
-  bool first = true;
-  out << '[';
-  for (const auto &i: rhs) {
-    out << (first ? "" : ",") << *i;
-    first = false;
-  }
-  return out << ']';
 }
 
 bool BufferSpace::is_range_loaded(extent_len_t offset, extent_len_t length) const
@@ -353,6 +345,174 @@ ceph::bufferptr BufferSpace::to_full_ptr(extent_len_t length)
   assert(ptr.length() == length);
   buffer_map.clear();
   return ptr;
+}
+
+void ExtentCommitter::sync_version() {
+  assert(extent.prior_instance);
+  auto &prior = *extent.prior_instance;
+  for (auto &mext : prior.mutation_pending_extents) {
+    auto &mextent = static_cast<CachedExtent&>(mext);
+    mextent.version = extent.version + 1;
+  }
+}
+
+void ExtentCommitter::sync_dirty_from() {
+  assert(extent.prior_instance);
+  auto &prior = *extent.prior_instance;
+  for (auto &mext : prior.mutation_pending_extents) {
+    auto &mextent = static_cast<CachedExtent&>(mext);
+    assert(mextent.dirty_from < extent.dirty_from ||
+      mextent.dirty_from == JOURNAL_SEQ_NULL);
+    mextent.dirty_from = extent.dirty_from;
+  }
+}
+
+void ExtentCommitter::sync_checksum() {
+  assert(extent.prior_instance);
+  auto &prior = *extent.prior_instance;
+  for (auto &mext : prior.mutation_pending_extents) {
+    auto &mextent = static_cast<CachedExtent&>(mext);
+    mextent.set_last_committed_crc(extent.last_committed_crc);
+  }
+}
+
+void ExtentCommitter::commit_data() {
+  assert(extent.prior_instance);
+  // extent and its prior are sharing the same bptr content
+  auto &prior = *extent.prior_instance;
+  prior.set_bptr(extent.get_bptr());
+  prior.on_data_commit();
+  _share_prior_data_to_mutations();
+  _share_prior_data_to_pending_versions();
+}
+
+void ExtentCommitter::commit_state() {
+  LOG_PREFIX(CachedExtent::commit_state_to_prior);
+  assert(extent.prior_instance);
+  SUBTRACET(seastore_cache, "{} prior={}",
+    t, extent, *extent.prior_instance);
+  auto &prior = *extent.prior_instance;
+  prior.pending_for_transaction = extent.pending_for_transaction;
+  prior.modify_time = extent.modify_time;
+  prior.last_committed_crc = extent.last_committed_crc;
+  prior.dirty_from = extent.dirty_from;
+  prior.length = extent.length;
+  prior.loaded_length = extent.loaded_length;
+  prior.buffer_space = std::move(extent.buffer_space);
+  // XXX: We can go ahead and change the prior's version because
+  // transactions don't hold a local view of the version field,
+  // unlike FixedKVLeafNode::modifications
+  prior.version = extent.version;
+  prior.user_hint = extent.user_hint;
+  prior.rewrite_generation = extent.rewrite_generation;
+  prior.state = extent.state;
+  extent.on_state_commit();
+}
+
+void ExtentCommitter::maybe_sync_copied_lba_key() {
+  ceph_assert(extent.is_logical());
+  auto &lextent = static_cast<LogicalChildNode&>(extent);
+  auto &prior = *extent.prior_instance;
+  for (auto &item : prior.read_transactions) {
+    item.t->maybe_sync_copied_lba_key(
+      lextent.get_laddr(), lextent.get_paddr());
+  }
+}
+
+void ExtentCommitter::commit_and_share_paddr() {
+  auto &prior = *extent.prior_instance;
+  auto old_paddr = prior.get_prior_paddr_and_reset();
+  if (prior.get_paddr() == extent.get_paddr()) {
+    return;
+  }
+  if (prior.read_transactions.empty()) {
+    prior.set_paddr(extent.get_paddr());
+    return;
+  }
+  for (auto &item : prior.read_transactions) {
+    auto [removed, retired] = item.t->pre_stable_extent_paddr_mod(item);
+    if (prior.get_paddr() != extent.get_paddr()) {
+      prior.set_paddr(extent.get_paddr());
+    }
+    item.t->post_stable_extent_paddr_mod(item, retired);
+    item.t->maybe_update_pending_paddr(
+      old_paddr, extent.get_paddr(), extent.get_length());
+  }
+}
+
+void ExtentCommitter::_share_prior_data_to_mutations() {
+  LOG_PREFIX(ExtentCommitter::_share_prior_data_to_mutations);
+  ceph_assert(is_lba_backref_node(extent.get_type()));
+  auto &prior = *extent.prior_instance;
+  for (auto &mext : prior.mutation_pending_extents) {
+    if (extent.get_type() == extent_types_t::LADDR_LEAF) {
+      // LBA leaf mappings contains other fields than just pladdr, which
+      // may also be modified. In this case, we can just overwrite the
+      // whole contents of the leaf node and reapply deltas like what
+      // we do for internal nodes.
+      auto &mextent = static_cast<lba::LBALeafNode&>(mext);
+      auto &me = static_cast<lba::LBALeafNode&>(extent);
+      TRACE("{} -> {}", me, mextent);
+      auto iter = me.begin();
+      auto merged = me.merge_content_to(t, mextent, iter);
+      mextent.adjust_delta([&](auto &buf) {
+        if (buf.op == lba::LBALeafNode::delta_t::op_t::UPDATE ||
+            // only remapping extents can create a delta with op
+            // INSERT and the corresponding mapping in "merged"
+            buf.op == lba::LBALeafNode::delta_t::op_t::INSERT) {
+          auto it = merged.find(buf.key);
+          if (it != merged.end()) {
+            TRACE("{} -> {}, {} -> {}",
+              me, mextent, (pladdr_t)buf.val.pladdr, it->second);
+            buf.val.pladdr = pladdr_le_t(it->second);
+          }
+        }
+      });
+      // "me" is the actual prev of mextent, so before mextent enters
+      // the "prepare" pipeline phase, its last_committed_crc should be
+      // that of "me"'s
+      mextent.set_last_committed_crc(me.get_last_committed_crc());
+    } else {
+      auto &mextent = static_cast<CachedExtent&>(mext);
+      TRACE("{} -> {}", extent, mextent);
+      extent.get_bptr().copy_out(
+        0, extent.get_length(), mextent.get_bptr().c_str());
+      mextent.on_data_commit();
+      mextent.reapply_delta();
+      mextent.set_last_committed_crc(extent.get_last_committed_crc());
+    }
+  }
+}
+
+void ExtentCommitter::_share_prior_data_to_pending_versions()
+{
+  ceph_assert(is_lba_backref_node(extent.get_type()));
+  auto &prior = *extent.prior_instance;
+  switch (extent.get_type()) {
+  case extent_types_t::LADDR_LEAF:
+    static_cast<lba::LBALeafNode&>(
+      prior).merge_content_to_pending_versions(t);
+    break;
+  case extent_types_t::LADDR_INTERNAL:
+    static_cast<lba::LBAInternalNode&>(prior
+      ).merge_content_to_pending_versions(t);
+    break;
+  case extent_types_t::BACKREF_INTERNAL:
+    static_cast<backref::BackrefInternalNode&>(prior
+      ).merge_content_to_pending_versions(t);
+    break;
+  default:
+    break;
+  }
+}
+
+void CachedExtent::new_committer(Transaction &t) {
+  ceph_assert(should_use_no_conflict_publish(t, this->get_type()));
+  ceph_assert(!committer);
+  committer = new ExtentCommitter(*this, t);
+  assert(prior_instance);
+  assert(!prior_instance->committer);
+  prior_instance->committer = committer;
 }
 
 }

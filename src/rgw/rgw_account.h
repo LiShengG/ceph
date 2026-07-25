@@ -1,5 +1,5 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab ft=cpp
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab ft=cpp
 
 /*
  * Ceph - scalable distributed file system
@@ -27,6 +27,8 @@ class DoutPrefixProvider;
 class RGWFormatterFlusher;
 class optional_yield;
 
+namespace rgw { class ARN; }
+
 namespace rgw::account {
 
 /// generate a randomized account id in a specific format
@@ -37,6 +39,9 @@ bool validate_id(std::string_view id, std::string* err_msg = nullptr);
 
 /// check an account name for any invalid characters
 bool validate_name(std::string_view name, std::string* err_msg = nullptr);
+
+/// construct the account root arn
+ARN root_arn(std::string account_id);
 
 
 struct AdminOpState {
@@ -53,6 +58,7 @@ struct AdminOpState {
   std::optional<int64_t> quota_max_size;
   std::optional<int64_t> quota_max_objects;
   std::optional<bool> quota_enabled;
+  bool purge_data = false;
 };
 
 /// create an account
@@ -85,7 +91,7 @@ int stats(const DoutPrefixProvider* dpp, rgw::sal::Driver* driver,
 int list_users(const DoutPrefixProvider* dpp, rgw::sal::Driver* driver,
                AdminOpState& op_state, const std::string& path_prefix,
                const std::string& marker, bool max_entries_specified,
-               int max_entries, std::string& err_msg,
+               int max_entries, bool root_only, std::string& err_msg,
                RGWFormatterFlusher& flusher, optional_yield y);
 
 } // namespace rgw::account

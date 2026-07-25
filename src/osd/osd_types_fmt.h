@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
+
 #pragma once
 /**
  * \file fmtlib formatters for some osd_types.h classes
@@ -7,6 +8,11 @@
 
 #include "common/hobject.h"
 #include "include/types_fmt.h"
+// formatter<osd_reqid_t> below formats req_id.name (entity_name_t), so its
+// formatter must be visible here, otherwise it gets instantiated before
+// msg_fmt.h is pulled in by a later include (explicit-specialization-after-
+// instantiation under compile-time {fmt} checking).
+#include "msg/msg_fmt.h"
 #include "osd/osd_types.h"
 #include <fmt/chrono.h>
 #include <fmt/ranges.h>
@@ -109,6 +115,9 @@ struct formatter<object_info_t> {
     if (oi.has_manifest()) {
       fmt::format_to(ctx.out(), " {}", oi.manifest);
     }
+    if (!oi.shard_versions.empty()) {
+      fmt::format_to(ctx.out(), " shard_versions={}", oi.shard_versions);
+    }
     return fmt::format_to(ctx.out(), ")");
   }
 };
@@ -132,7 +141,7 @@ struct formatter<spg_t> {
   template <typename FormatContext>
   auto format(const spg_t& spg, FormatContext& ctx) const
   {
-    if (shard_id_t::NO_SHARD == spg.shard.id) {
+    if (shard_id_t::NO_SHARD == spg.shard) {
       return fmt::format_to(ctx.out(), "{}", spg.pgid);
     } else {
       return fmt::format_to(ctx.out(), "{}s{}", spg.pgid, spg.shard.id);
@@ -253,9 +262,8 @@ struct formatter<SnapSet> {
 
     } else {
       return fmt::format_to(ctx.out(),
-			    "{}={}:{}",
+			    "{}={}",
 			    snps.seq,
-			    snps.snaps,
 			    snps.clone_snaps);
     }
   }

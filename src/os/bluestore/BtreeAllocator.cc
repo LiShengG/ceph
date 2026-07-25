@@ -1,5 +1,5 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
-// vim: ts=8 sw=2 smarttab
+// vim: ts=8 sw=2 sts=2 expandtab
 
 #include "BtreeAllocator.h"
 
@@ -226,14 +226,14 @@ int64_t BtreeAllocator::_allocate(
   uint64_t want,
   uint64_t unit,
   uint64_t max_alloc_size,
-  int64_t  hint, // unused, for now!
+  int64_t  hint,
   PExtentVector* extents)
 {
   uint64_t allocated = 0;
   while (allocated < want) {
     uint64_t offset, length;
     int r = _allocate(std::min(max_alloc_size, want - allocated),
-                      unit, &offset, &length);
+                      unit, hint, &offset, &length);
     if (r < 0) {
       // Allocation failed.
       break;
@@ -241,13 +241,14 @@ int64_t BtreeAllocator::_allocate(
     extents->emplace_back(offset, length);
     allocated += length;
   }
-  assert(range_size_tree.size() == range_tree.size());
+  ceph_assert(range_size_tree.size() == range_tree.size());
   return allocated ? allocated : -ENOSPC;
 }
 
 int BtreeAllocator::_allocate(
   uint64_t size,
   uint64_t unit,
+  int64_t  hint,
   uint64_t *offset,
   uint64_t *length)
 {
@@ -294,7 +295,8 @@ int BtreeAllocator::_allocate(
        * not guarantee that other allocations sizes may exist in the same
        * region.
        */
-      uint64_t* cursor = &lbas[cbits(size) - 1];
+      uint64_t dummy_cursor = (uint64_t)hint;
+      uint64_t* cursor = hint == -1 ? &lbas[cbits(size) - 1] : &dummy_cursor;
       start = _pick_block_after(cursor, size, unit);
       dout(20) << __func__ << " first fit=" << start << " size=" << size << dendl;
       if (start != uint64_t(-1ULL)) {
@@ -351,7 +353,8 @@ BtreeAllocator::BtreeAllocator(CephContext* cct,
 			       int64_t block_size,
 			       uint64_t max_mem,
 			       std::string_view name) :
-  Allocator(name, device_size, block_size),
+  AllocatorBase(name, device_size, block_size),
+  AllocatorPerf(cct, name),
   range_size_alloc_threshold(
     cct->_conf.get_val<uint64_t>("bluestore_avl_alloc_bf_threshold")),
   range_size_alloc_free_pct(
@@ -376,7 +379,7 @@ int64_t BtreeAllocator::allocate(
   uint64_t want,
   uint64_t unit,
   uint64_t max_alloc_size,
-  int64_t  hint, // unused, for now!
+  int64_t  hint,
   PExtentVector* extents)
 {
   ldout(cct, 10) << __func__ << std::hex
@@ -395,8 +398,22 @@ int64_t BtreeAllocator::allocate(
       max_alloc_size >= cap) {
     max_alloc_size = p2align(uint64_t(cap), (uint64_t)block_size);
   }
+  auto lock_wait_start = mono_clock::now();
+
   std::lock_guard l(lock);
-  return _allocate(want, unit, max_alloc_size, hint, extents);
+
+  auto lock_acquired = mono_clock::now();
+
+  auto ret = _allocate(want, unit, max_alloc_size, hint, extents);
+
+  logger->tinc_with_max(
+      l_bluestore_allocator_alloc_process_lat,
+      mono_clock::now() - lock_acquired);
+  logger->tinc_with_max(
+      l_bluestore_allocator_lock_wait_lat,
+      lock_acquired - lock_wait_start);
+
+  return ret;
 }
 
 void BtreeAllocator::release(const interval_set<uint64_t>& release_set) {

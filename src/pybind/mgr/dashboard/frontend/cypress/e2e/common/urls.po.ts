@@ -3,10 +3,10 @@ import { PageHelper } from '../page-helper.po';
 export class UrlsCollection extends PageHelper {
   pages = {
     // Cluster expansion
-    welcome: { url: '#/expand-cluster?welcome=true', id: 'cd-create-cluster' },
+    onboarding: { url: '#/add-storage?welcome=true', id: 'cd-create-cluster' },
 
     // Landing page
-    dashboard: { url: '#/dashboard', id: 'cd-dashboard' },
+    overview: { url: '#/overview', id: 'cd-overview' },
 
     // Hosts
     hosts: { url: '#/hosts', id: 'cd-hosts' },
@@ -43,6 +43,10 @@ export class UrlsCollection extends PageHelper {
 
     // CephFS
     cephfs: { url: '#/cephfs/fs', id: 'cd-cephfs-list' },
-    'create cephfs': { url: '#/cephfs/fs/create', id: 'cd-cephfs-form' }
+    'create cephfs': { url: '#/cephfs/fs/create', id: 'cd-cephfs-form' },
+
+    // Pools
+    pools: { url: '/#pool', id: 'cd-pool-list' },
+    'create pool': { url: '#/pool/create', id: 'cd-pool-form' }
   };
 }

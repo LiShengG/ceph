@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph - scalable distributed file system
  *
@@ -550,7 +551,7 @@ COMMAND("mon set_location " \
 	"specify location <args> for the monitor <name>, using CRUSH bucket names", \
 	"mon", "rw")
 COMMAND("mon enable_stretch_mode " \
-	"name=tiebreaker_mon,type=CephString, "
+	"name=tiebreaker_mon,type=CephString,req=false, "
 	"name=new_crush_rule,type=CephString, "
 	"name=dividing_bucket,type=CephString, ",
 	"enable stretch mode, changing the peering rules and "
@@ -895,7 +896,7 @@ COMMAND("osd unset "
 	"notieragent|nosnaptrim|noautoscale",
 	"unset <key>", "osd", "rw")
 COMMAND("osd require-osd-release "\
-	"name=release,type=CephChoices,strings=octopus|pacific|quincy|reef|squid "
+	"name=release,type=CephChoices,strings=octopus|pacific|quincy|reef|squid|tentacle|umbrella "
         "name=yes_i_really_mean_it,type=CephBool,req=false",
 	"set the minimum allowed OSD release to participate in the cluster",
 	"osd", "rw")
@@ -1034,6 +1035,9 @@ COMMAND("osd rm-pg-upmap-primary "
 	"name=pgid,type=CephPgid ",
 	"clear pg primary setting for <pgid>",
         "osd", "rw")
+COMMAND("osd rm-pg-upmap-primary-all ",
+        "clear all pg primary entries (developers only)",
+        "osd", "rw")
 COMMAND("osd primary-temp "
 	"name=pgid,type=CephPgid "
 	"name=id,type=CephOsdName",
@@ -1166,11 +1170,137 @@ COMMAND("osd pool rename "
 	"rename <srcpool> to <destpool>", "osd", "rw")
 COMMAND("osd pool get "
 	"name=pool,type=CephPoolname "
-	"name=var,type=CephChoices,strings=size|min_size|pg_num|pgp_num|crush_rule|hashpspool|nodelete|nopgchange|nosizechange|write_fadvise_dontneed|noscrub|nodeep-scrub|hit_set_type|hit_set_period|hit_set_count|hit_set_fpp|use_gmt_hitset|target_max_objects|target_max_bytes|cache_target_dirty_ratio|cache_target_dirty_high_ratio|cache_target_full_ratio|cache_min_flush_age|cache_min_evict_age|erasure_code_profile|min_read_recency_for_promote|all|min_write_recency_for_promote|fast_read|hit_set_grade_decay_rate|hit_set_search_last_n|scrub_min_interval|scrub_max_interval|deep_scrub_interval|recovery_priority|recovery_op_priority|scrub_priority|compression_mode|compression_algorithm|compression_required_ratio|compression_max_blob_size|compression_min_blob_size|csum_type|csum_min_block|csum_max_block|allow_ec_overwrites|fingerprint_algorithm|pg_autoscale_mode|pg_autoscale_bias|pg_num_min|pg_num_max|target_size_bytes|target_size_ratio|dedup_tier|dedup_chunk_algorithm|dedup_cdc_chunk_size|eio|bulk|read_ratio|pct_update_delay",
+	"name=var,type=CephChoices,strings=all"
+          "|allow_ec_optimizations"
+          "|allow_ec_overwrites"
+          "|bulk"
+          "|cache_min_evict_age"
+          "|cache_min_flush_age"
+          "|cache_target_dirty_high_ratio"
+          "|cache_target_dirty_ratio"
+          "|cache_target_full_ratio"
+          "|compression_algorithm"
+          "|compression_max_blob_size"
+          "|compression_min_blob_size"
+          "|compression_mode"
+          "|compression_required_ratio"
+          "|crimson_allow_pg_merge"
+          "|crush_rule"
+          "|csum_max_block"
+          "|csum_min_block"
+          "|csum_type"
+          "|deep_scrub_interval"
+          "|dedup_cdc_chunk_size"
+          "|dedup_chunk_algorithm"
+          "|dedup_tier"
+          "|ec_coding_shard_count"
+          "|ec_data_shard_count"
+          "|eio"
+          "|erasure_code_profile"
+          "|fast_read"
+          "|fingerprint_algorithm"
+          "|hashpspool"
+          "|hit_set_count"
+          "|hit_set_fpp"
+          "|hit_set_grade_decay_rate"
+          "|hit_set_period"
+          "|hit_set_search_last_n"
+          "|hit_set_type"
+          "|min_read_recency_for_promote"
+          "|min_size"
+          "|min_write_recency_for_promote"
+          "|nodeep-scrub"
+          "|nodelete"
+          "|nopgchange"
+          "|noscrub"
+          "|nosizechange"
+          "|pct_update_delay"
+          "|pg_autoscale_bias"
+          "|pg_autoscale_mode"
+          "|pg_num"
+          "|pg_num_max"
+          "|pg_num_min"
+          "|pgp_num"
+          "|read_ratio"
+          "|recovery_op_priority"
+          "|recovery_priority"
+          "|scrub_max_interval"
+          "|scrub_min_interval"
+          "|scrub_priority"
+          "|size"
+          "|supports_omap"
+          "|target_max_bytes"
+          "|target_max_objects"
+          "|target_size_bytes"
+          "|target_size_ratio"
+          "|use_gmt_hitset"
+          "|write_fadvise_dontneed",
 	"get pool parameter <var>", "osd", "r")
 COMMAND("osd pool set "
 	"name=pool,type=CephPoolname "
-	"name=var,type=CephChoices,strings=size|min_size|pg_num|pgp_num|pgp_num_actual|crush_rule|hashpspool|nodelete|nopgchange|nosizechange|write_fadvise_dontneed|noscrub|nodeep-scrub|hit_set_type|hit_set_period|hit_set_count|hit_set_fpp|use_gmt_hitset|target_max_bytes|target_max_objects|cache_target_dirty_ratio|cache_target_dirty_high_ratio|cache_target_full_ratio|cache_min_flush_age|cache_min_evict_age|min_read_recency_for_promote|min_write_recency_for_promote|fast_read|hit_set_grade_decay_rate|hit_set_search_last_n|scrub_min_interval|scrub_max_interval|deep_scrub_interval|recovery_priority|recovery_op_priority|scrub_priority|compression_mode|compression_algorithm|compression_required_ratio|compression_max_blob_size|compression_min_blob_size|csum_type|csum_min_block|csum_max_block|allow_ec_overwrites|fingerprint_algorithm|pg_autoscale_mode|pg_autoscale_bias|pg_num_min|pg_num_max|target_size_bytes|target_size_ratio|dedup_tier|dedup_chunk_algorithm|dedup_cdc_chunk_size|eio|bulk|read_ratio|pct_update_delay "
+ 	"name=var,type=CephChoices,strings=allow_ec_optimizations"
+          "|allow_ec_overwrites"
+          "|bulk"
+          "|cache_min_evict_age"
+          "|cache_min_flush_age"
+          "|cache_target_dirty_high_ratio"
+          "|cache_target_dirty_ratio"
+          "|cache_target_full_ratio"
+          "|compression_algorithm"
+          "|compression_max_blob_size"
+          "|compression_min_blob_size"
+          "|compression_mode"
+          "|compression_required_ratio"
+          "|crimson_allow_pg_merge"
+          "|crush_rule"
+          "|csum_max_block"
+          "|csum_min_block"
+          "|csum_type"
+          "|deep_scrub_interval"
+          "|dedup_cdc_chunk_size"
+          "|dedup_chunk_algorithm"
+          "|dedup_tier"
+          "|eio"
+          "|fast_read"
+          "|fingerprint_algorithm"
+          "|hashpspool"
+          "|hit_set_count"
+          "|hit_set_fpp"
+          "|hit_set_grade_decay_rate"
+          "|hit_set_period"
+          "|hit_set_search_last_n"
+          "|hit_set_type"
+          "|min_read_recency_for_promote"
+          "|min_size"
+          "|min_write_recency_for_promote"
+          "|nodeep-scrub"
+          "|nodelete"
+          "|nopgchange"
+          "|noscrub"
+          "|nosizechange"
+          "|pct_update_delay"
+          "|pg_autoscale_bias"
+          "|pg_autoscale_mode"
+          "|pg_num"
+          "|pg_num_max"
+          "|pg_num_min"
+          "|pgp_num"
+          "|pgp_num_actual"
+          "|read_ratio"
+          "|recovery_op_priority"
+          "|recovery_priority"
+          "|scrub_max_interval"
+          "|scrub_min_interval"
+          "|scrub_priority"
+          "|set_pool_flags"
+          "|size"
+          "|target_max_bytes"
+          "|target_max_objects"
+          "|target_size_bytes"
+          "|target_size_ratio"
+          "|unset_pool_flags"
+          "|use_gmt_hitset"
+          "|write_fadvise_dontneed "
 	"name=val,type=CephString "
 	"name=yes_i_really_mean_it,type=CephBool,req=false",
 	"set pool parameter <var> to <val>", "osd", "rw")
@@ -1212,7 +1342,7 @@ COMMAND("osd pool application rm "
         "removes application <app> metadata key <key> on pool <poolname>",
         "osd", "rw")
 COMMAND("osd pool application get "
-        "name=pool,type=CephPoolname,req=fasle "
+        "name=pool,type=CephPoolname,req=false "
         "name=app,type=CephString,req=false "
         "name=key,type=CephString,req=false",
         "get value of key <key> of application <app> on pool <poolname>",
@@ -1233,9 +1363,19 @@ COMMAND("osd pool stretch set "
         "make the pool stretched across the specified number of CRUSH buckets",
         "osd", "rw")
 COMMAND("osd pool stretch unset "
-		"name=pool,type=CephPoolname",
+		"name=pool,type=CephPoolname "
+		"name=crush_rule,type=CephString "
+		"name=size,type=CephInt,range=0 "
+		"name=min_size,type=CephInt,range=0 ",
 		"unset the stretch mode for the pool",
 		"osd", "rw")
+COMMAND("osd pool availability-status", \
+        "obtain availability stats from all pools", \
+        "osd", "r")
+COMMAND("osd pool clear-availability-status "
+		"name=pool,type=CephPoolname ",
+        "clear a pool's existing availability stats", 
+        "osd", "r")
 COMMAND("osd utilization",
 	"get basic pg distribution stats",
 	"osd", "r")
@@ -1438,6 +1578,58 @@ COMMAND("nvme-gw show"
    " show nvmeof gateways within (pool, group)",
    "mon", "r")
 
+COMMAND("nvme-gw show-all",
+  " Dump nvmeof gateways for all pools and groups",
+  "mon", "r")
+
+COMMAND("nvme-gw listeners"
+	" name=pool,type=CephString"
+	" name=group,type=CephString",
+	" show all nvmeof gateways listeners within (pool, group)",
+	"mon", "r")
+
+COMMAND("nvme-gw enable"
+   " name=id,type=CephString"
+   " name=pool,type=CephString"
+   " name=group,type=CephString",
+   "administratively enables nvmeof gateway id for (pool, group)",
+   "mgr", "rw")
+
+COMMAND("nvme-gw disable"
+   " name=id,type=CephString"
+   " name=pool,type=CephString"
+   " name=group,type=CephString",
+   "administratively disables nvmeof gateway id for (pool, group)",
+   "mgr", "rw")
+
+COMMAND("nvme-gw set-location"
+   " name=id,type=CephString"
+   " name=pool,type=CephString"
+   " name=group,type=CephString"
+   " name=location,type=CephString",
+   "set location for nvmeof gateway id for (pool, group)",
+   "mgr", "rw")
+
+COMMAND("nvme-gw disaster-set"
+     " name=pool,type=CephString"
+     " name=group,type=CephString"
+     " name=location,type=CephString",
+     " set location to Disaster state",
+     "mgr", "rw")
+
+COMMAND("nvme-gw disaster-clear"
+    " name=pool,type=CephString"
+    " name=group,type=CephString"
+    " name=location,type=CephString",
+    " set location to clear Disaster state - failbacks allowed for recovered location",
+    "mgr", "rw")
+
+COMMAND("nvme-gw set"
+    " name=var,type=CephChoices,strings=beacon-diff"
+    " name=val,type=CephString ",
+    "config nvme-gw",
+    "mgr", "rw")
+
 // these are tell commands that were implemented as CLI commands in
 // the broken pre-octopus way that we want to allow to work when a
 // monitor has upgraded to octopus+ but the monmap min_mon_release is
@@ -1510,7 +1702,15 @@ COMMAND_WITH_FLAG("dump_historic_ops",
             "show recent ops",
             "mon", "r",
             FLAG(TELL))
+COMMAND_WITH_FLAG("dump_historic_ops_by_duration",
+            "show recent ops sorted by duration",
+            "mon", "r",
+            FLAG(TELL))
 COMMAND_WITH_FLAG("dump_historic_slow_ops",
             "show recent slow ops",
+            "mon", "r",
+            FLAG(TELL))
+COMMAND_WITH_FLAG("dump_ops_in_flight",
+            "show the ops currently in flight",
             "mon", "r",
             FLAG(TELL))

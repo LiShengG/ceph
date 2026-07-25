@@ -22,8 +22,8 @@ seastar::future<> test_accumulate(ThreadPool& tp) {
     });
   };
   return seastar::map_reduce(
-    boost::irange(0, N), slow_plus, 0, std::plus{}).then([] (int sum) {
-    auto r = boost::irange(0 + M, N + M);
+    std::views::iota(0, N), slow_plus, 0, std::plus{}).then([] (int sum) {
+    auto r = std::views::iota(0 + M, N + M);
     if (sum != std::accumulate(r.begin(), r.end(), 0)) {
       throw std::runtime_error("test_accumulate failed");
     }
@@ -61,6 +61,8 @@ int main(int argc, char** argv)
           return tp->stop();
         });
       });
+    }).then([] {
+      std::cout << "All tests succeeded" << std::endl;
     }).finally([] {
       return crimson::common::sharded_conf().stop();
     }).handle_exception([](auto e) {

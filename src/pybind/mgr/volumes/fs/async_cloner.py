@@ -113,61 +113,26 @@ def bulk_copy(fs_handle, source_path, dst_path, should_cancel):
     and regular files are synced.
     """
     log.info("copying data from {0} to {1}".format(source_path, dst_path))
-    def cptree(src_root_path, dst_root_path):
-        log.debug("cptree: {0} -> {1}".format(src_root_path, dst_root_path))
-        try:
-            with fs_handle.opendir(src_root_path) as dir_handle:
-                d = fs_handle.readdir(dir_handle)
-                while d and not should_cancel():
-                    if d.d_name not in (b".", b".."):
-                        log.debug("d={0}".format(d))
-                        d_full_src = os.path.join(src_root_path, d.d_name)
-                        d_full_dst = os.path.join(dst_root_path, d.d_name)
-                        stx = fs_handle.statx(d_full_src, cephfs.CEPH_STATX_MODE  |
-                                                          cephfs.CEPH_STATX_UID   |
-                                                          cephfs.CEPH_STATX_GID   |
-                                                          cephfs.CEPH_STATX_ATIME |
-                                                          cephfs.CEPH_STATX_MTIME |
-                                                          cephfs.CEPH_STATX_SIZE,
-                                                          cephfs.AT_SYMLINK_NOFOLLOW)
-                        handled = True
-                        mo = stx["mode"] & ~stat.S_IFMT(stx["mode"])
-                        if stat.S_ISDIR(stx["mode"]):
-                            log.debug("cptree: (DIR) {0}".format(d_full_src))
-                            try:
-                                fs_handle.mkdir(d_full_dst, mo)
-                            except cephfs.Error as e:
-                                if not e.args[0] == errno.EEXIST:
-                                    raise
-                            cptree(d_full_src, d_full_dst)
-                        elif stat.S_ISLNK(stx["mode"]):
-                            log.debug("cptree: (SYMLINK) {0}".format(d_full_src))
-                            target = fs_handle.readlink(d_full_src, 4096)
-                            try:
-                                fs_handle.symlink(target[:stx["size"]], d_full_dst)
-                            except cephfs.Error as e:
-                                if not e.args[0] == errno.EEXIST:
-                                    raise
-                        elif stat.S_ISREG(stx["mode"]):
-                            log.debug("cptree: (REG) {0}".format(d_full_src))
-                            copy_file(fs_handle, d_full_src, d_full_dst, mo, cancel_check=should_cancel)
-                        else:
-                            handled = False
-                            log.warning("cptree: (IGNORE) {0}".format(d_full_src))
-                        if handled:
-                            sync_attrs(fs_handle, d_full_dst, stx)
-                    d = fs_handle.readdir(dir_handle)
-                stx_root = fs_handle.statx(src_root_path, cephfs.CEPH_STATX_ATIME |
-                                                          cephfs.CEPH_STATX_MTIME,
-                                                          cephfs.AT_SYMLINK_NOFOLLOW)
-                fs_handle.lutimes(dst_root_path, (time.mktime(stx_root["atime"].timetuple()),
-                                                  time.mktime(stx_root["mtime"].timetuple())))
-        except cephfs.Error as e:
-            if not e.args[0] == errno.ENOENT:
-                raise VolumeException(-e.args[0], e.args[1])
-    cptree(source_path, dst_path)
-    if should_cancel():
+    # TODO: add code set utime on each file
+    try:
+        # src subvol's UUID must not be copied, only its contents should be.
+        # therefore cp_src_dir is set to False.
+        fs_handle.cptree(source_path, dst_path, should_sync_attrs=True,
+                         cp_src_dir=False, should_cancel=should_cancel,
+                         suppress_errors=False)
+
+        stx_root = fs_handle.statx(source_path, cephfs.CEPH_STATX_ATIME |
+                                                cephfs.CEPH_STATX_MTIME,
+                                                cephfs.AT_SYMLINK_NOFOLLOW)
+        fs_handle.lutimes(dst_path, (time.mktime(stx_root["atime"].timetuple()),
+                                     time.mktime(stx_root["mtime"].timetuple())))
+
+        log.info(f'successfully finished copying data from {source_path} to {dst_path}')
+    except cephfs.OpCanceled:
         raise VolumeException(-errno.EINTR, "user interrupted clone operation")
+    except cephfs.Error as e:
+        if e.args[0] != errno.ENOENT:
+            raise VolumeException(-e.args[0], e.args[1])
 
 def set_quota_on_clone(fs_handle, clone_volumes_pair):
     src_path = clone_volumes_pair[1].snapshot_data_path(clone_volumes_pair[2])
@@ -177,12 +142,20 @@ def set_quota_on_clone(fs_handle, clone_volumes_pair):
         quota = int(fs_handle.getxattr(src_path, 'ceph.quota.max_bytes').decode('utf-8'))
     except cephfs.NoData:
         pass
+    except cephfs.ObjectNotFound:
+        log.info('set_quota_on_clone(): getxattr failed because source path '
+                 f'"{src_path}" has gone missing')
+        raise
 
     if quota is not None:
         try:
             fs_handle.setxattr(dst_path, 'ceph.quota.max_bytes', str(quota).encode('utf-8'), 0)
         except cephfs.InvalidValue:
             raise VolumeException(-errno.EINVAL, "invalid size specified: '{0}'".format(quota))
+        except cephfs.ObjectNotFound:
+            log.info('set_quota_on_clone(): getxattr failed because destination path '
+                     f'"{dst_path}" has gone missing')
+            raise
         except cephfs.Error as e:
              raise VolumeException(-e.args[0], e.args[1])
 
@@ -191,12 +164,20 @@ def set_quota_on_clone(fs_handle, clone_volumes_pair):
         quota_files = int(fs_handle.getxattr(src_path, 'ceph.quota.max_files').decode('utf-8'))
     except cephfs.NoData:
         pass
+    except cephfs.ObjectNotFound:
+        log.info('set_quota_on_clone(): getxattr failed because source path '
+                 f'"{src_path}" has gone missing')
+        raise
 
     if quota_files is not None:
         try:
             fs_handle.setxattr(dst_path, 'ceph.quota.max_files', str(quota_files).encode('utf-8'), 0)
         except cephfs.InvalidValue:
             raise VolumeException(-errno.EINVAL, "invalid file count specified: '{0}'".format(quota_files))
+        except cephfs.ObjectNotFound:
+            log.info('set_quota_on_clone(): getxattr failed because destination path '
+                     f'"{dst_path}" has gone missing')
+            raise
         except cephfs.Error as e:
              raise VolumeException(-e.args[0], e.args[1])
 
@@ -213,12 +194,12 @@ def do_clone(fs_client, volspec, volname, groupname, subvolname, should_cancel):
             set_quota_on_clone(fs_handle, (subvol0, subvol1, subvol2))
 
 def update_clone_failure_status(fs_client, volspec, volname, groupname, subvolname, ve):
-    with open_clone_subvol_pair_in_vol(fs_client, volspec, volname, groupname,
-            subvolname, lockless=False) as (subvol0, subvol1, subvol2):
+    with open_at_volume(fs_client, volspec, volname, groupname, subvolname,
+                        SubvolumeOpType.CLONE_INTERNAL) as clone:
         if ve.errno == -errno.EINTR:
-            subvol0.add_clone_failure(-ve.errno, "user interrupted clone operation")
+            clone.add_clone_failure(-ve.errno, "user interrupted clone operation")
         else:
-            subvol0.add_clone_failure(-ve.errno, ve.error_str)
+            clone.add_clone_failure(-ve.errno, ve.error_str)
 
 def log_clone_failure(volname, groupname, subvolname, ve):
     if ve.errno == -errno.EINTR:
@@ -246,7 +227,7 @@ def handle_clone_failed(fs_client, volspec, volname, index, groupname, subvolnam
     try:
         # detach source but leave the clone section intact for later inspection
         with open_clone_subvol_pair_in_vol(fs_client, volspec, volname, groupname,
-                subvolname) as (subvol0, subvol1, subvol2):
+                subvolname, failed=True) as (subvol0, subvol1, subvol2):
             subvol1.detach_snapshot(subvol2, index)
     except (MetadataMgrException, VolumeException) as e:
         log.error("failed to detach clone from snapshot: {0}".format(e))
@@ -257,7 +238,6 @@ def handle_clone_complete(fs_client, volspec, volname, index, groupname, subvoln
         with open_clone_subvol_pair_in_vol(fs_client, volspec, volname,
                 groupname, subvolname) as (subvol0, subvol1, subvol2):
             subvol1.detach_snapshot(subvol2, index)
-            subvol0.remove_clone_source(flush=True)
     except (MetadataMgrException, VolumeException) as e:
         log.error("failed to detach clone from snapshot: {0}".format(e))
     return (None, True)
@@ -383,7 +363,7 @@ class Cloner(AsyncJobs):
                         jobs = [j[0] for j in self.jobs[volname]]
                         with lock_timeout_log(self.lock):
                             if SubvolumeOpSm.is_init_state(SubvolumeTypes.TYPE_CLONE, clone_state) and not clone_job in jobs:
-                                logging.debug("Cancelling pending job {0}".format(clone_job))
+                                log.debug("Cancelling pending job {0}".format(clone_job))
                                 # clone has not started yet -- cancel right away.
                                 self._cancel_pending_clone(fs_handle, clone_subvolume, clonename, groupname, status, track_idx)
                                 return

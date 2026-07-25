@@ -74,7 +74,8 @@ struct BufferlistMetaTable : public EmptyMetaTable {
 };
 
 int RGWObjFilter::execute(bufferlist& bl, off_t offset, const char* op_name) const {
-  lua_state_guard lguard(s->cct->_conf->rgw_lua_max_memory_per_state, s);
+  lua_state_guard lguard(s->cct->_conf->rgw_lua_max_memory_per_state,
+                         s->cct->_conf->rgw_lua_max_runtime_per_state, s);
   auto L = lguard.get();
   if (!L) {
     ldpp_dout(s, 1) << "Failed to create state for Lua data context" << dendl;
@@ -102,11 +103,8 @@ int RGWObjFilter::execute(bufferlist& bl, off_t offset, const char* op_name) con
       // create the "RGW" table
       s->penv.lua.background->create_background_metatable(L);
     }
-
-    // execute the lua script
-    if (luaL_dostring(L, script.c_str()) != LUA_OK) {
-      const std::string err(lua_tostring(L, -1));
-      ldpp_dout(s, 1) << "Lua ERROR: " << err << dendl;
+    auto rc = rgw::lua::lua_execute(L, s, script);
+    if (rc) {
       return -EINVAL;
     }
   } catch (const std::runtime_error& e) {

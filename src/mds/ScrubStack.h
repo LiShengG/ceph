@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph - scalable distributed file system
  *
@@ -15,21 +16,19 @@
 #ifndef SCRUBSTACK_H_
 #define SCRUBSTACK_H_
 
-#include "CDir.h"
-#include "CDentry.h"
 #include "CInode.h"
-#include "MDSContext.h"
 #include "ScrubHeader.h"
 
 #include "common/LogClient.h"
 #include "common/Cond.h"
 #include "common/ceph_time.h"
 #include "include/elist.h"
-#include "messages/MMDSScrub.h"
-#include "messages/MMDSScrubStats.h"
 
 class MDCache;
+class MMDSScrub;
+class MMDSScrubStats;
 class Finisher;
+class CDir;
 
 class ScrubStack {
 public:
@@ -58,7 +57,7 @@ public:
    * caller should provide a context which is completed after all
    * in-progress scrub operations are completed and pending inodes
    * are removed from the scrub stack (with the context callbacks for
-   * inodes completed with -CEPHFS_ECANCELED).
+   * inodes completed with -ECANCELED).
    * @param on_finish Context callback to invoke after abort
    */
   void scrub_abort(Context *on_finish);
@@ -76,8 +75,8 @@ public:
   /**
    * Resume a paused scrub. Unlike abort or pause, this is instantaneous.
    * Pending pause operations are cancelled (context callbacks are
-   * invoked with -CEPHFS_ECANCELED).
-   * @returns 0 (success) if resumed, -CEPHFS_EINVAL if an abort is in-progress.
+   * invoked with -ECANCELED).
+   * @returns 0 (success) if resumed, -EINVAL if an abort is in-progress.
    */
   bool scrub_resume();
 
@@ -215,6 +214,12 @@ private:
   void scrub_file_inode(CInode *in);
 
   /**
+   * Scrub a file inode.
+   * @param dn The remote dentry to identify
+   */
+  void identify_remote_link_damage(CDentry *dn);
+
+  /**
    * Callback from completion of CInode::validate_disk_state
    * @param in The inode we were validating
    * @param r The return status from validate_disk_state
@@ -237,9 +242,10 @@ private:
    * scrub of the dirfrag.
    *
    * @param dir The dirfrag to scrub (must be auth)
+   * @param added_children set to true if we pushed some of our children
    * @param done set to true if we started to do final scrub
    */
-  void scrub_dirfrag(CDir *dir, bool *done);
+  void scrub_dirfrag(CDir *dir, bool *added_children, bool *done);
   /**
    * Scrub a directory-representing dentry.
    *
@@ -270,7 +276,7 @@ private:
 
   /**
    * Abort pending scrubs for inodes waiting in the inode stack.
-   * Completion context is complete with -CEPHFS_ECANCELED.
+   * Completion context is complete with -ECANCELED.
    */
   void abort_pending_scrubs();
 

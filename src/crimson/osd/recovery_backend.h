@@ -1,5 +1,5 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
 
 #pragma once
 
@@ -19,9 +19,60 @@
 #include "osd/recovery_types.h"
 #include "osd/osd_types.h"
 
-namespace crimson::osd{
-  class PG;
-}
+namespace crimson::osd {
+class PG;
+
+class PGRecovery;
+
+/// holds read locks on neighbor clones used for clone overlap recovery
+class RecoveryCloneLockManager {
+  std::map<hobject_t, ObjectContextRef> locks;
+
+  void unlock_all() {
+    for (auto& kv : locks) {
+      kv.second->put_read_lock();
+    }
+    locks.clear();
+  }
+public:
+  RecoveryCloneLockManager() = default;
+  RecoveryCloneLockManager(RecoveryCloneLockManager&& o) noexcept
+    : locks(std::move(o.locks)) {}
+  RecoveryCloneLockManager(const RecoveryCloneLockManager&) = delete;
+  RecoveryCloneLockManager& operator=(RecoveryCloneLockManager&& o) noexcept {
+    if (this != &o) {
+      unlock_all();
+      locks = std::move(o.locks);
+    }
+    return *this;
+  }
+  RecoveryCloneLockManager& operator=(const RecoveryCloneLockManager&) = delete;
+
+  bool try_lock_for_read(
+    const hobject_t& hoid,
+    ObjectContextRegistry& registry) {
+    if (locks.count(hoid)) {
+      return false;
+    }
+    auto obc = registry.maybe_get_cached_obc(hoid);
+    if (!obc || !obc->try_get_read_lock()) {
+      return false;
+    }
+    locks.emplace(hoid, std::move(obc));
+    return true;
+  }
+
+  void release_locks() {
+    unlock_all();
+  }
+
+  ~RecoveryCloneLockManager() {
+    // Safe to unlock from the dtor: unlock_for_read() only decrements
+    // and wakes waiters.  Also covers move-assign replacing a non-empty
+    // target without an explicit release_locks() call.
+    unlock_all();
+  }
+};
 
 class RecoveryBackend {
 public:
@@ -37,13 +88,22 @@ public:
   RecoveryBackend(crimson::osd::PG& pg,
 		  crimson::osd::ShardServices& shard_services,
 		  crimson::os::CollectionRef coll,
+      store_index_t store_index,
 		  PGBackend* backend)
     : pg{pg},
       shard_services{shard_services},
-      store{&shard_services.get_store()},
+      store(shard_services.get_store(store_index)),
       coll{coll},
       backend{backend} {}
   virtual ~RecoveryBackend() {}
+
+  static std::unique_ptr<RecoveryBackend> create(
+    const pg_pool_t& pool,
+    crimson::osd::PG& pg,
+    crimson::osd::ShardServices& shard_services,
+    crimson::os::CollectionRef coll,
+    PGBackend* backend);
+
   std::pair<WaitForObjectRecovery&, bool> add_recovering(const hobject_t& soid) {
     auto [it, added] = recovering.emplace(soid, new WaitForObjectRecovery(pg));
     assert(it->second);
@@ -82,15 +142,22 @@ public:
   virtual interruptible_future<> recover_object(
     const hobject_t& soid,
     eversion_t need) = 0;
-  virtual interruptible_future<> recover_delete(
-    const hobject_t& soid,
-    eversion_t need) = 0;
-  virtual interruptible_future<> push_delete(
-    const hobject_t& soid,
-    eversion_t need) = 0;
 
-  interruptible_future<BackfillInterval> scan_for_backfill(
-    const hobject_t& from,
+  interruptible_future<> recover_delete(
+    const hobject_t& soid,
+    eversion_t need);
+  interruptible_future<> push_delete(
+    const hobject_t& soid,
+    eversion_t need);
+
+  interruptible_future<PrimaryBackfillInterval> scan_for_backfill_primary(
+    const hobject_t from,
+    std::int64_t min,
+    std::int64_t max,
+    const std::set<pg_shard_t> &backfill_targets);
+
+  interruptible_future<ReplicaBackfillInterval> scan_for_backfill_replica(
+    const hobject_t from,
     std::int64_t min,
     std::int64_t max);
 
@@ -122,7 +189,7 @@ public:
 protected:
   crimson::osd::PG& pg;
   crimson::osd::ShardServices& shard_services;
-  crimson::os::FuturizedStore::Shard* store;
+  crimson::os::BackendStore store;
   crimson::os::CollectionRef coll;
   PGBackend* backend;
 
@@ -134,6 +201,7 @@ protected:
     crimson::osd::ObjectContextRef head_ctx;
     crimson::osd::ObjectContextRef obc;
     object_stat_sum_t stat;
+    RecoveryCloneLockManager clone_lock_manager;
     bool is_complete() const {
       return recovery_progress.is_complete(recovery_info);
     }
@@ -144,6 +212,7 @@ protected:
     ObjectRecoveryInfo recovery_info;
     crimson::osd::ObjectContextRef obc;
     object_stat_sum_t stat;
+    RecoveryCloneLockManager clone_lock_manager;
   };
 
 public:
@@ -171,6 +240,15 @@ public:
     }
     seastar::future<> wait_for_pushes(pg_shard_t shard) {
       return pushes[shard].get_shared_future();
+    }
+    bool has_pushes() const {
+      return !pushes.empty();
+    }
+    seastar::future<> wait_for_all_pushes() {
+      return seastar::parallel_for_each(pushes,
+	[](auto& entry) {
+	  return entry.second.get_shared_future();
+	});
     }
     seastar::future<> wait_for_recovered() {
       if (!recovered) {
@@ -214,11 +292,9 @@ public:
     }
     void set_pushed(pg_shard_t shard) {
       auto it = pushes.find(shard);
-      if (it != pushes.end()) {
-	auto &push_promise = it->second;
-	push_promise.set_value();
-	pushes.erase(it);
-      }
+      ceph_assert(it != pushes.end());
+      it->second.set_value();
+      pushes.erase(it);
     }
     void set_pulled() {
       if (pulled) {
@@ -252,6 +328,8 @@ public:
 protected:
   std::map<hobject_t, WaitForObjectRecoveryRef> recovering;
   std::map<hobject_t, seastar::shared_promise<>> unfound;
+
+  friend PGRecovery;
   hobject_t get_temp_recovery_object(
     const hobject_t& target,
     eversion_t version) const;
@@ -268,7 +346,29 @@ protected:
 
   void clean_up(ceph::os::Transaction& t, interrupt_cause_t why);
   virtual seastar::future<> on_stop() = 0;
+
+  /**
+   * replica_push_targets
+   *
+   * Holds obc on replica for in-progress pushes, see
+   * ReplicatedRecoveryBackend::handle_push
+   */
+  std::map<hobject_t, crimson::osd::ObjectContextRef> replica_push_targets;
 private:
+  interruptible_future<> on_local_recover_persist(
+    const hobject_t& soid,
+    const ObjectRecoveryInfo& _recovery_info,
+    bool is_delete,
+    epoch_t epoch_to_freeze);
+  interruptible_future<> local_recover_delete(
+    const hobject_t& soid,
+    eversion_t need,
+    epoch_t epoch_frozen);
+  interruptible_future<> handle_recovery_delete(
+    Ref<MOSDPGRecoveryDelete> m);
+  interruptible_future<> handle_recovery_delete_reply(
+    Ref<MOSDPGRecoveryDeleteReply> m);
+
   void handle_backfill_finish(
     MOSDPGBackfill& m,
     crimson::net::ConnectionXcoreRef conn);
@@ -290,3 +390,5 @@ private:
     crimson::net::ConnectionXcoreRef conn);
   interruptible_future<> handle_backfill_remove(MOSDPGBackfillRemove& m);
 };
+
+}

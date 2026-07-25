@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph - scalable distributed file system
  *
@@ -18,17 +19,24 @@
 #ifndef PGBACKEND_H
 #define PGBACKEND_H
 
-#include "ECCommon.h"
+#include "ECListener.h"
+#include "ECTypes.h"
+#include "ECExtentCache.h"
 #include "osd_types.h"
 #include "pg_features.h"
 #include "common/intrusive_timer.h"
 #include "common/WorkQueue.h"
 #include "include/Context.h"
 #include "os/ObjectStore.h"
+#include "osd/scrubber_common.h"
 #include "common/LogClient.h"
 #include <string>
 #include "PGTransaction.h"
 #include "common/ostream_temp.h"
+#include "Coroutines.h"
+
+
+class ECOmapJournalEntry;
 
 namespace Scrub {
   class Store;
@@ -57,11 +65,10 @@ typedef std::shared_ptr<const OSDMap> OSDMapRef;
  public:
   virtual int object_stat(const hobject_t &hoid, struct stat* st) { return -1;};
    CephContext* cct;
- protected:
+ public:
    ObjectStore *store;
    const coll_t coll;
    ObjectStore::CollectionHandle &ch;
- public:
    /**
     * Provides interfaces for PGBackend callbacks
     *
@@ -290,6 +297,10 @@ typedef std::shared_ptr<const OSDMap> OSDMapRef;
        MessageRef, Connection *con) = 0;
      virtual void send_message_osd_cluster(
        Message *m, const ConnectionRef& con) = 0;
+     virtual void start_mon_command(
+       std::vector<std::string>&& cmd, bufferlist&& inbl,
+       bufferlist *outbl, std::string *outs,
+       Context *onfinish) = 0;
      virtual ConnectionRef get_con_osd_cluster(int peer, epoch_t from_epoch) = 0;
      virtual entity_name_t get_cluster_msgr_name() = 0;
 
@@ -420,11 +431,65 @@ typedef std::shared_ptr<const OSDMap> OSDMapRef;
 
    virtual IsPGRecoverablePredicate *get_is_recoverable_predicate() const = 0;
    virtual IsPGReadablePredicate *get_is_readable_predicate() const = 0;
-   virtual int get_ec_data_chunk_count() const { return 0; };
+   virtual unsigned int get_ec_data_chunk_count() const { return 0; };
    virtual int get_ec_stripe_chunk_size() const { return 0; };
-
+   virtual bool get_ec_supports_crc_encode_decode() const = 0;
+   virtual uint64_t object_size_to_shard_size(const uint64_t size, shard_id_t shard) const { return size; };
    virtual void dump_recovery_info(ceph::Formatter *f) const = 0;
-
+   virtual bool get_is_nonprimary_shard(shard_id_t shard) const {
+     return false; // Only EC has nonprimary shards.
+   };
+   virtual bool get_is_hinfo_required() const {
+     return false; // Only EC can have hinfo.
+   }
+   virtual bool get_is_ec_optimized() const {
+     return false; // Only EC can have be ec optimized!
+   }
+   virtual bool ec_can_decode(const shard_id_set &available_shards) const = 0;
+   virtual shard_id_map<bufferlist> ec_encode_acting_set(
+       const bufferlist &in_bl) const = 0;
+   virtual shard_id_map<bufferlist> ec_decode_acting_set(
+       const shard_id_map<bufferlist> &shard_map, int chunk_size) const = 0;
+   virtual ECUtil::stripe_info_t ec_get_sinfo() const = 0;
+   virtual bool remove_ec_omap_journal_entry(const hobject_t &hoid, const ECOmapJournalEntry &entry) {
+     return false; // Only EC uses ec_omap_journal
+   };
+   virtual std::pair<gen_t, bool> omap_get_generation(const hobject_t &hoid) {
+     return {0, false}; // Only EC uses ec_omap_journal
+   };
+   virtual void omap_trim_delete_from_journal(const hobject_t &hoid, const version_t version) {};
+   using OmapIterFunction = std::function<ObjectStore::omap_iter_ret_t(std::string_view, std::string_view)>;
+   virtual int omap_iterate(
+     ObjectStore::CollectionHandle &c_, ///< [in] collection
+     const ghobject_t &oid, ///< [in] object
+     const ObjectStore::omap_iter_seek_t &start_from,
+     ///^ [in] where the iterator should point to at the beginning
+     const OmapIterFunction &f ///< [in] function to call for each key/value pair
+   ) = 0;
+   virtual int omap_get_values(
+     ObjectStore::CollectionHandle &c_, ///< [in] collection
+     const ghobject_t &oid, ///< [in] object
+     const std::set<std::string> &keys, ///< [in] keys to get
+     std::map<std::string, ceph::buffer::list> *out ///< [out] returned key/values
+   ) = 0;
+   virtual int omap_get_header(
+     ObjectStore::CollectionHandle &c_, ///< [in] Collection containing oid
+     const ghobject_t &oid, ///< [in] Object containing omap
+     ceph::buffer::list *header, ///< [out] omap header
+     bool allow_eio ///< [in] don't assert on eio
+   ) = 0;
+   virtual int omap_get(
+     ObjectStore::CollectionHandle &c_, ///< [in] Collection containing oid
+     const ghobject_t &oid, ///< [in] Object containing omap
+     ceph::buffer::list *header, ///< [out] omap header
+     std::map<std::string, ceph::buffer::list> *out /// < [out] Key to value map
+   ) = 0;
+   virtual int omap_check_keys(
+     ObjectStore::CollectionHandle &c_, ///< [in] Collection containing oid
+     const ghobject_t &oid, ///< [in] Object containing omap
+     const std::set<std::string> &keys, ///< [in] Keys to check
+     std::set<std::string> *out ///< [out] Subset of keys defined on oid
+   ) = 0;
  private:
    std::set<hobject_t> temp_contents;
  public:
@@ -487,6 +552,15 @@ typedef std::shared_ptr<const OSDMap> OSDMapRef;
      const pg_log_entry_t &entry,
      ObjectStore::Transaction *t);
 
+   void trim_after_remove(
+     const pg_log_entry_t &entry,
+     ObjectStore::Transaction *t);
+
+   void partial_write(
+     pg_info_t *info,
+     eversion_t previous_version,
+     const pg_log_entry_t &entry);
+
    void remove(
      const hobject_t &hoid,
      ObjectStore::Transaction *t);
@@ -500,12 +574,13 @@ typedef std::shared_ptr<const OSDMap> OSDMapRef;
    void rollback_setattrs(
      const hobject_t &hoid,
      std::map<std::string, std::optional<ceph::buffer::list> > &old_attrs,
-     ObjectStore::Transaction *t);
+     ObjectStore::Transaction *t,
+     bool only_oi);
 
    /// Truncate object to rollback append
-   virtual void rollback_append(
+   void rollback_append(
      const hobject_t &hoid,
-     uint64_t old_size,
+     uint64_t old_shard_size,
      ObjectStore::Transaction *t);
 
    /// Unstash object to rollback stash
@@ -530,8 +605,10 @@ typedef std::shared_ptr<const OSDMap> OSDMapRef;
    /// Clone the extents back into place
    void rollback_extents(
      version_t gen,
-     const std::vector<std::pair<uint64_t, uint64_t> > &extents,
+     const uint64_t offset,
+     uint64_t length,
      const hobject_t &hoid,
+     const uint64_t shard_size,
      ObjectStore::Transaction *t);
  public:
 
@@ -569,7 +646,17 @@ typedef std::shared_ptr<const OSDMap> OSDMapRef;
      uint64_t off,
      uint64_t len,
      uint32_t op_flags,
-     ceph::buffer::list *bl) = 0;
+     ceph::buffer::list *bl,
+     uint64_t object_size,
+     std::optional<CoroHandles> coro
+   ) = 0;
+
+   virtual int objects_read_local(
+      const hobject_t &hoid,
+      uint64_t off,
+      uint64_t len,
+      uint32_t op_flags,
+      ceph::buffer::list *bl) = 0;
 
    virtual int objects_readv_sync(
      const hobject_t &hoid,
@@ -579,21 +666,31 @@ typedef std::shared_ptr<const OSDMap> OSDMapRef;
      return -EOPNOTSUPP;
    }
 
+   virtual std::pair<uint64_t, uint64_t> extent_to_shard_extent(
+       uint64_t off, uint64_t len) {
+     return std::pair(off, len);
+   }
+
    virtual void objects_read_async(
      const hobject_t &hoid,
-     const std::list<std::pair<ECCommon::ec_align_t,
-		std::pair<ceph::buffer::list*, Context*> > > &to_read,
+     uint64_t object_size,
+     const std::list<std::pair<ec_align_t,
+		std::pair<ceph::buffer::list*, Context*>>> &to_read,
      Context *on_complete, bool fast_read = false) = 0;
 
    virtual bool auto_repair_supported() const = 0;
+
    int be_scan_list(
+     const Scrub::ScrubCounterSet& io_counters,
      ScrubMap &map,
      ScrubMapBuilder &pos);
 
-   virtual uint64_t be_get_ondisk_size(
-     uint64_t logical_size) const = 0;
+   virtual uint64_t be_get_ondisk_size(uint64_t logical_size,
+                                       shard_id_t shard_id,
+                                       bool object_is_legacy_ec) const = 0;
 
    virtual int be_deep_scrub(
+     [[maybe_unused]] const Scrub::ScrubCounterSet& io_counters,
      const hobject_t &oid,
      ScrubMap &map,
      ScrubMapBuilder &pos,
@@ -606,7 +703,8 @@ typedef std::shared_ptr<const OSDMap> OSDMapRef;
      coll_t coll,
      ObjectStore::CollectionHandle &ch,
      ObjectStore *store,
-     CephContext *cct);
+     CephContext *cct,
+     ECExtentCache::LRU &ec_extent_cache_lru);
 };
 
 #endif

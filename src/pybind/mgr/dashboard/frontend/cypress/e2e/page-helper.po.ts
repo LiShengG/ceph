@@ -13,17 +13,19 @@ export abstract class PageHelper {
    */
   static restrictTo(page: string): Function {
     return (target: any, propertyKey: string, descriptor: PropertyDescriptor) => {
-      const fn: Function = descriptor.value;
-      descriptor.value = function (...args: any) {
-        cy.location('hash').should((url) => {
-          expect(url).to.eq(
-            page,
-            `Method ${target.constructor.name}::${propertyKey} is supposed to be ` +
-              `run on path "${page}", but was run on URL "${url}"`
-          );
-        });
-        fn.apply(this, args);
-      };
+      if (descriptor) {
+        const fn: Function = descriptor.value;
+        descriptor.value = function (...args: any) {
+          cy.location('hash').should((url) => {
+            expect(url).to.eq(
+              page,
+              `Method ${target.constructor.name}::${propertyKey} is supposed to be ` +
+                `run on path "${page}", but was run on URL "${url}"`
+            );
+          });
+          fn.apply(this, args);
+        };
+      }
     };
   }
 
@@ -93,6 +95,10 @@ export abstract class PageHelper {
     return cy.contains('.nav.nav-tabs a', tabName);
   }
 
+  getCdsTab(tabName: string) {
+    return cy.contains('cds-tab-headers button[role="tab"]', tabName);
+  }
+
   getTabText(index: number) {
     return this.getTabs().its(index).text();
   }
@@ -118,19 +124,45 @@ export abstract class PageHelper {
    * Helper method to select an option inside a select element.
    * This method will also expect that the option was set.
    * @param option The option text (not value) to be selected.
+   * @param isCarbon If true, uses Carbon select element selector (cds-select).
+   *   This is a temporary parameter that will be removed once carbonization is complete.
    */
-  selectOption(selectionName: string, option: string) {
-    cy.get(`select[id=${selectionName}]`).select(option);
-    return this.expectSelectOption(selectionName, option);
+  selectOption(selectionName: string, option: string, isCarbon = false) {
+    if (isCarbon) {
+      cy.get(`cds-select[id=${selectionName}] select`).select(option, { force: true });
+    } else {
+      cy.get(`select[id=${selectionName}]`).select(option);
+    }
+    return this.expectSelectOption(selectionName, option, isCarbon);
   }
 
   /**
    * Helper method to expect a set option inside a select element.
    * @param option The selected option text (not value) that is to
    *   be expected.
+   * @param isCarbon If true, uses Carbon select element selector (cds-select).
+   *   This is a temporary parameter that will be removed once carbonization is complete.
    */
-  expectSelectOption(selectionName: string, option: string) {
-    return cy.get(`select[id=${selectionName}] option:checked`).contains(option);
+  expectSelectOption(selectionName: string, option: string, isCarbon = false) {
+    if (isCarbon) {
+      return cy.get(`cds-select[id=${selectionName}] select option:checked`).should(($option) => {
+        const text = $option.text().trim().toLowerCase();
+        expect(text).to.include(option.toLowerCase());
+      });
+    } else {
+      return cy.get(`select[id=${selectionName}] option:checked`).contains(option);
+    }
+  }
+
+  /**
+   * Helper method to select an option inside a cds-radio-group element.
+   * @param testId The data-testid attribute of the cds-radio-group.
+   * @param option The option value to be selected.
+   */
+  selectRadioOption(testId: string, option: string) {
+    cy.get(`[data-testid="${testId}"] cds-radio input[type="radio"][value="${option}"]`).check({
+      force: true
+    });
   }
 
   getLegends() {
@@ -238,6 +270,17 @@ export abstract class PageHelper {
     return cy.get('.cds--table-expand__button').first();
   }
 
+  getResourcePage(content?: string) {
+    this.waitDataTableToLoad();
+    if (content) {
+      return cy
+        .contains('[cdstablerow] [cdstabledata]', content)
+        .parent('[cdstablerow]')
+        .contains('[cdstabledata] a', new RegExp(`^${content}$`));
+    }
+    return cy.get('[cdstablerow] [cdstabledata] a').first();
+  }
+
   /**
    * Gets column headers of table
    */
@@ -258,8 +301,13 @@ export abstract class PageHelper {
 
   filterTable(name: string, option: string) {
     this.waitDataTableToLoad();
-    cy.get('select#filter_name').select(name);
-    cy.get('select#filter_option').select(option);
+    cy.get('[data-testid=filter-button]').click();
+    cy.get('cds-popover-content')
+      .should('be.visible')
+      .within(() => {
+        cy.get(`[data-testid="filter-select-${name}"]`).find('select').select(option);
+        cy.get('[data-testid="apply-filters"]').click();
+      });
   }
 
   setPageSize(size: string) {
@@ -314,7 +362,7 @@ export abstract class PageHelper {
       .find('[cdstabledata] [data-testid="table-action-btn"]')
       .click({ force: true });
     cy.wait(waitTime);
-    cy.get(`button.${action}`).click({ force: true });
+    cy.get(`button.${action}`).should('not.be.disabled').click({ force: true });
   }
 
   /**
@@ -332,7 +380,8 @@ export abstract class PageHelper {
     section?: string,
     cdsModal = false,
     isMultiselect = false,
-    shouldReload = false
+    shouldReload = false,
+    confirmInput = false
   ) {
     const action: string = section === 'hosts' ? 'remove' : 'delete';
 
@@ -345,10 +394,14 @@ export abstract class PageHelper {
 
     // Convert action to SentenceCase and Confirms deletion
     const actionUpperCase = action.charAt(0).toUpperCase() + action.slice(1);
-    cy.get('input[name="confirmation"]').click({ force: true });
+    if (confirmInput) {
+      cy.get('cds-modal input#resource_name').type(name, { force: true });
+    } else {
+      cy.get('[aria-label="confirmation"]').click({ force: true });
+    }
 
     if (cdsModal) {
-      cy.get('cds-modal button').contains(actionUpperCase).click();
+      cy.get('cds-modal button').contains(actionUpperCase).click({ force: true });
       // Wait for modal to close
       cy.get('cds-modal').should('not.exist');
     } else {

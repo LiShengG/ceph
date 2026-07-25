@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*- 
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*- 
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph - scalable distributed file system
  *
@@ -18,18 +19,23 @@
 #include <atomic>
 #include <map>
 #include <set>
+#include <string>
+#include <vector>
 
 #include <fmt/format.h>
 #include <fmt/ostream.h>
 
-#include "include/types.h"
+#include "include/utime.h"
+#include "include/types.h" // for version_t
 #include "PaxosService.h"
 
 #include "common/config_fwd.h"
+#include "common/debug.h"
 #include "common/LogEntry.h"
 #include "include/str_map.h"
 
 class MLog;
+struct Subscription;
 
 static const std::string LOG_META_CHANNEL = "$channel";
 
@@ -44,7 +50,7 @@ class LogMonitor : public PaxosService,
                    public md_config_obs_t {
 private:
   std::multimap<utime_t,LogEntry> pending_log;
-  unordered_set<LogEntryKey> pending_keys;
+  std::unordered_set<LogEntryKey> pending_keys;
 
   LogSummary summary;
 
@@ -182,20 +188,7 @@ private:
     g_conf().remove_observer(this);
   }
 
-  const char **get_tracked_conf_keys() const override {
-    static const char* KEYS[] = {
-      "mon_cluster_log_to_syslog",
-      "mon_cluster_log_to_syslog_facility",
-      "mon_cluster_log_file",
-      "mon_cluster_log_level",
-      "mon_cluster_log_to_graylog",
-      "mon_cluster_log_to_graylog_host",
-      "mon_cluster_log_to_graylog_port",
-      "mon_cluster_log_to_journald",
-      NULL
-    };
-    return KEYS;
-  }
+  std::vector<std::string> get_tracked_keys() const noexcept override;
   void handle_conf_change(const ConfigProxy& conf,
                           const std::set<std::string> &changed) override;
 };

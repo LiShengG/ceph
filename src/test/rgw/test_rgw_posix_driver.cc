@@ -1,5 +1,5 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab ft=cpp
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab ft=cpp
 
 /*
  * Ceph - scalable distributed file system
@@ -148,7 +148,7 @@ TEST(FSEnt, DirCreate)
 
   EXPECT_FALSE(sf::exists(tp));
 
-  bool existed;
+  bool existed{false};
   int ret = testdir->create(env->dpp, &existed);
 
   EXPECT_EQ(ret, 0);
@@ -165,7 +165,7 @@ TEST(FSEnt, DirBase)
 
   EXPECT_FALSE(sf::exists(tp));
 
-  bool existed;
+  bool existed{false};
   int ret = testdir->create(env->dpp, &existed);
 
   EXPECT_EQ(ret, 0);
@@ -273,14 +273,14 @@ TEST(FSEnt, DirBase)
   EXPECT_EQ(ret, 0);
   EXPECT_EQ(ent->get_type(), ObjectType::DIRECTORY);
 
-  ret = testdir->remove(env->dpp, null_yield, false);
+  ret = testdir->remove(env->dpp, null_yield, false, nullptr);
   EXPECT_EQ(ret, 0);
   EXPECT_FALSE(sf::exists(tp));
 }
 
 TEST(FSEnt, DirAddDir)
 {
-  bool existed;
+  bool existed{false};
   std::string dirname = get_test_name();
   sf::path tp{base_path / dirname};
   std::unique_ptr<Directory> testdir = std::make_unique<Directory>(dirname, root.get(), env->cct.get());
@@ -314,7 +314,7 @@ TEST(FSEnt, DirAddDir)
 
 TEST(FSEnt, DirRename)
 {
-  bool existed;
+  bool existed{false};
   std::string dirname = get_test_name();
   sf::path tp{base_path / dirname};
   std::unique_ptr<Directory> testdir = std::make_unique<Directory>(dirname, root.get(), env->cct.get());
@@ -357,7 +357,7 @@ TEST(FSEnt, FileCreateReal)
 
   EXPECT_FALSE(sf::exists(tp));
 
-  bool existed;
+  bool existed{false};
   int ret = testfile.create(env->dpp, &existed);
 
   EXPECT_EQ(ret, 0);
@@ -374,7 +374,7 @@ TEST(FSEnt, FileCreateTemp)
 
   EXPECT_FALSE(sf::exists(tp));
 
-  bool existed;
+  bool existed{false};
   int ret = testfile.create(env->dpp, &existed, true);
   EXPECT_EQ(ret, 0);
   EXPECT_FALSE(existed);
@@ -396,7 +396,7 @@ TEST(FSEnt, FileBase)
   EXPECT_FALSE(sf::exists(tp));
   EXPECT_EQ(testfile->get_fd(), -1);
 
-  bool existed;
+  bool existed{false};
   int ret = testfile->create(env->dpp, &existed);
 
   EXPECT_EQ(ret, 0);
@@ -485,7 +485,7 @@ TEST(FSEnt, FileBase)
   EXPECT_EQ(ret, 0);
   EXPECT_EQ(ent->get_type(), ObjectType::FILE);
 
-  ret = testfile->remove(env->dpp, null_yield, false);
+  ret = testfile->remove(env->dpp, null_yield, false, nullptr);
   EXPECT_EQ(ret, 0);
   EXPECT_FALSE(sf::exists(tp));
 }
@@ -530,7 +530,7 @@ TEST(FSEnt, SymlinkBase)
 
   EXPECT_FALSE(sf::exists(tp));
 
-  bool existed;
+  bool existed{false};
   int ret = testlink->create(env->dpp, &existed);
 
   EXPECT_EQ(ret, 0);
@@ -549,7 +549,7 @@ TEST(FSEnt, SymlinkBase)
   EXPECT_EQ(ent->get_type(), ObjectType::SYMLINK);
 
 
-  ret = testlink->remove(env->dpp, null_yield, false);
+  ret = testlink->remove(env->dpp, null_yield, false, nullptr);
   EXPECT_EQ(ret, 0);
   EXPECT_FALSE(sf::exists(tp));
 }
@@ -562,7 +562,7 @@ TEST(FSEnt, MPDirBase)
 
   EXPECT_FALSE(sf::exists(tp));
 
-  bool existed;
+  bool existed{false};
   int ret = testdir->create(env->dpp, &existed);
 
   EXPECT_EQ(ret, 0);
@@ -667,7 +667,7 @@ TEST(FSEnt, MPDirBase)
   EXPECT_EQ(ret, 0);
   EXPECT_EQ(ent->get_type(), ObjectType::MULTIPART);
 
-  ret = testdir->remove(env->dpp, null_yield, false);
+  ret = testdir->remove(env->dpp, null_yield, false, nullptr);
   EXPECT_EQ(ret, 0);
   EXPECT_FALSE(sf::exists(tp));
 }
@@ -680,7 +680,7 @@ TEST(FSEnt, MPDirTemp)
 
   EXPECT_FALSE(sf::exists(tp));
 
-  bool existed;
+  bool existed{false};
   int ret = testdir->create(env->dpp, &existed, true);
 
   EXPECT_EQ(ret, 0);
@@ -771,7 +771,7 @@ TEST(FSEnt, VerDirBase)
 
   EXPECT_FALSE(sf::exists(tp));
 
-  bool existed;
+  bool existed{false};
   int ret = testdir->create(env->dpp, &existed);
 
   EXPECT_EQ(ret, 0);
@@ -877,7 +877,7 @@ TEST(FSEnt, VerDirBase)
   EXPECT_EQ(ret, 0);
   EXPECT_EQ(ent->get_type(), ObjectType::VERSIONED);
 
-  ret = testdir->remove(env->dpp, null_yield, false);
+  ret = testdir->remove(env->dpp, null_yield, false, nullptr);
   EXPECT_EQ(ret, 0);
   EXPECT_FALSE(sf::exists(tp));
 }
@@ -1073,7 +1073,9 @@ public:
 
   TestDriver(std::string _base_path) : POSIXDriver(nullptr), driver_base(_base_path)
   { }
-  virtual ~TestDriver() = default;
+  virtual ~TestDriver() {
+    RGWQuotaHandler::free_handler(quota_handler);
+  }
 
   int init(const DoutPrefixProvider* dpp)
   {
@@ -1097,7 +1099,7 @@ public:
         }
       }
     }
-
+    quota_handler = RGWQuotaHandler::generate_handler(env->dpp, this, false);
     /* ordered listing cache */
     bucket_cache.reset(new BucketCache(
         this, base_path, cache_base, 100, 3, 3, 3));
@@ -1541,6 +1543,7 @@ TEST_F(POSIXObjectTest, ObjectCopy)
 	   &tag,
 	   nullptr,
 	   nullptr,
+	   nullptr,
 	   env->dpp,
 	   null_yield);
   EXPECT_EQ(ret, 0);
@@ -1847,6 +1850,7 @@ TEST_F(POSIXMPObjectTest, MPUploadCopy)
 	   nullptr,
 	   &tag, /* use req_id as tag */
 	   &tag,
+	   nullptr,
 	   nullptr,
 	   nullptr,
 	   env->dpp,
@@ -2185,7 +2189,8 @@ TEST_F(POSIXVerObjectTest, DeleteCurVersion)
   EXPECT_TRUE(sf::is_regular_file(op2));
   EXPECT_TRUE(sf::exists(op3));
   EXPECT_TRUE(sf::is_regular_file(op3));
-  EXPECT_FALSE(sf::exists(ops));
+  // a temporary 0 byte file exists to represent a delete marker
+  EXPECT_TRUE(sf::exists(ops));
   EXPECT_TRUE(sf::is_symlink(ops));
   /* Need to find a way to get the correct version */
   //EXPECT_EQ(sf::read_symlink(ops), dfname);
@@ -2298,6 +2303,7 @@ TEST_F(POSIXVerObjectTest, ObjectCopy)
 	   &tag,
 	   nullptr,
 	   nullptr,
+	   nullptr,
 	   env->dpp,
 	   null_yield);
   EXPECT_EQ(ret, 0);
@@ -2373,6 +2379,7 @@ TEST_F(POSIXVerObjectTest, CopyVersion)
 	   nullptr,
 	   &tag, /* use req_id as tag */
 	   &tag,
+	   nullptr,
 	   nullptr,
 	   nullptr,
 	   env->dpp,

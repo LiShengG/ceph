@@ -1,5 +1,5 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab ft=cpp
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab ft=cpp
 
 /*
  * Ceph - scalable distributed file system
@@ -443,6 +443,55 @@ TEST_F(CmpOmap, cmp_set_vals_str)
     EXPECT_EQ(value2, vals["gte"]);
     EXPECT_EQ(value1, vals["lt"]);
     EXPECT_EQ(value1, vals["lte"]);
+  }
+}
+
+TEST_F(CmpOmap, atomic_omap_set_conditional_match)
+{
+  const std::string oid = __PRETTY_FUNCTION__;
+  const bufferlist value1 = u64_buffer(1);
+  const bufferlist value2 = u64_buffer(42);
+  {
+    std::map<std::string, bufferlist> vals = {
+      {"eq", value1},
+    };
+    ASSERT_EQ(ioctx.omap_set(oid, vals), 0);
+  }
+
+  librados::ObjectWriteOperation op;
+  ASSERT_EQ(cmp_vals(op, Mode::U64, Op::EQ, {{"eq", value1}}, std::nullopt), 0);
+  op.omap_set({{"eq", value2}});
+  ASSERT_EQ(ioctx.operate(oid, &op), 0);
+  {
+    std::map<std::string, bufferlist> vals;
+    ASSERT_EQ(get_vals(oid, &vals), 0);
+    ASSERT_EQ(vals.size(), 1);
+    EXPECT_EQ(value2, vals["eq"]);
+  }
+}
+
+TEST_F(CmpOmap, atomic_omap_set_conditional_mismatch)
+{
+  const std::string oid = __PRETTY_FUNCTION__;
+  const bufferlist value1 = u64_buffer(1);
+  const bufferlist value2 = u64_buffer(2);
+  const bufferlist value3 = u64_buffer(42);
+  {
+    std::map<std::string, bufferlist> vals = {
+      {"eq", value1},
+    };
+    ASSERT_EQ(ioctx.omap_set(oid, vals), 0);
+  }
+
+  librados::ObjectWriteOperation op;
+  ASSERT_EQ(cmp_vals(op, Mode::U64, Op::EQ, {{"eq", value2}}, std::nullopt), 0);
+  op.omap_set({{"eq", value3}});
+  ASSERT_EQ(ioctx.operate(oid, &op), -ECANCELED);
+  {
+    std::map<std::string, bufferlist> vals;
+    ASSERT_EQ(get_vals(oid, &vals), 0);
+    ASSERT_EQ(vals.size(), 1);
+    EXPECT_EQ(value1, vals["eq"]); // Nothing is changed
   }
 }
 

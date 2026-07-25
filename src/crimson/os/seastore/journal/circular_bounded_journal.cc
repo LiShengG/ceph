@@ -1,9 +1,9 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
 
 #include <boost/iterator/counting_iterator.hpp>
 
-#include "crimson/common/errorator-loop.h"
+#include "crimson/common/errorator-utils.h"
 #include "include/intarith.h"
 #include "crimson/os/seastore/async_cleaner.h"
 #include "crimson/os/seastore/journal/circular_bounded_journal.h"
@@ -15,10 +15,12 @@ SET_SUBSYS(seastore_journal);
 namespace crimson::os::seastore::journal {
 
 CircularBoundedJournal::CircularBoundedJournal(
+    store_index_t store_index,
     JournalTrimmer &trimmer,
     RBMDevice* device,
     const std::string &path)
-  : trimmer(trimmer), path(path),
+  : store_index(store_index),
+    trimmer(trimmer), path(path),
   cjs(device),
   record_submitter(crimson::common::get_conf<uint64_t>(
       "seastore_journal_iodepth_limit"),
@@ -29,12 +31,14 @@ CircularBoundedJournal::CircularBoundedJournal(
     crimson::common::get_conf<double>(
       "seastore_journal_batch_preferred_fullness"),
     cjs)
-  {}
+{
+  register_metrics();
+}
 
 CircularBoundedJournal::open_for_mkfs_ret
 CircularBoundedJournal::open_for_mkfs()
 {
-  return record_submitter.open(true
+  return record_submitter.open(store_index, true
   ).safe_then([this](auto ret) {
     return open_for_mkfs_ret(
       open_for_mkfs_ertr::ready_future_marker{},
@@ -45,7 +49,7 @@ CircularBoundedJournal::open_for_mkfs()
 CircularBoundedJournal::open_for_mount_ret
 CircularBoundedJournal::open_for_mount()
 {
-  return record_submitter.open(false
+  return record_submitter.open(store_index, false
   ).safe_then([this](auto ret) {
     return open_for_mount_ret(
       open_for_mount_ertr::ready_future_marker{},
@@ -68,43 +72,46 @@ CircularBoundedJournal::submit_record(
   LOG_PREFIX(CircularBoundedJournal::submit_record);
   DEBUG("H{} {} start ...", (void*)&handle, record);
   assert(write_pipeline);
-  return do_submit_record(
-    std::move(record), handle, std::move(on_submission)
-  ).safe_then([this, t_src] {
-    if (is_trim_transaction(t_src)) {
-      return update_journal_tail(
-	trimmer.get_dirty_tail(),
-	trimmer.get_alloc_tail());
-    } else {
-      return seastar::now();
-    }
-  });
-}
 
-CircularBoundedJournal::submit_record_ertr::future<>
-CircularBoundedJournal::do_submit_record(
-  record_t &&record,
-  OrderingHandle &handle,
-  on_submission_func_t &&on_submission)
-{
-  LOG_PREFIX(CircularBoundedJournal::do_submit_record);
-  if (!record_submitter.is_available()) {
-    DEBUG("H{} wait ...", (void*)&handle);
-    return record_submitter.wait_available(
-    ).safe_then([this, record=std::move(record), &handle,
-		 on_submission=std::move(on_submission)]() mutable {
-      return do_submit_record(
-	std::move(record), handle, std::move(on_submission));
-    });
-  }
-  auto action = record_submitter.check_action(record.size);
-  if (action == RecordSubmitter::action_t::ROLL) {
-    return record_submitter.roll_segment(
-    ).safe_then([this, record=std::move(record), &handle,
-		 on_submission=std::move(on_submission)]() mutable {
-      return do_submit_record(
-	std::move(record), handle, std::move(on_submission));
-    });
+  stats.submit_record_count++;
+  stats.submit_record_size += record.size.get_raw_mdlength();
+  auto start = ceph::mono_clock::now();
+
+  RecordSubmitter::action_t action;
+  bool waited = false;
+  bool rolled = false;
+  while (true) {
+    if (!record_submitter.is_available()) {
+      DEBUG("H{} wait ...", (void*)&handle);
+
+      auto wait_start = ceph::mono_clock::now();
+
+      co_await record_submitter.wait_available();
+
+      if (!waited) {
+	stats.submit_record_wait_count++;
+	waited = true;
+      }
+      stats.submit_record_wait_latency_total +=
+	ceph::mono_clock::now() - wait_start;
+      continue;
+    }
+    action = record_submitter.check_action(record.size);
+    if (action == RecordSubmitter::action_t::ROLL) {
+
+      auto roll_start = ceph::mono_clock::now();
+
+      co_await record_submitter.roll_segment();
+
+      if (!rolled) {
+	stats.submit_record_roll_count++;
+	rolled = true;
+      }
+      stats.submit_record_roll_latency_total +=
+	ceph::mono_clock::now() - roll_start;
+      continue;
+    }
+    break;
   }
 
   DEBUG("H{} submit {} ...",
@@ -113,21 +120,24 @@ CircularBoundedJournal::do_submit_record(
 	"FULL" : "NOT_FULL");
   auto submit_ret = record_submitter.submit(std::move(record));
   // submit_ret.record_base_regardless_md is wrong for journaling
-  return handle.enter(write_pipeline->device_submission
-  ).then([submit_fut=std::move(submit_ret.future)]() mutable {
-    return std::move(submit_fut);
-  }).safe_then([FNAME, this, &handle, on_submission=std::move(on_submission)
-	       ](record_locator_t result) mutable {
-    return handle.enter(write_pipeline->finalize
-    ).then([FNAME, this, result, &handle,
-	    on_submission=std::move(on_submission)] {
-      DEBUG("H{} finish with {}", (void*)&handle, result);
-      auto new_committed_to = result.write_result.get_end_seq();
-      record_submitter.update_committed_to(new_committed_to);
-      std::invoke(on_submission, result);
-      return seastar::now();
-    });
-  });
+  co_await handle.enter(write_pipeline->device_submission);
+
+  record_locator_t result = co_await std::move(submit_ret.future);
+
+  co_await handle.enter(write_pipeline->finalize);
+
+  DEBUG("H{} finish with {}", (void*)&handle, result);
+  auto new_committed_to = result.write_result.get_end_seq();
+  record_submitter.update_committed_to(new_committed_to);
+  std::invoke(on_submission, result);
+
+  stats.submit_record_latency_total += ceph::mono_clock::now() - start;
+
+  if (is_trim_transaction(t_src)) {
+    co_await update_journal_tail(
+      trimmer.get_dirty_tail(),
+      trimmer.get_alloc_tail());
+  }
 }
 
 Journal::replay_ret CircularBoundedJournal::replay_segment(
@@ -212,9 +222,9 @@ Journal::replay_ret CircularBoundedJournal::replay_segment(
         dhandler
       ).handle_error(
         replay_ertr::pass_further{},
-        crimson::ct_error::assert_all{
+        crimson::ct_error::assert_all(
           "shouldn't meet with any other error other replay_ertr"
-        }
+        )
       );
     }
   );
@@ -322,94 +332,176 @@ Journal::replay_ret CircularBoundedJournal::replay(
   /*
    * read records from last applied record prior to written_to, and replay
    */
+  auto d_handler = std::move(delta_handler);
   LOG_PREFIX(CircularBoundedJournal::replay);
-  return cjs.read_header(
-  ).handle_error(
+  auto p = co_await cjs.read_header().handle_error(
     open_for_mount_ertr::pass_further{},
-    crimson::ct_error::assert_all{
-      "Invalid error read_header"
-  }).safe_then([this, FNAME, delta_handler=std::move(delta_handler)](auto p)
-    mutable {
-    auto &[head, bl] = *p;
-    cjs.set_cbj_header(head);
-    DEBUG("header : {}", cjs.get_cbj_header());
-    cjs.set_initialized(true);
-    return seastar::do_with(
-      std::move(delta_handler),
-      std::map<paddr_t, journal_seq_t>(),
-      std::map<paddr_t, std::pair<CachedExtentRef, uint32_t>>(),
-      [this](auto &d_handler, auto &map, auto &crc_info) {
-      auto build_paddr_seq_map = [&map](
-        const auto &offsets,
-        const auto &e,
-	sea_time_point modify_time)
-      {
-	if (e.type == extent_types_t::ALLOC_INFO) {
-	  alloc_delta_t alloc_delta;
-	  decode(alloc_delta, e.bl);
-	  if (alloc_delta.op == alloc_delta_t::op_types_t::CLEAR) {
-	    for (auto &alloc_blk : alloc_delta.alloc_blk_ranges) {
-	      map[alloc_blk.paddr] = offsets.write_result.start_seq;
-	    }
-	  }
-	}
-	return replay_ertr::make_ready_future<bool>(true);
-      };
-      auto tail = get_dirty_tail() <= get_alloc_tail() ?
-	get_dirty_tail() : get_alloc_tail();
-      set_written_to(tail);
-      // The first pass to build the paddr->journal_seq_t map 
-      // from extent allocations
-      return scan_valid_record_delta(std::move(build_paddr_seq_map), tail
-      ).safe_then([this, &map, &d_handler, tail, &crc_info]() {
-	auto call_d_handler_if_valid = [this, &map, &d_handler, &crc_info](
-	  const auto &offsets,
-	  const auto &e,
-	  sea_time_point modify_time)
-	{
-	  if (map.find(e.paddr) == map.end() ||
-	      map[e.paddr] <= offsets.write_result.start_seq) {
-	    return d_handler(
-	      offsets,
-	      e,
-	      get_dirty_tail(),
-	      get_alloc_tail(),
-	      modify_time
-	    ).safe_then([&e, &crc_info](auto ret) {
-	      auto [applied, ext] = ret;
-	      if (applied && ext && can_inplace_rewrite(
-		  ext->get_type())) {
-		crc_info[ext->get_paddr()] =
-		  std::make_pair(ext, e.final_crc);
-	      }
-	      return replay_ertr::make_ready_future<bool>(applied);
-	    });
-	  }
-	  return replay_ertr::make_ready_future<bool>(true);
-	};
-	// The second pass to replay deltas
-	return scan_valid_record_delta(std::move(call_d_handler_if_valid), tail
-	).safe_then([&crc_info]() {
-	  for (auto p : crc_info) {
-	    ceph_assert_always(p.second.first->get_last_committed_crc() == p.second.second);	
-	  }
-	  crc_info.clear();
-	  return replay_ertr::now();
-	});
-      });
-    }).safe_then([this]() {
-      // make sure that committed_to is JOURNAL_SEQ_NULL if jounal is the initial state
-      if (get_written_to() != 
-	  journal_seq_t{0,
-	    convert_abs_addr_to_paddr(get_records_start(),
-	    get_device_id())}) {
-	record_submitter.update_committed_to(get_written_to());
+    crimson::ct_error::assert_all("Invalid error read_header"));
+  auto &[head, bl] = *p;
+  cjs.set_cbj_header(head);
+  DEBUG("header : {}", cjs.get_cbj_header());
+  cjs.set_initialized(true);
+  std::map<paddr_t, journal_seq_t> map;
+  std::map<paddr_t, std::pair<CachedExtentRef, uint32_t>> crc_info;
+  auto tail = get_dirty_tail() <= get_alloc_tail() ?
+    get_dirty_tail() : get_alloc_tail();
+  set_written_to(tail);
+  // the first pass to find the real journal tail.
+  auto find_tail = [this](
+    const auto&,
+    const auto &e,
+    sea_time_point) {
+    if (e.type == extent_types_t::JOURNAL_TAIL) {
+      journal_tail_delta_t tails;
+      decode(tails, e.bl);
+      cjs.update_journal_tail_on_startup(
+        tails.dirty_tail, tails.alloc_tail);
+    }
+    return replay_ertr::make_ready_future<bool>(true);
+  };
+  co_await scan_valid_record_delta(std::move(find_tail), tail);
+  tail = get_dirty_tail() <= get_alloc_tail() ?
+    get_dirty_tail() : get_alloc_tail();
+  auto build_paddr_seq_map = [&map](
+    const auto &offsets,
+    const auto &e,
+    sea_time_point modify_time)
+  {
+    if (e.type == extent_types_t::ALLOC_INFO) {
+      alloc_delta_t alloc_delta;
+      decode(alloc_delta, e.bl);
+      if (alloc_delta.op == alloc_delta_t::op_types_t::CLEAR) {
+        for (auto &alloc_blk : alloc_delta.alloc_blk_ranges) {
+          map[alloc_blk.paddr] = offsets.write_result.start_seq;
+        }
       }
-      trimmer.update_journal_tails(
-	get_dirty_tail(),
-	get_alloc_tail());
-    });
-  });
+    }
+    return replay_ertr::make_ready_future<bool>(true);
+  };
+  // The second pass to build the paddr->journal_seq_t map
+  // from extent allocations
+  co_await scan_valid_record_delta(std::move(build_paddr_seq_map), tail);
+  auto call_d_handler_if_valid = [this, &map, &d_handler, &crc_info](
+    const auto &offsets,
+    const auto &e,
+    sea_time_point modify_time)
+  {
+    if (map.find(e.paddr) == map.end() ||
+        map[e.paddr] <= offsets.write_result.start_seq) {
+      return d_handler(
+        offsets,
+        e,
+        get_dirty_tail(),
+        get_alloc_tail(),
+        modify_time
+      ).safe_then([&e, &crc_info](auto ret) {
+        auto [applied, ext] = ret;
+        if (applied && ext && can_inplace_rewrite(
+            ext->get_type())) {
+          crc_info[ext->get_paddr()] =
+            std::make_pair(ext, e.final_crc);
+        }
+        return replay_ertr::make_ready_future<bool>(applied);
+      });
+    }
+    return replay_ertr::make_ready_future<bool>(true);
+  };
+  // The third pass to replay deltas
+  co_await scan_valid_record_delta(std::move(call_d_handler_if_valid), tail);
+  for (auto p : crc_info) {
+    ceph_assert_always(p.second.first->get_last_committed_crc() == p.second.second);	
+  }
+  crc_info.clear();
+  // make sure that committed_to is JOURNAL_SEQ_NULL if jounal is the initial state
+  if (get_written_to() != 
+      journal_seq_t{0,
+        convert_abs_addr_to_paddr(get_records_start(),
+        get_device_id())}) {
+    record_submitter.update_committed_to(get_written_to());
+  }
+  trimmer.update_journal_tails(
+    get_dirty_tail(),
+    get_alloc_tail());
+}
+
+void CircularBoundedJournal::register_metrics()
+{
+  namespace sm = seastar::metrics;
+  metrics.add_group(
+    "seastore_cbj",
+    {
+      sm::make_gauge(
+	"submit_record_count",
+	[this] {
+	  return stats.submit_record_count;
+	}
+      ),
+      sm::make_gauge(
+	"submit_record_size",
+	[this] {
+	  return stats.submit_record_size;
+	}
+      ),
+      sm::make_gauge(
+	"submit_record_latency_total",
+	[this] {
+	  return stats.submit_record_latency_total.count();
+	}
+      ),
+      sm::make_gauge(
+	"submit_record_latency_average",
+	[this] {
+	  return stats.submit_record_latency_total.count() /
+	    stats.submit_record_count;
+	}
+      ),
+      sm::make_gauge(
+	"submit_record_size_average",
+	[this] {
+	  return stats.submit_record_size /
+	    stats.submit_record_count;
+	}
+      ),
+      sm::make_gauge(
+	"submit_record_roll_count",
+	[this] {
+	  return stats.submit_record_roll_count;
+	}
+      ),
+      sm::make_gauge(
+	"submit_record_roll_latency_total",
+	[this] {
+	  return stats.submit_record_roll_latency_total.count();
+	}
+      ),
+      sm::make_gauge(
+	"submit_record_roll_latency_average",
+	[this] {
+	  return stats.submit_record_roll_latency_total.count() /
+	    stats.submit_record_roll_count;
+	}
+      ),
+      sm::make_gauge(
+	"submit_record_wait_count",
+	[this] {
+	  return stats.submit_record_wait_count;
+	}
+      ),
+      sm::make_gauge(
+	"submit_record_wait_latency_total",
+	[this] {
+	  return stats.submit_record_wait_latency_total.count();
+	}
+      ),
+      sm::make_gauge(
+	"submit_record_wait_latency_average",
+	[this] {
+	  return stats.submit_record_wait_latency_total.count() /
+	    stats.submit_record_wait_count;
+	}
+      )
+    }
+  );
 }
 
 }

@@ -11,8 +11,16 @@ try:
     from importlib.metadata import entry_points
 
     def get_entry_points(group: str):  # type: ignore
-        return entry_points().get(group, [])  # type: ignore
+        eps = entry_points()
+        if hasattr(eps, 'select'):
+            # New importlib.metadata uses .select()
+            return eps.select(group=group)
+        else:
+            # Fallback to older EntryPoints that returns dicts
+            return eps.get(group, [])  # type: ignore
+
 except ImportError:
+    # Fallback to `pkg_resources` for older versions
     from pkg_resources import iter_entry_points as entry_points  # type: ignore
 
     def get_entry_points(group: str):  # type: ignore
@@ -160,7 +168,7 @@ Ceph Conf: {ceph_path}
             # we warn only here, because it is possible that the configuration
             # file is not needed, or that it will be loaded by some other means
             # (like reading from lvm tags)
-            logger.warning('ignoring inability to load ceph.conf', exc_info=1)
+            logger.warning('ignoring inability to load ceph.conf')
             terminal.yellow(error)
         # dispatch to sub-commands
         terminal.dispatch(self.mapper, subcommand_args)

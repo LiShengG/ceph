@@ -20,7 +20,8 @@ import { RoleFormModel } from './role-form.model';
 @Component({
   selector: 'cd-role-form',
   templateUrl: './role-form.component.html',
-  styleUrls: ['./role-form.component.scss']
+  styleUrls: ['./role-form.component.scss'],
+  standalone: false
 })
 export class RoleFormComponent extends CdForm implements OnInit {
   roleForm: CdFormGroup;
@@ -36,6 +37,7 @@ export class RoleFormComponent extends CdForm implements OnInit {
 
   action: string;
   resource: string;
+  submitAction: string;
 
   constructor(
     private route: ActivatedRoute,
@@ -97,8 +99,10 @@ export class RoleFormComponent extends CdForm implements OnInit {
     if (this.router.url.startsWith('/user-management/roles/edit')) {
       this.mode = this.roleFormMode.editing;
       this.action = this.actionLabels.EDIT;
+      this.submitAction = this.actionLabels.SAVE_CHANGES;
     } else {
       this.action = this.actionLabels.CREATE;
+      this.submitAction = `${this.action} ${_.upperFirst(this.resource)}`;
     }
     if (this.mode === this.roleFormMode.editing) {
       this.initEdit();

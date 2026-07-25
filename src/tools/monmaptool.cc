@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*- 
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*- 
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph - scalable distributed file system
  *
@@ -14,11 +15,15 @@
 #include <string>
 
 #include "common/ceph_argparse.h"
+#include "common/Clock.h" // for ceph_clock_now()
 #include "common/errno.h"
+#include "common/strtol.h"
 
+#include "global/global_context.h"
 #include "global/global_init.h"
 #include "include/str_list.h"
 #include "mon/MonMap.h"
+#include "mon/mon_types.h" // for ceph::features::mon::*
 
 using std::cerr;
 using std::cout;
@@ -358,7 +363,7 @@ int main(int argc, const char **argv)
     monmap.strategy = static_cast<MonMap::election_strategy>(
 		  g_conf().get_val<uint64_t>("mon_election_default_strategy"));
     if (min_mon_release == ceph_release_t::unknown) {
-      min_mon_release = ceph_release_t::quincy;
+      min_mon_release = ceph_release_t::umbrella;
     }
     // TODO: why do we not use build_initial in our normal path here!?!?!
     modified = true;

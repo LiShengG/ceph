@@ -2,21 +2,24 @@ from __future__ import print_function
 import argparse
 import logging
 from textwrap import dedent
-from ceph_volume import objectstore
+from ceph_volume import objectstore, terminal
+from typing import List, Optional
 
 
 logger = logging.getLogger(__name__)
-
+mlogger = terminal.MultiLogger(__name__)
 
 class Activate(object):
     help = 'Discover and mount the LVM device associated with an OSD ID and start the Ceph OSD'
 
-    def __init__(self, argv, args=None):
-        self.objectstore = None
+    def __init__(self,
+                 argv: Optional[List[str]] = None,
+                 args: Optional[argparse.Namespace] = None) -> None:
+        self.objectstore: Optional[objectstore.baseobjectstore.BaseObjectStore] = None
         self.argv = argv
         self.args = args
 
-    def main(self):
+    def main(self) -> None:
         sub_command_help = dedent("""
         Activate OSDs by discovering them with LVM and mounting them in their
         appropriate destination:
@@ -85,6 +88,16 @@ class Activate(object):
             action='store_true',
             help='Do not use a tmpfs mount for OSD data dir'
         )
+        parser.add_argument(
+            '--osd-type',
+            dest='osd_type',
+            help='The Ceph OSD type to use.',
+            default='classic',
+            choices=['classic', 'crimson'],
+            type=str,
+        )
+        if self.argv is None:
+            self.argv = []
         if len(self.argv) == 0 and self.args is None:
             print(sub_command_help)
             return
@@ -93,7 +106,11 @@ class Activate(object):
         if self.args.bluestore:
             self.args.objectstore = 'bluestore'
         self.objectstore = objectstore.mapping['LVM'][self.args.objectstore](args=self.args)
-        if self.args.activate_all:
-            self.objectstore.activate_all()
+        if self.objectstore is not None:
+            if self.args.activate_all:
+                self.objectstore.activate_all()
+            else:
+                self.objectstore.activate()
         else:
-            self.objectstore.activate()
+            mlogger.error('Unexpected error while setting objectstore backend.')
+            return

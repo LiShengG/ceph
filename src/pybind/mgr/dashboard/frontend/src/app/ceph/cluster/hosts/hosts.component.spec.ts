@@ -4,7 +4,6 @@ import { ComponentFixture, TestBed } from '@angular/core/testing';
 import { BrowserAnimationsModule } from '@angular/platform-browser/animations';
 import { RouterTestingModule } from '@angular/router/testing';
 
-import { ToastrModule } from 'ngx-toastr';
 import { of } from 'rxjs';
 
 import { CephModule } from '~/app/ceph/ceph.module';
@@ -12,6 +11,7 @@ import { CephSharedModule } from '~/app/ceph/shared/ceph-shared.module';
 import { CoreModule } from '~/app/core/core.module';
 import { HostService } from '~/app/shared/api/host.service';
 import { OrchestratorService } from '~/app/shared/api/orchestrator.service';
+import { ModalCdsService } from '~/app/shared/services/modal-cds.service';
 import { TableActionsComponent } from '~/app/shared/datatable/table-actions/table-actions.component';
 import { CdTableFetchDataContext } from '~/app/shared/models/cd-table-fetch-data-context';
 import { CdTableSelection } from '~/app/shared/models/cd-table-selection';
@@ -25,6 +25,7 @@ import {
   TableActionHelper
 } from '~/testing/unit-test-helper';
 import { HostsComponent } from './hosts.component';
+import { TagModule } from 'carbon-components-angular';
 
 class MockShowForceMaintenanceModal {
   showModal = false;
@@ -61,9 +62,9 @@ describe('HostsComponent', () => {
       SharedModule,
       HttpClientTestingModule,
       RouterTestingModule,
-      ToastrModule.forRoot(),
       CephModule,
-      CoreModule
+      CoreModule,
+      TagModule
     ],
     providers: [
       { provide: AuthStorageService, useValue: fakeAuthStorageService },
@@ -120,46 +121,6 @@ describe('HostsComponent', () => {
       'table > tbody > tr > td > span'
     );
     expect(spans[0].textContent.trim()).toBe(hostname);
-  });
-
-  it('should show the exact count of the repeating daemons', () => {
-    const hostname = 'ceph.dev';
-    const payload = [
-      {
-        service_instances: [
-          {
-            type: 'mgr',
-            count: 2
-          },
-          {
-            type: 'osd',
-            count: 3
-          },
-          {
-            type: 'rgw',
-            count: 1
-          }
-        ],
-        hostname: hostname,
-        labels: ['foo', 'bar'],
-        headers: headers
-      }
-    ];
-
-    OrchestratorHelper.mockStatus(false);
-    fixture.detectChanges();
-    hostListSpy.and.callFake(() => of(payload));
-    fixture.detectChanges();
-
-    component.getHosts(new CdTableFetchDataContext(() => undefined));
-    fixture.detectChanges();
-
-    const spans = fixture.debugElement.nativeElement.querySelectorAll(
-      '[cdstabledata] span span.badge.badge-background-primary'
-    );
-    expect(spans[0].textContent).toContain('mgr: 2');
-    expect(spans[1].textContent).toContain('osd: 3');
-    expect(spans[2].textContent).toContain('rgw: 1');
   });
 
   it('should test if host facts are transformed correctly if orch available', () => {
@@ -279,8 +240,8 @@ describe('HostsComponent', () => {
     fixture.detectChanges();
 
     component.getHosts(new CdTableFetchDataContext(() => undefined));
-    expect(component.hosts[0]['memory_total_bytes']).toEqual('N/A');
-    expect(component.hosts[0]['raw_capacity']).toEqual('N/A');
+    expect(component.hosts[0]['memory_total_bytes']).toEqual('-');
+    expect(component.hosts[0]['raw_capacity']).toEqual('-');
   });
 
   it('should show force maintenance modal when it is safe to stop host', () => {
@@ -312,6 +273,21 @@ describe('HostsComponent', () => {
     const errorMsg = 'unsafe to stop osd.0 because of some unknown reason';
     showForceMaintenanceModal.showModalDialog(errorMsg);
     expect(showForceMaintenanceModal.showModal).toBeFalsy();
+  });
+
+  it('should set host edit modal submit label to Save changes', () => {
+    const hostService = TestBed.inject(HostService);
+    const modalService = TestBed.inject(ModalCdsService);
+    spyOn(hostService, 'getLabels').and.returnValue(of([]));
+    const showSpy = spyOn(modalService, 'show').and.stub();
+
+    component.selection = new CdTableSelection();
+    component.selection.selected = [{ hostname: 'host-test', labels: [] }];
+
+    component.editAction();
+
+    expect(showSpy).toHaveBeenCalled();
+    expect(showSpy.calls.mostRecent().args[1].submitButtonText).toBe('Save changes');
   });
 
   describe('table actions', () => {

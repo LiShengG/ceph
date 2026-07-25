@@ -1,5 +1,5 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab ft=cpp
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab ft=cpp
 
 #include <string.h>
 
@@ -8,7 +8,7 @@
 
 #include "include/types.h"
 
-#include "rgw_user.h"
+#include "driver/rados/rgw_user.h"
 #include "rgw_lc_s3.h"
 
 
@@ -255,6 +255,8 @@ void LCRule_S3::decode_xml(XMLObj *obj)
     if (!RGWXMLDecoder::decode_xml("Prefix", prefix, obj)) {
       throw RGWXMLDecoder::err("missing Prefix in Filter");
     }
+  } else {
+    filter_s3.set_flag(LCFlagType::Filter);
   }
   filter = (LCFilter)filter_s3;
 

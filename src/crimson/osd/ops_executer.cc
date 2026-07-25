@@ -1,5 +1,5 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
 
 #include "ops_executer.h"
 
@@ -31,6 +31,15 @@ namespace {
 }
 
 namespace crimson::osd {
+
+// workaround for clang 19
+// when a .cc file includes ops_executer.h but doesn't include the pg.h,
+// it seems that clang++-19 can't retrieve the type hierarchy of PG, so
+// that the destructor of boost::intrusive_ptr<PG> could not find the hidden
+// friend of intrusive_ptr_release.
+// Moving the destructor invocation of intrusive_ptr to this file could
+// solve this issue.
+OpsExecuter::~OpsExecuter() {}
 
 OpsExecuter::call_ierrorator::future<> OpsExecuter::do_op_call(OSDOp& osd_op)
 {
@@ -69,15 +78,10 @@ OpsExecuter::call_ierrorator::future<> OpsExecuter::do_op_call(OSDOp& osd_op)
   }
 
   const auto flags = method->get_flags();
-  if (!obc->obs.exists && (flags & CLS_METHOD_WR) == 0) {
-    return crimson::ct_error::enoent::make();
-  }
 
-#if 0
   if (flags & CLS_METHOD_WR) {
-    ctx->user_modify = true;
+    check_init_op_params(modified_by::user);
   }
-#endif
 
   logger().debug("calling method {}.{}, num_read={}, num_write={}",
                  cname, mname, num_read, num_write);
@@ -463,12 +467,29 @@ auto OpsExecuter::do_const_op(Func&& f) {
   return std::forward<Func>(f)(pg->get_backend(), std::as_const(obc->obs));
 }
 
+template <class Func>
+auto OpsExecuter::do_read_attr_cache(Func&& f) {
+  ++num_read;
+  // TODO: pass backend as read-only
+  return std::invoke(
+    std::forward<Func>(f),
+    pg->get_backend(),
+    std::as_const(obc->attr_cache),
+    std::as_const(obc->obs));
+}
+
 // Defined here because there is a circular dependency between OpsExecuter and PG
 template <class Func>
 auto OpsExecuter::do_write_op(Func&& f, OpsExecuter::modified_by m) {
   ++num_write;
   check_init_op_params(m);
   return std::forward<Func>(f)(pg->get_backend(), obc->obs, txn);
+}
+template <class Func>
+auto OpsExecuter::do_write_op_attr_cache(Func&& f, OpsExecuter::modified_by m) {
+  ++num_write;
+  check_init_op_params(m);
+  return std::forward<Func>(f)(pg->get_backend(), obc->obs, txn, obc->attr_cache);
 }
 OpsExecuter::call_errorator::future<> OpsExecuter::do_assert_ver(
   OSDOp& osd_op,
@@ -608,20 +629,24 @@ OpsExecuter::do_execute_op(OSDOp& osd_op)
       return backend.cmp_ext(os, osd_op);
     });
   case CEPH_OSD_OP_GETXATTR:
-    return do_read_op([this, &osd_op](auto& backend, const auto& os) {
-      return backend.getxattr(os, osd_op, delta_stats);
+    return do_read_attr_cache([this, &osd_op](auto& backend,
+					      const auto& attr_cache,
+					      const auto& os) {
+      return backend.getxattr(os, attr_cache, osd_op, delta_stats);
     });
   case CEPH_OSD_OP_GETXATTRS:
-    return do_read_op([this, &osd_op](auto& backend, const auto& os) {
-      return backend.get_xattrs(os, osd_op, delta_stats);
+    return do_read_attr_cache([this, &osd_op](auto& backend,
+					      const auto& attr_cache,
+					      const auto& os) {
+      return backend.get_xattrs(os, attr_cache, osd_op, delta_stats);
     });
   case CEPH_OSD_OP_CMPXATTR:
     return do_read_op([this, &osd_op](auto& backend, const auto& os) {
       return backend.cmp_xattr(os, osd_op, delta_stats);
     });
   case CEPH_OSD_OP_RMXATTR:
-    return do_write_op([&osd_op](auto& backend, auto& os, auto& txn) {
-      return backend.rm_xattr(os, osd_op, txn);
+    return do_write_op_attr_cache([&osd_op](auto& backend, auto& os, auto& txn, auto& attr_cache) {
+      return backend.rm_xattr(os, osd_op, txn, attr_cache);
     });
   case CEPH_OSD_OP_CREATE:
     return do_write_op([this, &osd_op](auto& backend, auto& os, auto& txn) {
@@ -666,8 +691,8 @@ OpsExecuter::do_execute_op(OSDOp& osd_op)
       return backend.set_allochint(os, osd_op, txn, delta_stats);
     });
   case CEPH_OSD_OP_SETXATTR:
-    return do_write_op([this, &osd_op](auto& backend, auto& os, auto& txn) {
-      return backend.setxattr(os, osd_op, txn, delta_stats);
+    return do_write_op_attr_cache([this, &osd_op](auto& backend, auto& os, auto& txn, auto& attr_cache) {
+      return backend.setxattr(os, osd_op, txn, delta_stats, attr_cache);
     });
   case CEPH_OSD_OP_DELETE:
   {
@@ -781,8 +806,8 @@ OpsExecuter::do_execute_op(OSDOp& osd_op)
     if (!pg.get_pgpool().info.supports_omap()) {
       return crimson::ct_error::operation_not_supported::make();
     }*/
-    return do_write_op([&osd_op](auto& backend, auto& os, auto& txn) {
-      return backend.omap_remove_key(os, osd_op, txn);
+    return do_write_op([&osd_op, this](auto& backend, auto& os, auto& txn) {
+      return backend.omap_remove_key(os, osd_op, txn, *osd_op_params, delta_stats);
     });
   case CEPH_OSD_OP_OMAPCLEAR:
     return do_write_op([this, &osd_op](auto& backend, auto& os, auto& txn) {
@@ -858,19 +883,9 @@ OpsExecuter::flush_changes_and_submit(
     if (auto log_rit = log_entries.rbegin(); log_rit != log_entries.rend()) {
       ceph_assert(log_rit->version == osd_op_params->at_version);
     }
-
-    /*
-     * This works around the gcc bug causing the generated code to incorrectly
-     * execute unconditionally before the predicate.
-     *
-     * https://gcc.gnu.org/bugzilla/show_bug.cgi?id=101244
-     */
-    auto clone_obc = cloning_ctx
-      ? std::move(cloning_ctx->clone_obc)
-      : nullptr;
     auto [_submitted, _all_completed] = co_await pg->submit_transaction(
       std::move(obc),
-      std::move(clone_obc),
+      cloning_ctx ? std::move(cloning_ctx->clone_obc) : nullptr,
       std::move(txn),
       std::move(*osd_op_params),
       std::move(log_entries)
@@ -904,6 +919,7 @@ pg_log_entry_t OpsExecuter::prepare_head_update(
 {
   LOG_PREFIX(OpsExecuter::prepare_head_update);
   assert(obc->obs.oi.soid.snap >= CEPH_MAXSNAP);
+  assert(obc->obs.oi.soid.is_head());
 
   update_clone_overlap();
   if (cloning_ctx) {
@@ -912,7 +928,6 @@ pg_log_entry_t OpsExecuter::prepare_head_update(
   if (snapc.seq > obc->ssc->snapset.seq) {
      // update snapset with latest snap context
      obc->ssc->snapset.seq = snapc.seq;
-     obc->ssc->snapset.snaps.clear();
   }
 
   pg_log_entry_t ret{
@@ -1090,6 +1105,8 @@ ObjectContextRef OpsExecuter::prepare_clone(
   clone_obs.oi.copy_user_bits(initial_obs.oi);
   clone_obs.oi.clear_flag(object_info_t::FLAG_WHITEOUT);
 
+  osd_op_params->at_version.version++;
+
   auto [clone_obc, existed] = pg->obc_registry.get_cached_obc(std::move(coid));
   ceph_assert(!existed);
 
@@ -1103,17 +1120,18 @@ void OpsExecuter::apply_stats()
   pg->apply_stats(get_target(), delta_stats);
 }
 
-OpsExecuter::OpsExecuter(Ref<PG> pg,
+OpsExecuter::OpsExecuter(Ref<PG> _pg,
                          ObjectContextRef _obc,
                          const OpInfo& op_info,
                          abstracted_msg_t&& msg,
                          crimson::net::ConnectionXcoreRef conn,
                          const SnapContext& _snapc)
-  : pg(std::move(pg)),
+  : pg(std::move(_pg)),
     obc(std::move(_obc)),
     op_info(op_info),
     msg(std::move(msg)),
     conn(conn),
+    txn(pg->min_peer_features()),
     snapc(_snapc)
 {
   if (op_info.may_write() && should_clone(*obc, snapc)) {
@@ -1190,7 +1208,7 @@ static PG::interruptible_future<hobject_t> pgls_filter(
   const PGBackend& backend,
   const hobject_t& sobj)
 {
-  if (const auto xattr = filter.get_xattr(); !xattr.empty()) {
+  if (std::string xattr = filter.get_xattr(); !xattr.empty()) {
     logger().debug("pgls_filter: filter is interested in xattr={} for obj={}",
                    xattr, sobj);
     return backend.getxattr(sobj, std::move(xattr)).safe_then_interruptible(
@@ -1415,8 +1433,8 @@ static PG::interruptible_future<ceph::bufferlist> do_pgls_common(
           }),
         seastar::make_ready_future<hobject_t>(next));
     }).then_interruptible([pg_end](auto&& ret) {
-      auto entries = std::move(std::get<0>(ret).get());
-      auto next = std::move(std::get<1>(ret).get());
+      auto entries = std::get<0>(ret).get();
+      auto next = std::get<1>(std::move(ret)).get();
       pg_ls_response_t response;
       response.handle = next.is_max() ? pg_end : next;
       response.entries = std::move(entries);

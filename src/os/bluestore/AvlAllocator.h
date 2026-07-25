@@ -1,5 +1,5 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
 
 #pragma once
 
@@ -7,6 +7,7 @@
 #include <boost/intrusive/avl_set.hpp>
 
 #include "Allocator.h"
+#include "AllocatorBase.h"
 #include "os/bluestore/bluestore_types.h"
 #include "include/mempool.h"
 
@@ -49,7 +50,7 @@ struct range_seg_t {
   boost::intrusive::avl_set_member_hook<> size_hook;
 };
 
-class AvlAllocator : public Allocator {
+class AvlAllocator : public AllocatorBase, public AllocatorPerf {
   struct dispose_rs {
     void operator()(range_seg_t* p)
     {
@@ -108,6 +109,7 @@ private:
   int _allocate(
     uint64_t size,
     uint64_t unit,
+    int64_t  hint,
     uint64_t *offset,
     uint64_t *length);
 

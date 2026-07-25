@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*- 
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*- 
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph distributed storage system
  *
@@ -23,6 +24,9 @@
 #include "global/global_context.h"
 #include "common/config_proxy.h"
 #include "gtest/gtest.h"
+
+// FIXME: Clay is not yet supported in new EC.
+IGNORE_DEPRECATED
 
 using namespace std;
 
@@ -584,6 +588,8 @@ TEST(ErasureCodeClay, create_rule)
     EXPECT_EQ("unknown type WORSE", ss.str());
   }
 }
+
+END_IGNORE_DEPRECATED
 
 /* 
  * Local Variables:

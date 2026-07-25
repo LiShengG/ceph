@@ -1,9 +1,12 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab ft=cpp
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab ft=cpp
 
 #pragma once
 
 #include <memory>
+
+#include "rgw_auth_registry.h"
+#include "rgw_kms_cache.h"
 
 class ActiveRateLimiter;
 class OpsLogSink;
@@ -16,6 +19,9 @@ namespace rgw::auth {
   class StrategyRegistry;
 }
 namespace rgw::lua {
+  class Background;
+}
+namespace rgw::dedup {
   class Background;
 }
 namespace rgw::sal {
@@ -42,9 +48,10 @@ struct RGWProcessEnv {
   rgw::sal::Driver* driver = nullptr;
   rgw::SiteConfig* site = nullptr;
   RGWREST *rest = nullptr;
-  OpsLogSink *olog = nullptr;
+  std::unique_ptr<OpsLogSink> olog;
   std::unique_ptr<rgw::auth::StrategyRegistry> auth_registry;
   ActiveRateLimiter* ratelimiting = nullptr;
+  std::unique_ptr<rgw::kms::KMSCache> kms_cache;
 
 #ifdef WITH_ARROW_FLIGHT
   // managed by rgw:flight::FlightFrontend in rgw_flight_frontend.cc

@@ -1,9 +1,10 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
 
 #pragma once
 
 #include <seastar/core/future.hh>
+#include <seastar/core/sleep.hh>
 
 #include <boost/intrusive/list.hpp>
 #include <boost/intrusive_ptr.hpp>
@@ -14,7 +15,6 @@
 #include "crimson/osd/object_context_loader.h"
 #include "crimson/osd/osdmap_gate.h"
 #include "crimson/osd/osd_operation.h"
-#include "crimson/osd/osd_operations/client_request_common.h"
 #include "crimson/osd/pg_activation_blocker.h"
 #include "crimson/osd/pg_map.h"
 #include "crimson/osd/scrub/pg_scrubber.h"
@@ -27,21 +27,34 @@ class PG;
 class OSD;
 class ShardServices;
 
-class ClientRequest final : public PhasedOperationT<ClientRequest>,
-                            private CommonClientRequest {
+class ClientRequest final
+  : public PhasedOperationT<ClientRequest>,
+    public RemoteOperation
+{
   // Initially set to primary core, updated to pg core after with_pg()
   ShardServices *shard_services = nullptr;
-
-  crimson::net::ConnectionRef l_conn;
-  crimson::net::ConnectionXcoreRef r_conn;
 
   // must be after conn due to ConnectionPipeline's life-time
   Ref<MOSDOp> m;
   OpInfo op_info;
   seastar::promise<> on_complete;
   unsigned instance_id = 0;
+  std::chrono::time_point<std::chrono::steady_clock> begin_time;
 
 public:
+  epoch_t get_epoch_sent_at() const {
+    return m->get_map_epoch();
+  }
+
+  bool may_write() const { return op_info.may_write(); }
+  bool may_cache() const { return op_info.may_cache(); }
+  bool may_read() const { return op_info.may_read(); }
+  template <typename T>
+  T* get_req() const {
+    static_assert(std::is_same_v<T, MOSDOp>);
+    return m.get();
+  }
+
   /**
    * instance_handle_t
    *
@@ -89,8 +102,7 @@ public:
       CommonOBCPipeline::Process::BlockingEvent,
       scrub::PGScrubber::BlockingEvent,
       CommonOBCPipeline::WaitRepop::BlockingEvent,
-      CommonOBCPipeline::SendReply::BlockingEvent,
-      CompletionEvent
+      CommonOBCPipeline::SendReply::BlockingEvent
       > pg_tracking_events;
 
     template <class BlockingEventT>
@@ -216,33 +228,6 @@ public:
 
   PerShardPipeline &get_pershard_pipeline(ShardServices &);
 
-  crimson::net::Connection &get_local_connection() {
-    assert(l_conn);
-    assert(!r_conn);
-    return *l_conn;
-  };
-
-  crimson::net::Connection &get_foreign_connection() {
-    assert(r_conn);
-    assert(!l_conn);
-    return *r_conn;
-  };
-
-  crimson::net::ConnectionFFRef prepare_remote_submission() {
-    assert(l_conn);
-    assert(!r_conn);
-    auto ret = seastar::make_foreign(std::move(l_conn));
-    l_conn.reset();
-    return ret;
-  }
-
-  void finish_remote_submission(crimson::net::ConnectionFFRef conn) {
-    assert(conn);
-    assert(!l_conn);
-    assert(!r_conn);
-    r_conn = make_local_shared_foreign(std::move(conn));
-  }
-
   interruptible_future<> with_pg_process_interruptible(
     Ref<PG> pgref, const unsigned instance_id, instance_handle_t &ihref);
 
@@ -284,7 +269,7 @@ private:
       ::crimson::osd::IOInterruptCondition,
       Errorator>;
 
-  bool is_misdirected(const PG& pg) const;
+  bool is_misdirected_replica_read(const PG& pg) const;
 
   const SnapContext get_snapc(
     PG &pg,
@@ -304,6 +289,18 @@ public:
   };
 
   void put_historic() const;
+  static interruptible_future<> maybe_inject_delay() {
+    if (common::local_conf()->osd_debug_inject_dispatch_delay_probability > 0) {
+      if (rand() % 10000 <
+        common::local_conf()->osd_debug_inject_dispatch_delay_probability * 10000) {
+        auto delay_duration = std::chrono::duration<double>(
+          common::local_conf()->osd_debug_inject_dispatch_delay_duration);
+        auto a_while = std::chrono::duration_cast<std::chrono::seconds>(delay_duration);
+        return seastar::sleep(a_while);
+      }
+    }
+    return seastar::now();
+  }
 };
 
 }

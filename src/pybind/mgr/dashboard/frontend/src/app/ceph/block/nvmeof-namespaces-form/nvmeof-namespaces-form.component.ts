@@ -1,16 +1,20 @@
-import { Component, OnInit } from '@angular/core';
+import { ChangeDetectorRef, Component, OnInit } from '@angular/core';
 import { UntypedFormControl, Validators } from '@angular/forms';
-import { ActivatedRoute, Router } from '@angular/router';
-import { NgbActiveModal } from '@ng-bootstrap/ng-bootstrap';
+import { ActivatedRoute, Params, Router } from '@angular/router';
 import {
   NamespaceCreateRequest,
-  NamespaceEditRequest,
+  NamespaceInitiatorRequest,
   NvmeofService
 } from '~/app/shared/api/nvmeof.service';
 import { ActionLabelsI18n, URLVerbs } from '~/app/shared/constants/app.constants';
 import { CdFormGroup } from '~/app/shared/forms/cd-form-group';
 import { FinishedTask } from '~/app/shared/models/finished-task';
-import { NvmeofSubsystemNamespace } from '~/app/shared/models/nvmeof';
+import {
+  RadosNamespace,
+  NvmeofSubsystem,
+  NvmeofSubsystemInitiator,
+  NvmeofSubsystemNamespace
+} from '~/app/shared/models/nvmeof';
 import { Permission } from '~/app/shared/models/permissions';
 import { AuthStorageService } from '~/app/shared/services/auth-storage.service';
 import { TaskWrapperService } from '~/app/shared/services/task-wrapper.service';
@@ -18,14 +22,17 @@ import { Pool } from '../../pool/pool';
 import { PoolService } from '~/app/shared/api/pool.service';
 import { RbdService } from '~/app/shared/api/rbd.service';
 import { FormatterService } from '~/app/shared/services/formatter.service';
-import { Observable } from 'rxjs';
+import { forkJoin, Observable, of } from 'rxjs';
+import { switchMap } from 'rxjs/operators';
 import { CdValidators } from '~/app/shared/forms/cd-validators';
 import { DimlessBinaryPipe } from '~/app/shared/pipes/dimless-binary.pipe';
+import { HttpResponse } from '@angular/common/http';
 
 @Component({
   selector: 'cd-nvmeof-namespaces-form',
   templateUrl: './nvmeof-namespaces-form.component.html',
-  styleUrls: ['./nvmeof-namespaces-form.component.scss']
+  styleUrls: ['./nvmeof-namespaces-form.component.scss'],
+  standalone: false
 })
 export class NvmeofNamespacesFormComponent implements OnInit {
   action: string;
@@ -33,15 +40,25 @@ export class NvmeofNamespacesFormComponent implements OnInit {
   poolPermission: Permission;
   resource: string;
   pageURL: string;
-  edit: boolean = false;
+
+  title: string = '';
+  description: string = '';
+
   nsForm: CdFormGroup;
   subsystemNQN: string;
+  subsystems: NvmeofSubsystem[] | null = null;
   rbdPools: Array<Pool> = null;
-  units: Array<string> = ['KiB', 'MiB', 'GiB', 'TiB'];
+  rbdImages: any[] = [];
+  radosNamespaces: RadosNamespace[] | null = null;
+  initiatorCandidates: { content: string; selected: boolean }[] = [];
+
   nsid: string;
-  currentBytes: number;
-  invalidSizeError: boolean;
+
   group: string;
+  MAX_NAMESPACE_CREATE: number = 5;
+  MIN_NAMESPACE_CREATE: number = 1;
+  requiredInvalidText: string = $localize`This field is required`;
+  nsCountInvalidText: string = $localize`The namespace count should be between 1 and 5`;
 
   constructor(
     public actionLabels: ActionLabelsI18n,
@@ -52,146 +69,428 @@ export class NvmeofNamespacesFormComponent implements OnInit {
     private rbdService: RbdService,
     private router: Router,
     private route: ActivatedRoute,
-    public activeModal: NgbActiveModal,
+    private cdr: ChangeDetectorRef,
     public formatterService: FormatterService,
     public dimlessBinaryPipe: DimlessBinaryPipe
   ) {
     this.permission = this.authStorageService.getPermissions().nvmeof;
     this.poolPermission = this.authStorageService.getPermissions().pool;
     this.resource = $localize`Namespace`;
-    this.pageURL = 'block/nvmeof/subsystems';
+    this.pageURL = 'block/nvmeof/namespaces';
   }
 
   init() {
-    this.route.queryParams.subscribe((params) => {
-      this.group = params?.['group'];
-    });
     this.createForm();
     this.action = this.actionLabels.CREATE;
-    this.route.params.subscribe((params: { subsystem_nqn: string; nsid: string }) => {
-      this.subsystemNQN = params.subsystem_nqn;
-      this.nsid = params?.nsid;
-    });
-  }
+    this.title = this.action + ' ' + this.resource;
+    this.description = $localize`Namespaces define the storage volumes that subsystems present to hosts.`;
 
-  initForEdit() {
-    this.edit = true;
-    this.action = this.actionLabels.EDIT;
-    this.nvmeofService
-      .getNamespace(this.subsystemNQN, this.nsid, this.group)
-      .subscribe((res: NvmeofSubsystemNamespace) => {
-        const convertedSize = this.dimlessBinaryPipe.transform(res.rbd_image_size).split(' ');
-        this.currentBytes = res.rbd_image_size;
-        this.nsForm.get('image').setValue(res.rbd_image_name);
-        this.nsForm.get('pool').setValue(res.rbd_pool_name);
-        this.nsForm.get('unit').setValue(convertedSize[1]);
-        this.nsForm.get('image_size').setValue(convertedSize[0]);
-        this.nsForm.get('image_size').addValidators(Validators.required);
-        this.nsForm.get('image').disable();
-        this.nsForm.get('pool').disable();
-      });
+    this.route.params.subscribe((params: Params) => {
+      if (params['subsystem_nqn']) {
+        this.subsystemNQN = params['subsystem_nqn'];
+      }
+      this.nsid = params['nsid'];
+      if (params['group']) {
+        this.group = params['group'];
+      }
+      if (this.subsystemNQN && this.group) {
+        this.pageURL = `block/nvmeof/subsystems/${this.subsystemNQN}/namespaces`;
+        this.action = this.actionLabels.ADD;
+        this.title = this.action + ' ' + this.resource;
+        this.description = $localize`Create a new namespace associated with this subsystem.`;
+      }
+    });
+    this.route.queryParams.subscribe((params: Params) => {
+      if (params['group']) {
+        this.group = params['group'];
+      }
+      if (params['subsystem_nqn']) {
+        this.subsystemNQN = params['subsystem_nqn'];
+      }
+      if (this.subsystemNQN && this.group) {
+        this.pageURL = `block/nvmeof/subsystems/${this.subsystemNQN}/namespaces`;
+        this.action = this.actionLabels.ADD;
+        this.title = this.action + ' ' + this.resource;
+        this.description = $localize`Create a new namespace associated with this subsystem.`;
+      }
+    });
   }
 
   initForCreate() {
     this.poolService.getList().subscribe((resp: Pool[]) => {
       this.rbdPools = resp.filter(this.rbdService.isRBDPool);
     });
+    if (this.group) {
+      this.fetchUsedImages();
+      this.nvmeofService
+        .listSubsystems(this.group)
+        .subscribe((res: NvmeofSubsystem[] | NvmeofSubsystem) => {
+          this.subsystems = Array.isArray(res) ? res : [res];
+          this.cdr.detectChanges();
+          if (this.subsystemNQN) {
+            const selectedSubsystem = this.subsystems.find((s) => s.nqn === this.subsystemNQN);
+            if (selectedSubsystem) {
+              this.nsForm.get('subsystem').setValue(selectedSubsystem.nqn);
+            }
+          }
+        });
+    }
   }
 
   ngOnInit() {
     this.init();
-    if (this.router.url.includes('subsystems/(modal:edit')) {
-      this.initForEdit();
-    } else {
-      this.initForCreate();
+    this.initForCreate();
+    const subsystemControl = this.nsForm.get('subsystem');
+    if (subsystemControl) {
+      subsystemControl.valueChanges.subscribe((nqn: string) => {
+        this.onSubsystemChange(nqn);
+      });
     }
+  }
+
+  // Stores all RBD images fetched for the selected pool + RADOS namespace.
+  private allRbdImages: { name: string; size: number }[] = [];
+  // Maps "pool:radosNamespace" composite key to used image names.
+  private usedRbdImages: Map<string, Set<string>> = new Map();
+
+  onPoolChange(): void {
+    const pool = this.nsForm.getValue('pool');
+    if (!pool) return;
+
+    this.radosNamespaces = null;
+    this.nsForm.get('rados_namespace').setValue(null, { emitEvent: false });
+
+    this.rbdService.listNamespaces(pool).subscribe({
+      next: (namespaces) => {
+        this.radosNamespaces = namespaces as RadosNamespace[];
+      },
+      error: () => {
+        this.radosNamespaces = [];
+      }
+    });
+
+    this.fetchImagesForCurrentSelection(pool, null);
+  }
+
+  private onRadosNamespaceChange(): void {
+    const pool = this.nsForm.getValue('pool');
+    if (!pool) return;
+
+    const radosNs = this.nsForm.getValue('rados_namespace') as string | null;
+    this.fetchImagesForCurrentSelection(pool, radosNs);
+  }
+
+  private fetchImagesForCurrentSelection(pool: string, radosNs: string | null): void {
+    const params: Record<string, string> = { pool_name: pool, offset: '0', limit: '-1' };
+    if (radosNs) {
+      params['namespace'] = radosNs;
+    }
+
+    this.rbdService
+      .list(params)
+      .subscribe((pools: { pool_name: string; value: { name: string; size: number }[] }[]) => {
+        const selectedPool = pools.find((p) => p.pool_name === pool);
+        this.allRbdImages = selectedPool?.value ?? [];
+        this.filterImages();
+
+        const imageControl = this.nsForm.get('rbd_image_name');
+        const currentImage = this.nsForm.getValue('rbd_image_name');
+        if (currentImage && !this.rbdImages.some((img) => img.name === currentImage)) {
+          imageControl.setValue(null);
+        }
+        imageControl.markAsUntouched();
+        imageControl.markAsPristine();
+      });
+  }
+
+  fetchUsedImages(): void {
+    if (!this.group) return;
+
+    this.nvmeofService.listNamespaces(this.group).subscribe((response: any) => {
+      const namespaces: NvmeofSubsystemNamespace[] = Array.isArray(response)
+        ? response
+        : (response?.namespaces ?? []);
+      this.usedRbdImages = namespaces.reduce((map, ns) => {
+        const key = this.usedImagesKey(ns.rbd_pool_name, ns.rados_namespace_name ?? '');
+        if (!map.has(key)) {
+          map.set(key, new Set<string>());
+        }
+        map.get(key)!.add(ns.rbd_image_name);
+        return map;
+      }, new Map<string, Set<string>>());
+      this.filterImages();
+    });
+  }
+
+  onSubsystemChange(nqn: string): void {
+    if (!nqn) return;
+    this.nvmeofService
+      .getInitiators(nqn, this.group)
+      .subscribe((response: NvmeofSubsystemInitiator[] | { hosts: NvmeofSubsystemInitiator[] }) => {
+        const initiators = Array.isArray(response) ? response : response?.hosts || [];
+        this.initiatorCandidates = initiators.map((initiator) => ({
+          content: initiator.nqn,
+          selected: false
+        }));
+      });
+  }
+
+  onInitiatorSelection(event: any) {
+    // Carbon ComboBox (selected) emits the full array of selected items
+    const selectedInitiators = Array.isArray(event) ? event.map((e: any) => e.content) : [];
+    this.nsForm
+      .get('initiators')
+      .setValue(selectedInitiators.length > 0 ? selectedInitiators : null);
+    this.nsForm.get('initiators').markAsDirty();
+    this.nsForm.get('initiators').markAsTouched();
+  }
+
+  private filterImages(): void {
+    const pool = this.nsForm.getValue('pool');
+    if (!pool) {
+      this.rbdImages = [];
+      return;
+    }
+    const radosNs = (this.nsForm.getValue('rados_namespace') as string | null) ?? '';
+    const usedInScope = this.usedRbdImages.get(this.usedImagesKey(pool, radosNs));
+    this.rbdImages = usedInScope
+      ? this.allRbdImages.filter((img) => !usedInScope.has(img.name))
+      : [...this.allRbdImages];
+  }
+
+  private usedImagesKey(pool: string, radosNs: string): string {
+    return `${pool}\x00${radosNs}`;
   }
 
   createForm() {
     this.nsForm = new CdFormGroup({
-      image: new UntypedFormControl(`nvme_ns_image:${Date.now()}`, {
-        validators: [Validators.required, Validators.pattern(/^[^@/]+?$/)]
-      }),
-      pool: new UntypedFormControl(null, {
+      pool: new UntypedFormControl('', {
         validators: [Validators.required]
       }),
-      image_size: new UntypedFormControl(1, [CdValidators.number(false), Validators.min(1)]),
-      unit: new UntypedFormControl(this.units[2])
+      rados_namespace: new UntypedFormControl(null),
+      subsystem: new UntypedFormControl('', {
+        validators: [Validators.required]
+      }),
+      image_size: new UntypedFormControl(null, {
+        validators: [Validators.required]
+      }),
+      nsCount: new UntypedFormControl(this.MAX_NAMESPACE_CREATE, [
+        Validators.required,
+        Validators.max(this.MAX_NAMESPACE_CREATE),
+        Validators.min(this.MIN_NAMESPACE_CREATE)
+      ]),
+      rbd_image_creation: new UntypedFormControl('gateway_provisioned'),
+
+      rbd_image_name: new UntypedFormControl(null, [
+        CdValidators.custom('rbdImageName', (value: any) => {
+          if (!value) return null;
+          return /^[^@/]+$/.test(value) ? null : { rbdImageName: true };
+        })
+      ]),
+      namespace_size: new UntypedFormControl(512), // Block size in bytes; default 512
+      host_access: new UntypedFormControl('all'), // UI only - determines visibility
+      initiators: new UntypedFormControl([]) // UI only - selected hosts
+    });
+
+    this.nsForm.get('pool').valueChanges.subscribe(() => {
+      this.onPoolChange();
+    });
+
+    this.nsForm.get('rados_namespace').valueChanges.subscribe(() => {
+      this.onRadosNamespaceChange();
+    });
+
+    this.nsForm.get('nsCount').valueChanges.subscribe((count: number) => {
+      if (count > 1) {
+        const creationControl = this.nsForm.get('rbd_image_creation');
+        if (creationControl.value === 'externally_managed') {
+          creationControl.setValue('gateway_provisioned');
+        }
+      }
+    });
+
+    this.nsForm.get('rbd_image_creation').valueChanges.subscribe((mode: string) => {
+      const nameControl = this.nsForm.get('rbd_image_name');
+      const sizeControl = this.nsForm.get('image_size');
+      const countControl = this.nsForm.get('nsCount');
+
+      if (mode === 'externally_managed') {
+        countControl.setValue(1);
+        countControl.disable();
+        this.onPoolChange();
+        nameControl.addValidators(Validators.required);
+        sizeControl.removeValidators(Validators.required);
+        sizeControl.disable();
+      } else {
+        sizeControl.enable();
+        countControl.enable();
+        nameControl.removeValidators(Validators.required);
+        sizeControl.addValidators(Validators.required);
+      }
+      nameControl.updateValueAndValidity();
+      sizeControl.updateValueAndValidity();
+    });
+
+    this.nsForm.get('host_access').valueChanges.subscribe((mode: string) => {
+      const initiatorsControl = this.nsForm.get('initiators');
+      if (mode === 'specific') {
+        initiatorsControl.addValidators(Validators.required);
+      } else {
+        initiatorsControl.removeValidators(Validators.required);
+        initiatorsControl.setValue([]);
+        this.initiatorCandidates.forEach((i) => (i.selected = false));
+      }
+      initiatorsControl.updateValueAndValidity();
     });
   }
 
-  buildRequest(): NamespaceCreateRequest | NamespaceEditRequest {
-    const image_size = this.nsForm.getValue('image_size');
-    const image_size_unit = this.nsForm.getValue('unit');
-    const request = {} as NamespaceCreateRequest | NamespaceEditRequest;
-    request['gw_group'] = this.group;
-    if (image_size) {
-      const key: string = this.edit ? 'rbd_image_size' : 'size';
-      const value: number = this.formatterService.toBytes(image_size + image_size_unit);
-      request[key] = value;
-    }
-    if (!this.edit) {
-      const image = this.nsForm.getValue('image');
-      const pool = this.nsForm.getValue('pool');
-      request['rbd_image_name'] = image;
-      request['rbd_pool'] = pool;
-    }
-    return request;
+  randomString() {
+    return Math.random().toString(36).substring(2);
   }
 
-  validateSize() {
-    const unit = this.nsForm.getValue('unit');
-    const image_size = this.nsForm.getValue('image_size');
-    if (image_size && unit) {
-      const bytes = this.formatterService.toBytes(image_size + unit);
-      return bytes <= this.currentBytes;
+  private normalizeImageSizeInput(value: string | number): string {
+    const input = String(value ?? '').trim();
+    if (!input) {
+      return input;
     }
-    return null;
+    if (typeof value === 'number') {
+      return input;
+    }
+    // Accept plain numeric values as GiB (e.g. "45" => "45GiB").
+    return /^\d+(\.\d+)?$/.test(input) ? `${input}GiB` : input;
+  }
+
+  buildCreateRequest(
+    rbdImageSize: number,
+    nsCount: number,
+    noAutoVisible: boolean
+  ): Observable<HttpResponse<Object>>[] {
+    const pool = this.nsForm.getValue('pool');
+    const radosNs = this.nsForm.getValue('rados_namespace') as string | null;
+    const requests: Observable<HttpResponse<Object>>[] = [];
+    const creationMode = this.nsForm.getValue('rbd_image_creation');
+    const isGatewayProvisioned = creationMode === 'gateway_provisioned';
+
+    const loopCount = isGatewayProvisioned ? nsCount : 1;
+
+    const blockSize = this.nsForm.getValue('namespace_size');
+
+    for (let i = 1; i <= loopCount; i++) {
+      const request: NamespaceCreateRequest = {
+        gw_group: this.group,
+        rbd_pool: pool,
+        create_image: isGatewayProvisioned,
+        no_auto_visible: noAutoVisible
+      };
+
+      if (radosNs) {
+        request.rados_namespace = radosNs;
+      }
+      if (blockSize) {
+        request.block_size = blockSize;
+      }
+
+      if (isGatewayProvisioned) {
+        const rbdImageName = this.nsForm.getValue('rbd_image_name');
+        if (rbdImageName) {
+          request.rbd_image_name = loopCount > 1 ? `${rbdImageName}-${i}` : rbdImageName;
+        } else {
+          request.rbd_image_name = `nvme_${pool}_${this.group}_${this.randomString()}`;
+        }
+        if (rbdImageSize) {
+          request['rbd_image_size'] = rbdImageSize;
+        }
+      } else {
+        const rbdImageName = this.nsForm.getValue('rbd_image_name');
+        if (rbdImageName) {
+          request['rbd_image_name'] = rbdImageName;
+        }
+      }
+
+      const subsystemNQN = this.nsForm.getValue('subsystem') || this.subsystemNQN;
+      requests.push(this.nvmeofService.createNamespace(subsystemNQN, request));
+    }
+
+    return requests;
   }
 
   onSubmit() {
-    if (this.validateSize()) {
-      this.invalidSizeError = true;
+    if (this.nsForm.invalid) {
       this.nsForm.setErrors({ cdSubmitButton: true });
-    } else {
-      this.invalidSizeError = false;
-      const component = this;
-      const taskUrl: string = `nvmeof/namespace/${this.edit ? URLVerbs.EDIT : URLVerbs.CREATE}`;
-      const request = this.buildRequest();
-      let action: Observable<any>;
+      this.nsForm.markAllAsTouched();
+      return;
+    }
 
-      if (this.edit) {
-        action = this.taskWrapperService.wrapTaskAroundCall({
-          task: new FinishedTask(taskUrl, {
-            nqn: this.subsystemNQN,
-            nsid: this.nsid
-          }),
-          call: this.nvmeofService.updateNamespace(
-            this.subsystemNQN,
-            this.nsid,
-            request as NamespaceEditRequest
-          )
-        });
-      } else {
-        action = this.taskWrapperService.wrapTaskAroundCall({
-          task: new FinishedTask(taskUrl, {
-            nqn: this.subsystemNQN
-          }),
-          call: this.nvmeofService.createNamespace(
-            this.subsystemNQN,
-            request as NamespaceCreateRequest
-          )
+    const component = this;
+    const taskUrl: string = `nvmeof/namespace/${URLVerbs.CREATE}`;
+    const image_size = this.nsForm.getValue('image_size');
+    const nsCount = this.nsForm.getValue('nsCount');
+    const hostAccess = this.nsForm.getValue('host_access');
+    const selectedHosts: string[] = this.nsForm.getValue('initiators') || [];
+    const noAutoVisible = hostAccess === 'specific';
+    let action: Observable<any>;
+    let rbdImageSize: number = null;
+
+    if (image_size) {
+      const normalizedSize = this.normalizeImageSizeInput(image_size);
+      rbdImageSize = this.formatterService.toBytes(normalizedSize);
+      if (rbdImageSize === null) {
+        this.nsForm.get('image_size').setErrors({ invalid: true });
+        this.nsForm.setErrors({ cdSubmitButton: true });
+        return;
+      }
+    }
+
+    const subsystemNQN = this.nsForm.getValue('subsystem');
+
+    // Step 1: Create namespaces
+    // Step 2: If specific hosts selected, chain addNamespaceInitiators calls
+    const createObs = forkJoin(this.buildCreateRequest(rbdImageSize, nsCount, noAutoVisible));
+
+    const combinedObs = createObs.pipe(
+      switchMap((responses: HttpResponse<Object>[]) => {
+        if (noAutoVisible && selectedHosts.length > 0) {
+          const initiatorObs: Observable<any>[] = [];
+
+          responses.forEach((res) => {
+            const body: any = res.body;
+            if (body && body.nsid) {
+              selectedHosts.forEach((host: string) => {
+                const req: NamespaceInitiatorRequest = {
+                  gw_group: this.group,
+                  subsystem_nqn: subsystemNQN || this.subsystemNQN,
+                  host_nqn: host
+                };
+                initiatorObs.push(this.nvmeofService.addNamespaceInitiators(body.nsid, req));
+              });
+            }
+          });
+
+          if (initiatorObs.length > 0) {
+            return forkJoin(initiatorObs);
+          }
+        }
+        return of(responses);
+      })
+    );
+
+    action = this.taskWrapperService.wrapTaskAroundCall({
+      task: new FinishedTask(taskUrl, {
+        nqn: subsystemNQN,
+        nsCount
+      }),
+      call: combinedObs
+    });
+
+    action.subscribe({
+      error: () => {
+        component.nsForm.setErrors({ cdSubmitButton: true });
+      },
+      complete: () => {
+        this.router.navigate([this.pageURL], {
+          queryParams: { group: this.group }
         });
       }
-
-      action.subscribe({
-        error() {
-          component.nsForm.setErrors({ cdSubmitButton: true });
-        },
-        complete: () => {
-          this.router.navigate([this.pageURL, { outlets: { modal: null } }]);
-        }
-      });
-    }
+    });
   }
 }

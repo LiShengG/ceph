@@ -73,7 +73,7 @@ Response Entities
 +------------------------+-------------+-----------------------------------------------+
 | **LastModified**       | Date        |  The last modified date of the source object. |
 +------------------------+-------------+-----------------------------------------------+
-| **Etag**               | String      |  The ETag of the new object.                  |
+| **ETag**               | String      |  The ETag of the new object.                  |
 +------------------------+-------------+-----------------------------------------------+
 
 Remove Object
@@ -88,6 +88,14 @@ Syntax
 
     DELETE /{bucket}/{object} HTTP/1.1
 
+Request Headers
+~~~~~~~~~~~~~~~
+
++--------------------------------------+-------------------------------------------------+------------------------+------------+
+| Name                                 | Description                                     | Valid Values           | Required   |
++======================================+=================================================+========================+============+
+| **x-amz-delete-if-unmodified-since** | Deletes only if unmodified since the timestamp  | a datetime string      | No         |
++--------------------------------------+-------------------------------------------------+------------------------+------------+
 
 
 Get Object
@@ -115,7 +123,7 @@ Request Headers
 +---------------------------+------------------------------------------------+--------------------------------+------------+
 | **if-match**              | Gets only if object ETag matches ETag.         | Entity Tag                     | No         |
 +---------------------------+------------------------------------------------+--------------------------------+------------+
-| **if-none-match**         | Gets only if object ETag matches ETag.         | Entity Tag                     | No         |
+| **if-none-match**         | Gets only if object ETag doesn't match.        | Entity Tag                     | No         |
 +---------------------------+------------------------------------------------+--------------------------------+------------+
 
 Response Headers
@@ -155,7 +163,7 @@ Request Headers
 +---------------------------+------------------------------------------------+--------------------------------+------------+
 | **if-match**              | Gets only if object ETag matches ETag.         | Entity Tag                     | No         |
 +---------------------------+------------------------------------------------+--------------------------------+------------+
-| **if-none-match**         | Gets only if object ETag matches ETag.         | Entity Tag                     | No         |
+| **if-none-match**         | Gets only if object ETag doesn't match         | Entity Tag                     | No         |
 +---------------------------+------------------------------------------------+--------------------------------+------------+
 
 Get Object ACL
@@ -226,6 +234,7 @@ Request Entities
 | ``Permission``            | String      | The permission given to the ``Grantee`` object.                                              |
 +---------------------------+-------------+----------------------------------------------------------------------------------------------+
 
+.. note:: For accounts users, the ``Owner`` and ``ID`` in ``AccessControlPolicy`` may be set to either the legacy user ID or the new account ID. Both are accepted for backward compatibility.
 
 
 Initiate Multi-part Upload

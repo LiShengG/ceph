@@ -13,18 +13,20 @@ import { CephfsSubvolumegroupFormComponent } from '../cephfs-subvolumegroup-form
 import { ActionLabelsI18n } from '~/app/shared/constants/app.constants';
 import { AuthStorageService } from '~/app/shared/services/auth-storage.service';
 import { Permissions } from '~/app/shared/models/permissions';
-import { CriticalConfirmationModalComponent } from '~/app/shared/components/critical-confirmation-modal/critical-confirmation-modal.component';
+import { DeleteConfirmationModalComponent } from '~/app/shared/components/delete-confirmation-modal/delete-confirmation-modal.component';
 import { FinishedTask } from '~/app/shared/models/finished-task';
 import { TaskWrapperService } from '~/app/shared/services/task-wrapper.service';
 import { CephfsSubvolumeGroup } from '~/app/shared/models/cephfs-subvolume-group.model';
 import { NgbModalRef } from '@ng-bootstrap/ng-bootstrap';
 import _ from 'lodash';
 import { ModalCdsService } from '~/app/shared/services/modal-cds.service';
+import { DeletionImpact } from '~/app/shared/enum/delete-confirmation-modal-impact.enum';
 
 @Component({
   selector: 'cd-cephfs-subvolume-group',
   templateUrl: './cephfs-subvolume-group.component.html',
-  styleUrls: ['./cephfs-subvolume-group.component.scss']
+  styleUrls: ['./cephfs-subvolume-group.component.scss'],
+  standalone: false
 })
 export class CephfsSubvolumeGroupComponent implements OnInit, OnChanges {
   @ViewChild('quotaUsageTpl', { static: true })
@@ -81,9 +83,9 @@ export class CephfsSubvolumeGroupComponent implements OnInit, OnChanges {
         name: $localize`Data Pool`,
         prop: 'info.data_pool',
         flexGrow: 0.7,
-        cellTransformation: CellTemplate.badge,
+        cellTransformation: CellTemplate.tag,
         customTemplateConfig: {
-          class: 'badge-background-primary'
+          class: 'tag-background-primary'
         }
       },
       {
@@ -174,7 +176,8 @@ export class CephfsSubvolumeGroupComponent implements OnInit, OnChanges {
 
   removeSubVolumeModal() {
     const name = this.selection.first().name;
-    this.cdsModalService.show(CriticalConfirmationModalComponent, {
+    this.cdsModalService.show(DeleteConfirmationModalComponent, {
+      impact: DeletionImpact.high,
       itemDescription: 'subvolume group',
       itemNames: [name],
       actionDescription: 'remove',

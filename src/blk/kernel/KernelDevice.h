@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph - scalable distributed file system
  *
@@ -32,6 +33,7 @@
 enum {
   l_blk_kernel_device_first = 1000,
   l_blk_kernel_device_discard_op,
+  l_blk_kernel_discard_threads,
   l_blk_kernel_device_last,
 };
 
@@ -58,6 +60,7 @@ private:
   aio_callback_t discard_callback;
   void *discard_callback_priv;
   bool aio_stop;
+  bool need_notify = false;
   std::unique_ptr<PerfCounters> logger;
 
   ceph::mutex discard_lock = ceph::make_mutex("KernelDevice::discard_lock");
@@ -76,15 +79,15 @@ private:
 
   struct DiscardThread : public Thread {
     KernelDevice *bdev;
-    const uint64_t id;
     bool stop = false;
-    explicit DiscardThread(KernelDevice *b, uint64_t id) : bdev(b), id(id) {}
+    explicit DiscardThread(KernelDevice *b) : bdev(b) {
+    }
     void *entry() override {
-      bdev->_discard_thread(id);
+      bdev->_discard_thread(this);
       return NULL;
     }
   };
-  std::vector<std::shared_ptr<DiscardThread>> discard_threads;
+  std::vector<DiscardThread*> discard_threads;
 
   std::atomic_int injecting_crash;
 
@@ -92,9 +95,13 @@ private:
   virtual void  _pre_close() { }  // hook for child implementations
 
   void _aio_thread();
-  void _discard_thread(uint64_t tid);
-  void _queue_discard(interval_set<uint64_t> &to_release);
-  bool try_discard(interval_set<uint64_t> &to_release, bool async = true) override;
+  void _discard_thread(DiscardThread* thr);
+  bool _queue_discard(interval_set<uint64_t> &to_release);
+  bool try_discard(interval_set<uint64_t> &to_release,
+                   bool async = true,
+                   bool force = false) override;
+
+  void collect_alerts(osd_alert_list_t& alerts, const std::string& device_name) override;
 
   int _aio_start();
   void _aio_stop();
@@ -141,8 +148,10 @@ public:
     return 0;
   }
   int get_devices(std::set<std::string> *ls) const override;
+  int refresh_size() override;
 
   int get_ebd_state(ExtBlkDevState &state) const override;
+  int detect_ebd(std::string& id) override;
 
   int read(uint64_t off, uint64_t len, ceph::buffer::list *pbl,
 	   IOContext *ioc,
@@ -165,7 +174,7 @@ public:
   void close() override;
 
   // config observer bits
-  const char** get_tracked_conf_keys() const override;
+  std::vector<std::string> get_tracked_keys() const noexcept override;
   void handle_conf_change(const ConfigProxy& conf,
                           const std::set <std::string> &changed) override;
 };

@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph - scalable distributed file system
  *
@@ -17,15 +18,16 @@
 // First because it includes Python.h
 #include "PyModule.h"
 
-#include <string>
-#include <map>
-#include <set>
-#include <memory>
-
 #include "common/LogClient.h"
 
 #include "ActivePyModules.h"
 #include "StandbyPyModules.h"
+
+#include <map>
+#include <memory>
+#include <set>
+#include <string>
+#include <vector>
 
 class MgrSession;
 
@@ -48,6 +50,7 @@ private:
 
   std::unique_ptr<ActivePyModules> active_modules;
   std::unique_ptr<StandbyPyModules> standby_modules;
+  std::unique_ptr<ThreadMonitor> thread_monitor;
 
   PyThreadState *pMainThreadState;
 
@@ -62,6 +65,7 @@ private:
   std::vector<std::string> probe_modules(const std::string &path) const;
 
   PyModuleConfig module_config;
+  PyObject* process_obj = nullptr;
 
 public:
   void handle_config(const std::string &k, const std::string &v);
@@ -70,7 +74,7 @@ public:
   void update_kv_data(
     const std::string prefix,
     bool incremental,
-    const map<std::string, std::optional<bufferlist>, std::less<>>& data) {
+    const std::map<std::string, std::optional<bufferlist>, std::less<>>& data) {
     ceph_assert(active_modules);
     active_modules->update_kv_data(prefix, incremental, data);
   }
@@ -91,9 +95,13 @@ public:
   }
 
   explicit PyModuleRegistry(LogChannelRef clog_)
-    : clog(clog_)
-  {}
+    : clog(clog_),
+      thread_monitor(std::make_unique<ThreadMonitor>(g_ceph_context))
+  { }
 
+  ~PyModuleRegistry() {
+    thread_monitor->stop_monitoring();
+  }
   /**
    * @return true if the mgrmap has changed such that the service needs restart
    */
@@ -114,7 +122,7 @@ public:
                 const std::map<std::string, std::string> &kv_store,
 		bool mon_provides_kv_sub,
                 MonClient &mc, LogChannelRef clog_, LogChannelRef audit_clog_,
-                Objecter &objecter_, Client &client_, Finisher &f,
+                Objecter &objecter_, Finisher &f,
                 DaemonServer &server);
   void standby_start(MonClient &mc, Finisher &f);
 
@@ -165,7 +173,7 @@ public:
    */
   void get_health_checks(health_check_map_t *checks);
 
-  void get_progress_events(map<std::string,ProgressEvent> *events) {
+  void get_progress_events(std::map<std::string,ProgressEvent> *events) {
     if (active_modules) {
       active_modules->get_progress_events(events);
     }
@@ -235,6 +243,19 @@ public:
   auto& get_active_module_finisher(const std::string &name) {
     ceph_assert(active_modules);
     return active_modules->get_module_finisher(name);
+  }
+
+  // Sends the "active" beacon right away if all mgr modules
+  // have finished startup. If some modules are still pending
+  // startup, the "active" beacon is scheduled to send later
+  // after all modules are ready.
+  // See "Mgr::background_init()".
+  void check_all_modules_started(Context *modules_start_complete);
+
+  // Return set of active modules where class instances are not yet created.
+  // Protected by const; we only want to view the contents- not modify anything.
+  const std::set<std::string, std::less<>>& get_pending_modules() const {
+    return active_modules->get_pending_modules();
   }
 
   // <<< (end of ActivePyModules cheeky call-throughs)

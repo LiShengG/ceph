@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*- 
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*- 
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph - scalable distributed file system
  *
@@ -15,7 +16,7 @@
 #ifndef CEPH_WORKQUEUE_H
 #define CEPH_WORKQUEUE_H
 
-#if defined(WITH_SEASTAR) && !defined(WITH_ALIEN)
+#ifdef WITH_CRIMSON
 // for ObjectStore.h
 struct ThreadPool {
   struct TPHandle {
@@ -31,7 +32,6 @@ struct ThreadPool {
 #include <vector>
 
 #include "common/ceph_mutex.h"
-#include "include/unordered_map.h"
 #include "common/config_obs.h"
 #include "common/HeartbeatMap.h"
 #include "common/Thread.h"
@@ -39,6 +39,8 @@ struct ThreadPool {
 #include "include/Context.h"
 #include "common/HBHandle.h"
 
+
+class ShardedThreadPool;
 
 /// Pool of threads that share work submitted to multiple work queues.
 class ThreadPool : public md_config_obs_t {
@@ -56,18 +58,20 @@ protected:
 
 public:
   class TPHandle : public HBHandle {
-    friend class ThreadPool;
     CephContext *cct;
     ceph::heartbeat_handle_d *hb;
     ceph::timespan grace;
     ceph::timespan suicide_grace;
+    ShardedThreadPool *sharded_pool;
   public:
     TPHandle(
       CephContext *cct,
       ceph::heartbeat_handle_d *hb,
       ceph::timespan grace,
-      ceph::timespan suicide_grace)
-      : cct(cct), hb(hb), grace(grace), suicide_grace(suicide_grace) {}
+      ceph::timespan suicide_grace,
+      ShardedThreadPool *sharded_pool = nullptr)
+      : cct(cct), hb(hb), grace(grace), suicide_grace(suicide_grace),
+        sharded_pool(sharded_pool) {}
     void reset_tp_timeout() override final;
     void suspend_tp_timeout() override final;
   };
@@ -108,11 +112,15 @@ protected:
   // track thread pool size changes
   unsigned _num_threads;
   std::string _thread_num_option;
-  const char **_conf_keys;
 
-  const char **get_tracked_conf_keys() const override {
-    return _conf_keys;
+  std::vector<std::string> get_tracked_keys() const noexcept override {
+    if (_thread_num_option.empty()) {
+      return {};
+    } else {
+      return {_thread_num_option};
+    }
   }
+
   void handle_conf_change(const ConfigProxy& conf,
 			  const std::set <std::string> &changed) override;
 
@@ -552,8 +560,7 @@ protected:
     int result = 0;
     {
       std::lock_guard locker(m_lock);
-      ceph::unordered_map<Context *, int>::iterator it =
-        m_context_results.find(ctx);
+      auto it = m_context_results.find(ctx);
       if (it != m_context_results.end()) {
         result = it->second;
         m_context_results.erase(it);
@@ -563,7 +570,7 @@ protected:
   }
 private:
   ceph::mutex m_lock = ceph::make_mutex("ContextWQ::m_lock");
-  ceph::unordered_map<Context*, int> m_context_results;
+  std::unordered_map<Context*, int> m_context_results;
 };
 
 class ShardedThreadPool {
@@ -575,7 +582,10 @@ class ShardedThreadPool {
   ceph::mutex shardedpool_lock;
   ceph::condition_variable shardedpool_cond;
   ceph::condition_variable wait_cond;
-  uint32_t num_threads;
+  const uint32_t num_threads;
+  const uint32_t num_shards;
+  std::map<heartbeat_handle_d *,uint32_t> hb_to_thread_index;
+  std::map<uint32_t,heartbeat_handle_d *> thread_index_to_hb;
 
   std::atomic<bool> stop_threads = { false };
   std::atomic<bool> pause_threads = { false };
@@ -595,10 +605,13 @@ public:
       :timeout_interval(ti), suicide_interval(sti) {}
     virtual ~BaseShardedWQ() {}
 
-    virtual void _process(uint32_t thread_index, ceph::heartbeat_handle_d *hb ) = 0;
+    virtual void _process(uint32_t thread_index,
+                          uint32_t shard_index,
+                          ceph::heartbeat_handle_d *hb ) = 0;
     virtual void return_waiting_threads() = 0;
     virtual void stop_return_waiting_threads() = 0;
-    virtual bool is_shard_empty(uint32_t thread_index) = 0;
+    virtual bool is_shard_empty(uint32_t thread_index,
+                                uint32_t shard_index) = 0;
     void set_timeout(time_t ti) {
       timeout_interval.store(ceph::make_timespan(ti));
     }
@@ -643,18 +656,20 @@ private:
   // threads
   struct WorkThreadSharded : public Thread {
     ShardedThreadPool *pool;
-    uint32_t thread_index;
-    WorkThreadSharded(ShardedThreadPool *p, uint32_t pthread_index): pool(p),
-      thread_index(pthread_index) {}
+    const uint32_t thread_index;
+    const uint32_t shard_index;
+    WorkThreadSharded(ShardedThreadPool *p, uint32_t pthread_index, uint32_t pshard_index): pool(p),
+      thread_index(pthread_index),
+      shard_index(pshard_index) {}
     void *entry() override {
-      pool->shardedthreadpool_worker(thread_index);
+      pool->shardedthreadpool_worker(thread_index, shard_index);
       return 0;
     }
   };
 
   std::vector<WorkThreadSharded*> threads_shardedpool;
   void start_threads();
-  void shardedthreadpool_worker(uint32_t thread_index);
+  void shardedthreadpool_worker(uint32_t thread_index, uint32_t shard_index);
   void set_wq(BaseShardedWQ* swq) {
     wq = swq;
   }
@@ -663,9 +678,13 @@ private:
 
 public:
 
-  ShardedThreadPool(CephContext *cct_, std::string nm, std::string tn, uint32_t pnum_threads);
+  ShardedThreadPool(CephContext *cct_, std::string nm, std::string tn, uint32_t pnum_threads, uint32_t pnum_shards);
 
   ~ShardedThreadPool(){};
+
+  void reset_tp_timeout(heartbeat_handle_d *hb,
+                        ceph::timespan grace,
+                        ceph::timespan suicide_grace);
 
   /// start thread pool thread
   void start();

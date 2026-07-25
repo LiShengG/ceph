@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph - scalable distributed file system
   *
@@ -150,7 +151,7 @@ class BlockDevice {
 public:
   CephContext* cct;
   typedef void (*aio_callback_t)(void *handle, void *aio);
-  void collect_alerts(osd_alert_list_t& alerts, const std::string& device_name);
+  virtual void collect_alerts(osd_alert_list_t& alerts, const std::string& device_name);
 
 private:
   ceph::mutex ioc_reap_lock = ceph::make_mutex("BlockDevice::ioc_reap_lock");
@@ -178,7 +179,7 @@ private:
     void *cbpriv, aio_callback_t d_cb, void *d_cbpriv, const char* dev_name);
 
 protected:
-  uint64_t size = 0;
+  std::atomic<uint64_t> size = 0;
   uint64_t block_size = 0;
   uint64_t optimal_io_size = 0;
   bool support_discard = false;
@@ -240,12 +241,16 @@ public:
   }
   
   uint64_t get_size() const { return size; }
+  virtual int refresh_size() { return 0; }
   uint64_t get_block_size() const { return block_size; }
   uint64_t get_optimal_io_size() const { return optimal_io_size; }
   bool is_discard_supported() const { return support_discard; }
 
   /// hook to provide utilization of thinly-provisioned device
   virtual int get_ebd_state(ExtBlkDevState &state) const {
+    return -ENOENT;
+  }
+  virtual int detect_ebd(std::string& id) {
     return -ENOENT;
   }
 
@@ -294,7 +299,9 @@ public:
     bool buffered,
     int write_hint = WRITE_LIFE_NOT_SET) = 0;
   virtual int flush() = 0;
-  virtual bool try_discard(interval_set<uint64_t> &to_release, bool async=true) { return false; }
+  virtual bool try_discard(interval_set<uint64_t> &to_release,
+                           bool async=true,
+                           bool force=false) { return false; }
   virtual void discard_drain() { return; }
   virtual void swap_discard_queued(interval_set<uint64_t>& other)  { other.clear(); }
   // for managing buffered readers/writers
@@ -303,6 +310,9 @@ public:
   virtual void close() = 0;
 
   struct hugepaged_raw_marker_t {};
+
+  std::atomic<size_t> discard_queue_bytes = 0;
+  std::atomic<uint64_t> discard_queue_length = 0;
 
 protected:
   bool is_valid_io(uint64_t off, uint64_t len) const;

@@ -10,31 +10,83 @@ Usually, you would set up a ceph-mgr daemon using a tool such
 as ceph-ansible.  These instructions describe how to set up
 a ceph-mgr daemon manually.
 
-First, create an authentication key for your daemon::
+First, create an authentication key for your daemon:
 
-    ceph auth get-or-create mgr.$name mon 'allow profile mgr' osd 'allow *' mds 'allow *'
+.. prompt:: bash #
 
-Place that key as file named ``keyring`` into ``mgr data`` path, which for a cluster "ceph"
-and mgr $name "foo" would be ``/var/lib/ceph/mgr/ceph-foo`` respective ``/var/lib/ceph/mgr/ceph-foo/keyring``.
+   ``ceph auth get-or-create mgr.$name mon 'allow profile mgr' osd 'allow *' mds 'allow *'``
 
-Start the ceph-mgr daemon::
+Place that key as file named ``keyring`` into ``mgr data`` path, which for a
+cluster "ceph" and mgr $name "foo" would be ``/var/lib/ceph/mgr/ceph-foo``
+respective ``/var/lib/ceph/mgr/ceph-foo/keyring``.
 
-    ceph-mgr -i $name
+Start the ceph-mgr daemon:
 
-Check that the mgr has come up by looking at the output
-of ``ceph status``, which should now include a mgr status line::
+.. prompt:: bash #
+
+   ceph-mgr -i $name
+
+Check that the mgr has come up by looking at the output of ``ceph status``,
+which should now include a mgr status line::
 
     mgr active: $name
+
+Interpreting Manager Daemon Status
+==================================
+
+A cluster's health status will show each ``ceph-mgr`` daemon in one of three states:
+
+1. **active**
+
+   This Manager daemon has been fully initialized, which means it is ready to receive
+   and execute commands. Only one Manager will be in this state at a time.
+
+2. **active (starting)**
+
+   This Manager daemon has been chosen to be ``active``, but it is not done initializing.
+   Although it is not yet ready to execute commands, an operator may still issue commands,
+   which will be held and executed once the Manager becomes ``active``. Only one Manager
+   will be in this state at a time.
+
+3. **standby**
+
+   This Manager daemon is not currently receiving or executing commands, but it is ready to
+   take over if the current active Manager becomes unavailable. An administrator may
+   manually promote a standby to become active via ``ceph mgr fail`` if desired. All other
+   Manager daemons which are not ``active`` or ``active (starting)`` will be in this state.
+
+Each of these states are visible in the output of the ``ceph status`` command. For example:
+
+.. code-block:: console
+
+   $ ceph status
+     cluster:
+       id:     b150f540-745a-460c-a566-376b28b95ac3
+       health: HEALTH_OK
+
+     services:
+       mon: 3 daemons, quorum a,b,c (age 47m) [leader: a]
+       mgr: x(active, starting, since 3s)
+       mds: 1/1 daemons up, 2 standby
+       osd: 4 osds: 4 up (since 47m), 4 in (since 47m)
+
+     data:
+       volumes: 1/1 healthy
+       pools:   4 pools, 177 pgs
+       objects: 24 objects, 451 KiB
+       usage:   4.0 GiB used, 400 GiB / 404 GiB avail
+       pgs:     177 active+clean
 
 Client authentication
 ---------------------
 
-The manager is a new daemon which requires new CephX capabilities. If you upgrade
-a cluster from an old version of Ceph, or use the default install/deploy tools,
-your admin client should get this capability automatically. If you use tooling from
-elsewhere, you may get EACCES errors when invoking certain ceph cluster commands.
-To fix that, add a "mgr allow \*" stanza to your client's cephx capabilities by
-`Modifying User Capabilities`_.
+The manager is a new daemon which requires new CephX capabilities. If you
+upgrade a cluster from an old version of Ceph, or use the default
+install/deploy tools, your admin client should get this capability
+automatically. If you use tooling from elsewhere, you may get EACCES errors
+when invoking certain ceph cluster commands.  To fix that, add a ``mgr allow
+\*`` stanza to your client's cephx capabilities by `Modifying User
+Capabilities`_.
 
 High availability
 -----------------
@@ -55,49 +107,102 @@ daemon as failed using ``ceph mgr fail <mgr name>``.
 
 Performance and Scalability
 ---------------------------
+Manager modules share a cache that is enabled by default. The cache
+uses an event-driven invalidation strategy, automatically updating when cluster
+maps change to ensure modules always work with current data while maximizing
+performance.
 
-All the mgr modules share a cache that can be enabled with
-``ceph config set mgr mgr_ttl_cache_expire_seconds <seconds>``, where seconds
-is the time to live of the cached python objects.
+The cache is particularly beneficial for clusters with 500+ OSDs or 10k+ PGs
+as internal structures increase in size, which may result in latency issues when
+requesting large structures. As an example, an OSDMap with 1000 OSDs has an
+approximate size of 4MiB. With heavy load, on a 3000 OSD cluster, the response
+latency for cached requests reduces by approximately 50% when the cache
+is enabled.
 
-It is recommended to enable the cache with a 10 seconds TTL when there are 500+
-osds or 10k+ pgs as internal structures might increase in size, and cause latency
-issues when requesting large structures. As an example, an OSDMap with 1000 osds
-has a approximate size of 4MiB. With heavy load, on a 3000 osd cluster there has
-been a 1.5x improvement enabling the cache.
+The cache automatically invalidates entries when the underlying cluster maps
+(such as OSDMap, PGMap, or MonMap) are updated. If needed, you can manually
+flush specific cached maps using ``ceph mgr cli cache flush [map-name]``.
 
-Furthermore, you can run ``ceph daemon mgr.${MGRNAME} perf dump`` to retrieve perf
-counters of a mgr module. In ``mgr.cache_hit`` and ``mgr.cache_miss`` you'll find the
-hit/miss ratio of the mgr cache.
+To disable the cache (not recommended for large clusters), run:
+``ceph config set mgr mgr_map_cache_enabled false``
+
+You can run ``ceph daemon mgr.${MGRNAME} perf dump`` to retrieve
+perf counters of a Manager module. In ``mgr.cache_hit`` and ``mgr.cache_miss``
+you'll find the hit/miss ratio of the Manager cache, which can help verify the
+cache is operating effectively.
+
+The Manager includes a ThreadMonitor that tracks CPU usage and memory consumption
+for each enabled module. This monitoring can be configured with
+``ceph config set mgr mgr_module_monitor_interval <seconds>``, where ``seconds``
+is the monitoring interval. Setting this to 0 disables module monitoring.
+
+The ThreadMonitor provides per-module performance counters accessible via
+``ceph daemon mgr.${MGRNAME} perf dump``, including:
+
+- ``notify_avg_usec``: Average time spent in notify calls (microseconds)
+- ``cmd_avg_usec``: Average time spent in command calls (microseconds)  
+- ``alive``: Module health status (0=dead, 1=alive)
+- ``cpu_usage``: CPU percentage for the main module thread
+- ``serve_cpu_usage``: CPU percentage for the module's serve thread (if present)
+- ``mem_rss_current``: Current process memory usage (RSS) in bytes
+- ``mem_rss_change``: Memory usage change since last measurement in bytes
+
+These counters help identify resource-intensive modules and can be useful for
+debugging performance issues or memory leaks. The ``notify_avg_usec`` and 
+``cmd_avg_usec`` counters track the performance of module operations, while
+the CPU and memory counters monitor resource consumption. The default monitoring
+interval is 2 seconds.
+
+
+Automatic Stats Period Tuning
+------------------------------
+
+The Manager automatically adjusts :confval:`mgr_stats_period` based on message queue
+depth to prevent overload during high cluster activity. This feature is enabled by
+default and can be controlled with the following settings:
+
+- :confval:`mgr_stats_period_autotune` : Enable or disable
+  automatic tuning of the stats period.
+- :confval:`mgr_stats_period_autotune_queue_threshold` :
+  The message queue depth threshold that triggers an increase in the stats period.
+
+When the queue depth exceeds this threshold, the stats period is increased to
+reduce load. Conversely, if the queue depth remains low and the stats period is
+above the baseline, the period is decreased to improve responsiveness. In order 
+to ensure timely updates, the effective stats period will not exceed 60 seconds 
+regardless of these settings.
+
 
 Using modules
 -------------
 
-Use the command ``ceph mgr module ls`` to see which modules are
-available, and which are currently enabled. Use ``ceph mgr module ls --format=json-pretty``
-to view detailed metadata about disabled modules. Enable or disable modules
-using the commands ``ceph mgr module enable <module>`` and
-``ceph mgr module disable <module>`` respectively.
+Use the command ``ceph mgr module ls`` to see which modules are available, and
+which are currently enabled. Use ``ceph mgr module ls --format=json-pretty`` to
+view detailed metadata about disabled modules. Enable or disable modules using
+the commands ``ceph mgr module enable <module>`` and ``ceph mgr module disable
+<module>`` respectively.
 
-If a module is *enabled* then the active ceph-mgr daemon will load
-and execute it.  In the case of modules that provide a service,
-such as an HTTP server, the module may publish its address when it
-is loaded.  To see the addresses of such modules, use the command
-``ceph mgr services``.
+If a module is *enabled* then the active ceph-mgr daemon will load and execute
+it.  In the case of modules that provide a service, such as an HTTP server, the
+module may publish its address when it is loaded.  To see the addresses of such
+modules, use the command ``ceph mgr services``.
 
-Some modules may also implement a special standby mode which runs on
-standby ceph-mgr daemons as well as the active daemon.  This enables
-modules that provide services to redirect their clients to the active
-daemon, if the client tries to connect to a standby.
+Some modules may also implement a special standby mode which runs on standby
+ceph-mgr daemons as well as the active daemon.  This enables modules that
+provide services to redirect their clients to the active daemon, if the client
+tries to connect to a standby.
 
 Consult the documentation pages for individual manager modules for more
 information about what functionality each module provides.
 
 Here is an example of enabling the :term:`Dashboard` module:
 
+.. prompt:: bash $
+
+   ceph mgr module ls
+
 .. code-block:: console
 
-	$ ceph mgr module ls
 	{
 		"enabled_modules": [
 			"status"
@@ -107,8 +212,14 @@ Here is an example of enabling the :term:`Dashboard` module:
 		]
 	}
 
-	$ ceph mgr module enable dashboard
-	$ ceph mgr module ls
+
+.. prompt:: bash $
+
+   ceph mgr module enable dashboard
+   ceph mgr module ls
+
+.. code-block:: console
+
 	{
 		"enabled_modules": [
 			"status",
@@ -118,18 +229,22 @@ Here is an example of enabling the :term:`Dashboard` module:
 		]
 	}
 
-	$ ceph mgr services
+.. prompt:: bash $
+
+   ceph mgr services
+
+.. code-block:: console
+
 	{
 		"dashboard": "http://myserver.com:7789/"
 	}
 
 
 The first time the cluster starts, it uses the :confval:`mgr_initial_modules`
-setting to override which modules to enable.  However, this setting
-is ignored through the rest of the lifetime of the cluster: only
-use it for bootstrapping.  For example, before starting your
-monitor daemons for the first time, you might add a section like
-this to your ``ceph.conf``:
+setting to override which modules to enable.  However, this setting is ignored
+through the rest of the lifetime of the cluster: only use it for bootstrapping.
+For example, before starting your monitor daemons for the first time, you might
+add a section like this to your ``ceph.conf``:
 
 .. code-block:: ini
 
@@ -157,9 +272,11 @@ Calling module commands
 Where a module implements command line hooks, the commands will
 be accessible as ordinary Ceph commands.  Ceph will automatically incorporate
 module commands into the standard CLI interface and route them appropriately to
-the module.::
+the module.:
 
-    ceph <command | help>
+.. prompt:: bash #
+
+   ceph <command | help>
 
 Configuration
 -------------
@@ -171,5 +288,8 @@ Configuration
 .. confval:: mgr_data
 .. confval:: mgr_tick_period
 .. confval:: mon_mgr_beacon_grace
+.. confval:: mgr_stats_period
+.. confval:: mgr_stats_period_autotune
+.. confval:: mgr_stats_period_autotune_queue_threshold
 
 .. _Modifying User Capabilities: ../../rados/operations/user-management/#modify-user-capabilities

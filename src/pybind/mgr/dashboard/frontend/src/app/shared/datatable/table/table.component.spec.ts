@@ -1,12 +1,11 @@
 import { ComponentFixture, TestBed } from '@angular/core/testing';
-import { FormsModule } from '@angular/forms';
+import { FormsModule, ReactiveFormsModule } from '@angular/forms';
 import { By } from '@angular/platform-browser';
 import { BrowserAnimationsModule } from '@angular/platform-browser/animations';
 import { RouterTestingModule } from '@angular/router/testing';
 
 import { NgbDropdownModule, NgbTooltipModule } from '@ng-bootstrap/ng-bootstrap';
 import _ from 'lodash';
-import { NgxPipeFunctionModule } from 'ngx-pipe-function';
 
 import { ComponentsModule } from '~/app/shared/components/components.module';
 import { CellTemplate } from '~/app/shared/enum/cell-template.enum';
@@ -44,8 +43,8 @@ describe('TableComponent', () => {
     declarations: [TableComponent, TablePaginationComponent],
     imports: [
       BrowserAnimationsModule,
-      NgxPipeFunctionModule,
       FormsModule,
+      ReactiveFormsModule,
       ComponentsModule,
       RouterTestingModule,
       NgbDropdownModule,
@@ -135,8 +134,8 @@ describe('TableComponent', () => {
     ) => {
       component.search = search;
       _.forEach(changes, (change) => {
-        component.onSelectFilter(change.filter.column.name);
-        component.onChangeFilter(change.value || undefined);
+        component.onChangeFilter(change.value || undefined, change.filter);
+        component.onSubmitFilter();
       });
       expect(component.rows).toEqual(results);
       component.onClearSearch();
@@ -278,6 +277,57 @@ describe('TableComponent', () => {
       it('should remove filters', () => {
         expectColumnFiltered([{ filter: filterCustom, value: 'no' }], _.slice(component.data, 5));
       });
+    });
+  });
+
+  describe('test custom filtering', () => {
+    beforeEach(() => {
+      component.customFilter = true;
+      component.customFilters = [];
+      component.stagedCustomFilters = [];
+      spyOn(component.customFilterChange, 'emit');
+      spyOn(component, 'updateFilter');
+    });
+
+    it('should toggle popover and add an empty rule', () => {
+      component.toggleFilterPopover();
+
+      expect(component.openFilterPopover).toBe(true);
+      expect(component.stagedCustomFilters.length).toBe(1);
+      expect(component.stagedCustomFilters[0]).toEqual({ id: 0, key: '', value: '' });
+
+      // toggling again should close but not add a new rule
+      component.toggleFilterPopover();
+      expect(component.openFilterPopover).toBe(false);
+      expect(component.stagedCustomFilters.length).toBe(1);
+    });
+
+    it('should manually add new custom filters', () => {
+      component.addCustomFilter();
+      component.addCustomFilter();
+      expect(component.stagedCustomFilters.length).toBe(2);
+      expect(component.stagedCustomFilters[0]).toEqual({ id: 0, key: '', value: '' });
+      expect(component.stagedCustomFilters[1]).toEqual({ id: 1, key: '', value: '' });
+    });
+
+    it('should remove a filter by its id', () => {
+      component.addCustomFilter();
+      component.addCustomFilter();
+      component.addCustomFilter();
+
+      component.removeCustomFilter(1);
+      expect(component.stagedCustomFilters.length).toBe(2);
+      expect(component.stagedCustomFilters[0]).toEqual({ id: 0, key: '', value: '' });
+      expect(component.stagedCustomFilters[1]).toEqual({ id: 2, key: '', value: '' });
+    });
+
+    it('should emit custom filters on submit', () => {
+      component.addCustomFilter();
+      component.stagedCustomFilters[0] = { id: 0, key: 'foo', value: 'bar' };
+      component.onSubmitFilter();
+      expect(component.customFilterChange.emit).toHaveBeenCalledWith([
+        { id: 0, key: 'foo', value: 'bar' }
+      ]);
     });
   });
 
@@ -584,12 +634,76 @@ describe('TableComponent', () => {
       expect(executingElement.nativeElement.textContent.trim()).toBe(`(${state})`);
     };
 
+    const testEditingTemplate = (editing = false) => {
+      component.autoReload = -1;
+
+      const data = createFakeData(10);
+      // add id to every row so that we can use it to save the state.
+      component.data = data.map((item, i) => ({
+        ...item,
+        id: `id-${i}`
+      }));
+      component.localColumns = component.columns = [
+        {
+          prop: 'a',
+          name: 'Name',
+          cellTransformation: CellTemplate.editing,
+          customTemplateConfig: {
+            validators: []
+          }
+        }
+      ];
+
+      // trigger an editing by setting the edit state.
+      if (editing) {
+        component.editCellItem('id-0', component.localColumns[0], '0');
+      }
+
+      component.identifier = 'id';
+      component.ngOnInit();
+      component.ngAfterViewInit();
+      fixture.detectChanges();
+
+      if (editing) {
+        const inputElement = fixture.debugElement
+          .query(By.css('[cdstablerow] [cdstabledata]'))
+          .query(By.css('input'));
+        expect(inputElement).not.toBeNull();
+
+        const saveButton = fixture.debugElement
+          .query(By.css('[cdstablerow] [cdstabledata]'))
+          .query(By.css('#cell-inline-save-btn'));
+        expect(saveButton).not.toBeNull();
+
+        const svgElement = saveButton.nativeElement.querySelector('svg');
+        expect(svgElement).not.toBeNull();
+        expect(svgElement.classList.contains('check-icon')).toBeTruthy();
+      } else {
+        const editButton = fixture.debugElement
+          .query(By.css('[cdstablerow] [cdstabledata]'))
+          .query(By.css('#cell-inline-edit-btn'));
+        expect(editButton).not.toBeNull();
+
+        const svgElement = editButton.nativeElement.querySelector('svg');
+        expect(svgElement).not.toBeNull();
+        expect(svgElement.classList.contains('edit-icon')).toBeTruthy();
+      }
+    };
+
     it('should display executing template', () => {
       testExecutingTemplate();
     });
 
     it('should display executing template with custom classes', () => {
       testExecutingTemplate({ valueClass: 'a b', executingClass: 'c d' });
+    });
+
+    it('should display an edit icon on the cell', () => {
+      testEditingTemplate();
+    });
+
+    it('should display input element and save button if editing', () => {
+      testEditingTemplate(true);
     });
   });
 
@@ -677,7 +791,7 @@ describe('TableComponent', () => {
   describe('useCustomClass', () => {
     beforeEach(() => {
       component.customCss = {
-        'badge badge-danger': 'active',
+        'tag-danger': 'active',
         'secret secret-number': 123.456,
         btn: (v) => _.isString(v) && v.startsWith('http'),
         secure: (v) => _.isString(v) && v.startsWith('https')
@@ -696,7 +810,7 @@ describe('TableComponent', () => {
     });
 
     it('should match a string and return the corresponding class', () => {
-      expect(component.useCustomClass('active')).toBe('badge badge-danger');
+      expect(component.useCustomClass('active')).toBe('tag-danger');
     });
 
     it('should match a number and return the corresponding class', () => {

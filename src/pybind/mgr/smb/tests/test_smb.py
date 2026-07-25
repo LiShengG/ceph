@@ -722,3 +722,705 @@ def test_show_cluster_without_shares(tmodule):
 }
     """.strip()
     )
+
+
+def test_show_password_filter_hidden(tmodule):
+    _example_cfg_1(tmodule)
+    out = tmodule.show(password_filter=smb.enums.PasswordFilter.HIDDEN)
+    assert 'resources' in out
+    res = out['resources']
+    assert len(res) == 4
+    ja = [r for r in res if r['resource_type'] == 'ceph.smb.join.auth']
+    assert ja
+    join_auth = ja[0]
+    assert join_auth['auth']['username'] == 'testadmin'
+    assert join_auth['auth']['password'] == '****************'
+
+
+def test_show_password_filter_b64(tmodule):
+    _example_cfg_1(tmodule)
+    out = tmodule.show(password_filter=smb.enums.PasswordFilter.BASE64)
+    assert 'resources' in out
+    res = out['resources']
+    assert len(res) == 4
+    ja = [r for r in res if r['resource_type'] == 'ceph.smb.join.auth']
+    assert ja
+    join_auth = ja[0]
+    assert join_auth['auth']['username'] == 'testadmin'
+    assert join_auth['auth']['password'] == 'UGFzc3cwcmQ='
+
+
+def test_apply_password_filter(tmodule):
+    _example_cfg_1(tmodule)
+
+    txt = json.dumps(
+        {
+            'resource_type': 'ceph.smb.usersgroups',
+            'users_groups_id': 'ug1',
+            'intent': 'present',
+            'values': {
+                'users': [
+                    {'username': 'foo', 'password': 'YWJyYWNhZGFicmE='},
+                    {'username': 'bar', 'password': 'eHl6enk='},
+                ],
+                'groups': [],
+            },
+        }
+    )
+
+    rg = tmodule.apply_resources(
+        txt, password_filter=smb.enums.InputPasswordFilter.BASE64
+    )
+    assert rg.success, rg.to_simplified()
+    ts = rg.to_simplified()
+    assert len(ts['results']) == 1
+    r = ts['results'][0]['resource']
+    assert r['resource_type'] == 'ceph.smb.usersgroups'
+    assert len(r['values']['users']) == 2
+    # filtered passwords of command output should match input by default
+    assert r['values']['users'][0]['password'] == 'YWJyYWNhZGFicmE='
+    assert r['values']['users'][1]['password'] == 'eHl6enk='
+
+    # get unfiltered object
+    out = tmodule.show(['ceph.smb.usersgroups.ug1'])
+    assert out['resource_type'] == 'ceph.smb.usersgroups'
+    assert len(out['values']['users']) == 2
+    assert out['values']['users'][0]['password'] == 'abracadabra'
+    assert out['values']['users'][1]['password'] == 'xyzzy'
+
+
+def test_apply_password_filter_in_out(tmodule):
+    _example_cfg_1(tmodule)
+
+    txt = json.dumps(
+        {
+            'resource_type': 'ceph.smb.usersgroups',
+            'users_groups_id': 'ug1',
+            'intent': 'present',
+            'values': {
+                'users': [
+                    {'username': 'foo', 'password': 'YWJyYWNhZGFicmE='},
+                    {'username': 'bar', 'password': 'eHl6enk='},
+                ],
+                'groups': [],
+            },
+        }
+    )
+
+    rg = tmodule.apply_resources(
+        txt,
+        password_filter=smb.enums.InputPasswordFilter.BASE64,
+        password_filter_out=smb.enums.PasswordFilter.HIDDEN,
+    )
+    assert rg.success, rg.to_simplified()
+    ts = rg.to_simplified()
+    assert len(ts['results']) == 1
+    r = ts['results'][0]['resource']
+    assert r['resource_type'] == 'ceph.smb.usersgroups'
+    assert len(r['values']['users']) == 2
+    # filtered passwords of command output should match input by default
+    assert r['values']['users'][0]['password'] == '****************'
+    assert r['values']['users'][1]['password'] == '****************'
+
+    # get unfiltered object
+    out = tmodule.show(['ceph.smb.usersgroups.ug1'])
+    assert out['resource_type'] == 'ceph.smb.usersgroups'
+    assert len(out['values']['users']) == 2
+    assert out['values']['users'][0]['password'] == 'abracadabra'
+    assert out['values']['users'][1]['password'] == 'xyzzy'
+
+
+cert1 = """
+-----BEGIN CERTIFICATE-----
+MIIGFjCCA/6gAwIBAgIUZLL4QTx5ESBYQYS761DcZ7S1c24wDQYJKoZIhvcNAQEN
+BQAwgYgxCzAJBgNVBAYTAlVTMQswCQYDVQQIDAJNQTEPMA0GA1UEBwwGTG93ZWxs
+MR8wHQYDVQQKDBZCaXJjaCBTdHJlZXQgQ29tcHV0aW5nMRYwFAYDVQQDDA1Kb2hu
+IE11bGxpZ2FuMSIwIAYJKoZIhvcNAQkBFhNqb2hubUBhc3luY2hyb25vLnVzMB4X
+DTI1MDYzMDE5MzAwM1oXDTI2MDcyNDE5MzAwM1owbjELMAkGA1UEBhMCVVMxCzAJ
+BgNVBAgMAk1BMQ8wDQYDVQQHDAZMb3dlbGwxHzAdBgNVBAoMFkJpcmNoIFN0cmVl
+dCBDb21wdXRpbmcxIDAeBgNVBAMMF0ROUzpjZXBoMC5jeC5mZG9wZW4ubmV0MIIC
+IjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEApZYqA73a8ojX7QsCJHiXh0J2
+KKEqDU6k0Yjoie9raYCP/aaiJpffSjhKl1rYuIqjBUG5D0tdT3sRw3m96Nw6gkhM
+5J8r02muQpJqmzPmfAn75IVjRkJ9OsHyS1Mf9GADTfv3pMBkwqqrGb8NxWQXeS4s
+PLPBv8SI4ozFNwwlEvZ0kesI4Qf0VRZ1ieSzAArjDWWFX8kURMt6UzN8opnxGvzT
+cfY4J0iKCYBK6Vqmf/OrMg3IjDojKaQqBlMPAQURyiYeF1hfDrcqGQC6S4Iz5mDt
+ZsMywFQFlEhkWkhJdMMkY4bqvn01BKXl3WY0HY5pPslRWWfj4aQeBb8DFH+rFeTf
+I/S02ECE/SKc+O7JJa23HtzJspiaK/MV6XQUDDWYdFQEfLhQb3y3RuYJ7C0WZDMc
+EmJHuB1D0/RS5xWiukTyRbOFf0Dbzn07PPUycE5BaCJ/ekwpMBvYQ6uCZq19CRAE
+v5j7oyC1+rjOCKpTBPGCFWbODJmf5LrfcZLX/VtR+vu3a28OKmbxvdQ3uzLPwjFx
+szzsJRn4URyI5hxl3K0w5Yptd/mvdnSeQTnX9TmMFE/G+EdlGxZtc695mOvWX6gK
+ezwSqwtxVAZ18x/we6NZUkeuaC4+Xec8HoowHYmfRUH1P69ZXAuKKSIZizuvDYIF
+tfcDeDY6s0wp3SKQ1bUCAwEAAaOBkDCBjTAJBgNVHRMEAjAAMEAGA1UdEQQ5MDeC
+E2NlcGgwLmN4LmZkb3Blbi5uZXSCGnJjLnNtYi5jZXBoMC5jeC5mZG9wZW4ubmV0
+hwTAqEzIMB0GA1UdDgQWBBR9bOCw+6pMkeS1HnAuCFhmoM7NPzAfBgNVHSMEGDAW
+gBRsCQk9OUjWypZgtyH+5LxzZ4eBJDANBgkqhkiG9w0BAQ0FAAOCAgEAF6u76+6C
+JkQEqBSYU09JQT8JDWX3AUZDXoCIpv2F1UD26ueAIaYD1dkpKDFg0UOOBwC7TiR9
+uf210HtY5ic++Bm5xavhRk65FGwypv65SqjfehqTiRU+b0my0LG2OaAVrUcKWdbn
+ZvwiBr1I7Wyn0MV1Ko7sqZh0j7Y4kPXCa2D8QG1inr9YBQQpid7CUwNeS5eYAVbP
+gI4zTYKKvJMYPr4lTqsweCDOpctC7fwVb43XGTRVhVXQdOux9n5emROx/Ok0d2xX
+mi5rlUfMxlrWjs7KK336x8z31i3w+1xc1ESaF0eP1byikvpbYBN1dEYahilMaSVl
+3IpDYCwCFMU+ZZUZdqVyQQL+lTxqsc2orzzFgfv594hkEdYNlJ/z/f1b8idYk3g1
+WTrixgd+KYcHoCCS8pHFVs8lankBqQGMckZmIyzfP7RxY43j6XTV+4791O4o0waZ
+I5AwhUmgJj7G2Mp1jacMlHtZPqC0iDlci5fh6KpzVjPzrqA2sIN+9yJAlX8teJnC
+adKnxoY+AbqwLLTHfGx/W0W8jUxmea0eYufgUqxoQv5qdREafcuchGM36bKukVYb
+L3pqleYyvguwxxcc2MJvXjgAiZ5EsNJ2TCr4Mt0mZP406BhEQxfvpBSdRXTiHGJ/
+KNDwOknnnEhdXshW5M8G8ZhkahG8YABHTBw=
+-----END CERTIFICATE-----
+"""
+
+
+def test_tls_credential(tmodule):
+    _example_cfg_1(tmodule)
+
+    txt = json.dumps(
+        {
+            'resource_type': 'ceph.smb.tls.credential',
+            'tls_credential_id': 'tc1',
+            'intent': 'present',
+            'credential_type': 'cert',
+            'value': cert1,
+        }
+    )
+
+    rg = tmodule.apply_resources(txt)
+    assert rg.success, rg.to_simplified()
+    ts = rg.to_simplified()
+    assert len(ts['results']) == 1
+    r = ts['results'][0]['resource']
+    assert r['resource_type'] == 'ceph.smb.tls.credential'
+    out = tmodule.show()
+    res = out.get('resources')
+    assert res
+    assert len(res) == 5
+    clusters = [r for r in res if r['resource_type'] == 'ceph.smb.cluster']
+    assert len(clusters) == 1
+    shares = [r for r in res if r['resource_type'] == 'ceph.smb.share']
+    assert len(shares) == 2
+    jauths = [r for r in res if r['resource_type'] == 'ceph.smb.join.auth']
+    assert len(jauths) == 1
+    tcs = [r for r in res if r['resource_type'] == 'ceph.smb.tls.credential']
+    assert len(tcs) == 1
+    assert tcs[0]['credential_type'] == 'cert'
+    assert tcs[0]['value'] == cert1
+
+
+def test_tls_credential_yaml_show(tmodule):
+    _example_cfg_1(tmodule)
+
+    txt = json.dumps(
+        {
+            'resource_type': 'ceph.smb.tls.credential',
+            'tls_credential_id': 'tc1',
+            'intent': 'present',
+            'credential_type': 'cert',
+            'value': cert1,
+        }
+    )
+
+    rg = tmodule.apply_resources(txt)
+    assert rg.success, rg.to_simplified()
+    ts = rg.to_simplified()
+    assert len(ts['results']) == 1
+    r = ts['results'][0]['resource']
+    assert r['resource_type'] == 'ceph.smb.tls.credential'
+    res, body, status = tmodule.show.command(
+        ['ceph.smb.tls.credential'], format='yaml'
+    )
+    assert res == 0
+    body = body.strip()
+    assert 'value: |' in body
+
+
+def test_cmd_share_update_qos(tmodule):
+    cluster = _cluster(
+        cluster_id='qoscluster',
+        auth_mode=smb.enums.AuthMode.USER,
+        user_group_settings=[
+            smb.resources.UserGroupSource(
+                source_type=smb.resources.UserGroupSourceType.EMPTY,
+            ),
+        ],
+    )
+    share = smb.resources.Share(
+        cluster_id='qoscluster',
+        share_id='qostest',
+        name='QoS Test Share',
+        cephfs=smb.resources.CephFSStorage(
+            volume='cephfs',
+            path='/',
+        ),
+    )
+    rg = tmodule._handler.apply([cluster, share])
+    assert rg.success, rg.to_simplified()
+
+    # Test updating with positive values
+    res, body, status = tmodule.share_update_qos.command(
+        cluster_id='qoscluster',
+        share_id='qostest',
+        read_iops_limit=100,
+        write_iops_limit=200,
+        read_bw_limit="1048576",
+        write_bw_limit="2097152",
+        read_burst_mult=20,
+        write_burst_mult=15,
+    )
+    assert res == 0
+    bdata = json.loads(body)
+    assert bdata['success']
+    assert bdata['state'] == 'updated'
+
+    # Verify the QoS settings were updated
+    updated_shares = tmodule._handler.matching_resources(
+        ['ceph.smb.share.qoscluster.qostest']
+    )
+    assert len(updated_shares) == 1
+    updated_share = updated_shares[0]
+    assert updated_share.cephfs.qos is not None
+    assert updated_share.cephfs.qos.read_iops_limit == 100
+    assert updated_share.cephfs.qos.write_iops_limit == 200
+    assert updated_share.cephfs.qos.read_bw_limit == "1048576"
+    assert updated_share.cephfs.qos.write_bw_limit == "2097152"
+    assert updated_share.cephfs.qos.read_burst_mult == 20
+    assert updated_share.cephfs.qos.write_burst_mult == 15
+
+    # Test updating with 0 values (should remove QoS)
+    res, body, status = tmodule.share_update_qos.command(
+        cluster_id='qoscluster',
+        share_id='qostest',
+        read_iops_limit=0,
+        write_iops_limit=0,
+        read_bw_limit="0",
+        write_bw_limit="0",
+    )
+    assert res == 0
+    bdata = json.loads(body)
+    assert bdata['success']
+    assert bdata['state'] == 'updated'
+
+    # Verify QoS was removed
+    updated_shares = tmodule._handler.matching_resources(
+        ['ceph.smb.share.qoscluster.qostest']
+    )
+    updated_share = updated_shares[0]
+    assert updated_share.cephfs.qos is None
+
+    # Test updating with some values and keeping others
+    res, body, status = tmodule.share_update_qos.command(
+        cluster_id='qoscluster',
+        share_id='qostest',
+        read_iops_limit=500,
+        write_bw_limit="524288",
+    )
+    assert res == 0
+    bdata = json.loads(body)
+    assert bdata['success']
+    assert bdata['state'] == 'updated'
+
+    # Verify partial update
+    updated_shares = tmodule._handler.matching_resources(
+        ['ceph.smb.share.qoscluster.qostest']
+    )
+    updated_share = updated_shares[0]
+    assert updated_share.cephfs.qos is not None
+    assert updated_share.cephfs.qos.read_iops_limit == 500
+    assert updated_share.cephfs.qos.write_iops_limit is None
+    assert updated_share.cephfs.qos.read_bw_limit is None
+    assert updated_share.cephfs.qos.write_bw_limit == "524288"
+    assert updated_share.cephfs.qos.read_burst_mult == 15  # Default
+    assert updated_share.cephfs.qos.write_burst_mult == 15  # Default
+
+
+def test_cmd_cluster_update_qos(tmodule):
+    cluster = _cluster(
+        cluster_id='qoscluster',
+        auth_mode=smb.enums.AuthMode.USER,
+        user_group_settings=[
+            smb.resources.UserGroupSource(
+                source_type=smb.resources.UserGroupSourceType.EMPTY,
+            ),
+        ],
+    )
+
+    share1 = smb.resources.Share(
+        cluster_id='qoscluster',
+        share_id='share1',
+        name='Share One',
+        cephfs=smb.resources.CephFSStorage(
+            volume='cephfs',
+            path='/share1',
+        ),
+    )
+    share2 = smb.resources.Share(
+        cluster_id='qoscluster',
+        share_id='share2',
+        name='Share Two',
+        cephfs=smb.resources.CephFSStorage(
+            volume='cephfs',
+            path='/share2',
+        ),
+    )
+    share3 = smb.resources.Share(
+        cluster_id='qoscluster',
+        share_id='share3',
+        name='Share Three',
+        cephfs=smb.resources.CephFSStorage(
+            volume='cephfs',
+            path='/share3',
+        ),
+    )
+
+    rg = tmodule._handler.apply([cluster, share1, share2, share3])
+    assert rg.success, rg.to_simplified()
+
+    res, body, status = tmodule.cluster_update_qos.command(
+        cluster_id='qoscluster',
+        read_iops_limit=100,
+        write_iops_limit=200,
+        read_bw_limit="1048576",
+        write_bw_limit="2097152",
+        read_burst_mult=20,
+        write_burst_mult=15,
+    )
+    assert res == 0
+    bdata = json.loads(body)
+    assert bdata['success']
+    assert bdata['cluster_id'] == 'qoscluster'
+    assert bdata['total_shares'] == 3
+    assert len(bdata['successful_updates']) == 3
+    assert len(bdata['failed_updates']) == 0
+
+    for share_id in ['share1', 'share2', 'share3']:
+        updated_shares = tmodule._handler.matching_resources(
+            [f'ceph.smb.share.qoscluster.{share_id}']
+        )
+        assert len(updated_shares) == 1
+        updated_share = updated_shares[0]
+        assert updated_share.cephfs.qos is not None
+        assert updated_share.cephfs.qos.read_iops_limit == 100
+        assert updated_share.cephfs.qos.write_iops_limit == 200
+        assert updated_share.cephfs.qos.read_bw_limit == "1048576"
+        assert updated_share.cephfs.qos.write_bw_limit == "2097152"
+        assert updated_share.cephfs.qos.read_burst_mult == 20
+        assert updated_share.cephfs.qos.write_burst_mult == 15
+
+
+def _keybridge_example():
+    return [
+        {
+            'resource_type': 'ceph.smb.tls.credential',
+            'tls_credential_id': 'cert1',
+            'intent': 'present',
+            'credential_type': 'cert',
+            'value': cert1,
+        },
+        {
+            'resource_type': 'ceph.smb.tls.credential',
+            'tls_credential_id': 'key1',
+            'intent': 'present',
+            'credential_type': 'key',
+            'value': cert1,
+        },
+        {
+            'resource_type': 'ceph.smb.tls.credential',
+            'tls_credential_id': 'cacert1',
+            'intent': 'present',
+            'credential_type': 'ca-cert',
+            'value': cert1,
+        },
+        {
+            'resource_type': 'ceph.smb.cluster',
+            'cluster_id': 'foo',
+            'auth_mode': 'active-directory',
+            'intent': 'present',
+            'clustering': 'never',
+            'domain_settings': {
+                'realm': 'dom1.example.com',
+                'join_sources': [
+                    {
+                        'source_type': 'resource',
+                        'ref': 'foo',
+                    }
+                ],
+            },
+            "keybridge": {
+                "scopes": [
+                    {"name": "mem"},
+                    {
+                        "name": "kmip",
+                        "kmip_hosts": ["zorg.example.net"],
+                        "kmip_port": 78989,
+                        "kmip_cert": {"ref": "cert1"},
+                        "kmip_key": {"ref": "key1"},
+                        "kmip_ca_cert": {"ref": "cacert1"},
+                    },
+                ],
+            },
+        },
+        {
+            'resource_type': 'ceph.smb.join.auth',
+            'auth_id': 'foo',
+            'intent': 'present',
+            'auth': {
+                'username': 'testadmin',
+                'password': 'Passw0rd',
+            },
+        },
+        {
+            'resource_type': 'ceph.smb.share',
+            'cluster_id': 'foo',
+            'share_id': 's1',
+            'intent': 'present',
+            'name': 'Ess One',
+            'readonly': False,
+            'browseable': True,
+            'cephfs': {
+                'volume': 'cephfs',
+                'path': '/',
+                'provider': 'samba-vfs',
+                "fscrypt_key": {
+                    "scope": "mem",
+                    "name": "bob",
+                },
+            },
+        },
+    ]
+
+
+def test_keybridge_config(tmodule):
+    txt = json.dumps(_keybridge_example())
+
+    rg = tmodule.apply_resources(txt)
+    assert rg.success, rg.to_simplified()
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        dict(scopes=[{'name': 'joe'}], expected='invalid scope type'),
+        dict(scopes=[{'name': 'mem.joe'}], expected='invalid scope name'),
+        dict(scopes=[{'name': 'kmip.00'}], expected='invalid scope name'),
+        dict(scopes=[{'name': 'kmip.'}], expected='invalid scope name'),
+        dict(scopes=[{'name': 'kmip._'}], expected='invalid scope name'),
+        dict(scopes=[], enabled=True, expected='at least one scope'),
+        dict(scopes=[{'name': 'kmip'}], expected='kmip hostname'),
+        dict(
+            scopes=[{'name': 'kmip', 'kmip_hosts': ['foo.example.org']}],
+            expected='kmip default port',
+        ),
+        dict(
+            scopes=[
+                {
+                    'name': 'kmip',
+                    'kmip_hosts': ['foo.example.org'],
+                    'kmip_port': 67890,
+                }
+            ],
+            expected='cert',
+        ),
+        dict(
+            scopes=[
+                {
+                    'name': 'mem',
+                    'kmip_hosts': ['foo.example.org'],
+                    'kmip_port': 67890,
+                }
+            ],
+            expected='mem',
+        ),
+    ],
+)
+def test_keybridge_config_scope_error(tmodule, params):
+    example = _keybridge_example()
+    if enabled := params.get('enabled'):
+        example[3]['keybridge']['enabled'] = enabled
+    example[3]['keybridge']['scopes'] = params['scopes']
+    txt = json.dumps(example)
+
+    rg = tmodule.apply_resources(txt)
+    assert not rg.success, rg.to_simplified()
+    failures = [r for r in rg if not r.success]
+    assert len(failures) == 1
+    failure = failures[0]
+    assert params['expected'] in failure.msg
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        dict(fkey={'scope': 'mem', 'name': ''}, expected='valid'),
+        dict(fkey={'scope': 'mem', 'name': '-'}, expected='valid'),
+        dict(fkey={'scope': '-', 'name': 'foo'}, expected='valid'),
+        dict(
+            fkey={'scope': 'mim', 'name': 'foo'},
+            expected='invalid scope type',
+        ),
+        dict(
+            fkey={'scope': 'mem.bob', 'name': 'foo'},
+            expected='invalid scope name',
+        ),
+        dict(
+            fkey={'scope': 'kmip.-', 'name': 'foo'},
+            expected='invalid scope name',
+        ),
+        dict(
+            fkey={'scope': 'kmip.foo', 'name': 'foo'},
+            expected='scope name not known',
+        ),
+    ],
+)
+def test_share_fscrypt_config_error(tmodule, params):
+    example = _keybridge_example()
+    example[-1]['cephfs']['fscrypt_key'] = params['fkey']
+    txt = json.dumps(example)
+
+    rg = tmodule.apply_resources(txt)
+    assert not rg.success, rg.to_simplified()
+    failures = [r for r in rg if not r.success]
+    assert len(failures) == 1
+    failure = failures[0]
+    assert params['expected'] in failure.msg
+
+
+def test_share_rm_wildcard(tmodule):
+    _example_cfg_1(tmodule)
+
+    result = tmodule.share_rm('foo', 's*', wildcard=True)
+    assert result.success
+    assert len(list(result)) == 2
+
+
+def test_share_rm_wildcard_one_match(tmodule):
+    _example_cfg_1(tmodule)
+
+    result = tmodule.share_rm('foo', 'st*', wildcard=True)
+    assert result.success
+    assert len(list(result)) == 1
+
+
+def test_share_rm_wildcard_no_match(tmodule):
+    _example_cfg_1(tmodule)
+
+    with pytest.raises(smb.cli.NoMatchingValue):
+        tmodule.share_rm('foo', 'q*', wildcard=True)
+
+
+def test_cluster_rm_recursive(tmodule):
+    _example_cfg_1(tmodule)
+
+    result = tmodule.cluster_rm('foo', recursive=True)
+    assert result.success
+
+
+def test_cluster_rm_recursive_wildcard(tmodule):
+    _example_cfg_1(tmodule)
+
+    result = tmodule.cluster_rm('*', recursive=True, wildcard=True)
+    assert result.success
+    assert len(list(result)) == 3  # 1 cluster + 2 share
+
+
+def test_cluster_rm_wildcard_no_match(tmodule):
+    _example_cfg_1(tmodule)
+
+    with pytest.raises(smb.cli.NoMatchingValue):
+        tmodule.cluster_rm('gonk', wildcard=True)
+
+
+def test_cluster_update_client_compat(tmodule):
+    """Test updating cluster client compatibility mode with shares."""
+    # Create a cluster with default client_compat
+    cluster = _cluster(
+        cluster_id='foo',
+        auth_mode=smb.enums.AuthMode.USER,
+        user_group_settings=[
+            smb.resources.UserGroupSource(
+                source_type=smb.resources.UserGroupSourceType.EMPTY,
+            ),
+        ],
+    )
+    rg = tmodule._handler.apply([cluster])
+    assert rg.success, rg.to_simplified()
+
+    # Create some shares
+    share1 = smb.resources.Share(
+        cluster_id='foo',
+        share_id='share1',
+        cephfs=smb.resources.CephFSStorage(
+            volume='cephfs',
+            path='/share1',
+        ),
+    )
+    share2 = smb.resources.Share(
+        cluster_id='foo',
+        share_id='share2',
+        cephfs=smb.resources.CephFSStorage(
+            volume='cephfs',
+            path='/share2',
+        ),
+    )
+    rg = tmodule._handler.apply([share1, share2])
+    assert rg.success, rg.to_simplified()
+
+    # Verify initial state (should be None/DEFAULT)
+    clusters = tmodule._handler.matching_resources(['ceph.smb.cluster.foo'])
+    assert len(clusters) == 1
+    initial_cluster = clusters[0]
+    assert initial_cluster.client_compat is None
+    assert (
+        initial_cluster.effective_client_compat
+        == smb.enums.ClientSupportMode.DEFAULT
+    )
+
+    # Update to MACOS compatibility mode
+    result = tmodule.cluster_update_client_compat(
+        smb.enums.ClientSupportMode.MACOS, 'foo'
+    )
+    assert isinstance(result, dict)
+    assert result['cluster_id'] == 'foo'
+    assert result['client_compat'] == 'macos'
+    assert result['cluster_updated'] is True
+    assert result['total_shares'] == 2
+    assert len(result['successful_share_updates']) == 2
+    assert 'share1' in result['successful_share_updates']
+    assert 'share2' in result['successful_share_updates']
+    assert len(result['failed_share_updates']) == 0
+
+    # Verify the update
+    clusters = tmodule._handler.matching_resources(['ceph.smb.cluster.foo'])
+    assert len(clusters) == 1
+    updated_cluster = clusters[0]
+    assert updated_cluster.client_compat == smb.enums.ClientSupportMode.MACOS
+    assert (
+        updated_cluster.effective_client_compat
+        == smb.enums.ClientSupportMode.MACOS
+    )
+    assert updated_cluster.is_macos_compatibility_enabled is True
+
+    # Update back to DEFAULT
+    result = tmodule.cluster_update_client_compat(
+        smb.enums.ClientSupportMode.DEFAULT, 'foo'
+    )
+    assert isinstance(result, dict)
+    assert result['cluster_id'] == 'foo'
+    assert result['client_compat'] == 'default'
+    assert result['cluster_updated'] is True
+    assert result['total_shares'] == 2
+
+    # Verify the update back to DEFAULT
+    clusters = tmodule._handler.matching_resources(['ceph.smb.cluster.foo'])
+    assert len(clusters) == 1
+    final_cluster = clusters[0]
+    assert final_cluster.client_compat == smb.enums.ClientSupportMode.DEFAULT
+    assert (
+        final_cluster.effective_client_compat
+        == smb.enums.ClientSupportMode.DEFAULT
+    )
+    assert final_cluster.is_macos_compatibility_enabled is False
+
+
+def test_cluster_update_client_compat_nonexistent(tmodule):
+    """Test updating client_compat for a non-existent cluster."""
+    with pytest.raises(ValueError, match="Cluster nonexistent not found"):
+        tmodule.cluster_update_client_compat(
+            smb.enums.ClientSupportMode.MACOS, 'nonexistent'
+        )

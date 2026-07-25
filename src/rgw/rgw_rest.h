@@ -1,5 +1,5 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab ft=cpp
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab ft=cpp
 
 #pragma once
 
@@ -129,39 +129,30 @@ public:
   }
 
   int get_params(optional_yield y) override;
-  virtual std::string canonical_name() const override { return fmt::format("REST.{}.OBJECT", s->info.method); }
 };
 
 class RGWGetObjTags_ObjStore : public RGWGetObjTags {
 public:
   RGWGetObjTags_ObjStore() {};
   ~RGWGetObjTags_ObjStore() {};
-
-  virtual std::string canonical_name() const override { return fmt::format("REST.{}.OBJECT_TAGGING", s->info.method); }
 };
 
 class RGWPutObjTags_ObjStore: public RGWPutObjTags {
 public:
   RGWPutObjTags_ObjStore() {};
   ~RGWPutObjTags_ObjStore() {};
-
-  virtual std::string canonical_name() const override { return fmt::format("REST.{}.OBJECT_TAGGING", s->info.method); }
 };
 
 class RGWGetBucketTags_ObjStore : public RGWGetBucketTags {
 public:
   RGWGetBucketTags_ObjStore() = default;
   virtual ~RGWGetBucketTags_ObjStore() = default;
-
-  virtual std::string canonical_name() const override { return fmt::format("REST.{}.BUCKET_TAGGING", s->info.method); }
 };
 
 class RGWPutBucketTags_ObjStore: public RGWPutBucketTags {
 public:
   RGWPutBucketTags_ObjStore() = default;
   virtual ~RGWPutBucketTags_ObjStore() = default;
-
-  virtual std::string canonical_name() const override { return fmt::format("REST.{}.BUCKET_TAGGING", s->info.method); }
 };
 
 class RGWGetBucketReplication_ObjStore : public RGWGetBucketReplication {
@@ -186,56 +177,42 @@ class RGWListBuckets_ObjStore : public RGWListBuckets {
 public:
   RGWListBuckets_ObjStore() {}
   ~RGWListBuckets_ObjStore() override {}
-
-  virtual std::string canonical_name() const override { return fmt::format("REST.{}.BUCKETS", s->info.method); }
 };
 
 class RGWGetUsage_ObjStore : public RGWGetUsage {
 public:
   RGWGetUsage_ObjStore() {}
   ~RGWGetUsage_ObjStore() override {}
-
-  virtual std::string canonical_name() const override { return fmt::format("REST.{}.USER_USAGE", s->info.method); }
 };
 
 class RGWListBucket_ObjStore : public RGWListBucket {
 public:
   RGWListBucket_ObjStore() {}
   ~RGWListBucket_ObjStore() override {}
-
-  virtual std::string canonical_name() const override { return fmt::format("REST.{}.BUCKET", s->info.method); }
 };
 
 class RGWStatAccount_ObjStore : public RGWStatAccount {
 public:
   RGWStatAccount_ObjStore() {}
   ~RGWStatAccount_ObjStore() override {}
-
-  virtual std::string canonical_name() const override { return fmt::format("REST.{}.ACCOUNT_STATUS", s->info.method); }
 };
 
 class RGWStatBucket_ObjStore : public RGWStatBucket {
 public:
   RGWStatBucket_ObjStore() {}
   ~RGWStatBucket_ObjStore() override {}
-
-  virtual std::string canonical_name() const override { return fmt::format("REST.{}.BUCKET_STATUS", s->info.method); }
 };
 
 class RGWCreateBucket_ObjStore : public RGWCreateBucket {
 public:
   RGWCreateBucket_ObjStore() {}
   ~RGWCreateBucket_ObjStore() override {}
-
-  virtual std::string canonical_name() const override { return fmt::format("REST.{}.BUCKET", s->info.method); }
 };
 
 class RGWDeleteBucket_ObjStore : public RGWDeleteBucket {
 public:
   RGWDeleteBucket_ObjStore() {}
   ~RGWDeleteBucket_ObjStore() override {}
-
-  virtual std::string canonical_name() const override { return fmt::format("REST.{}.BUCKET", s->info.method); }
 };
 
 class RGWPutObj_ObjStore : public RGWPutObj
@@ -247,8 +224,6 @@ public:
   int verify_params() override;
   int get_params(optional_yield y) override;
   int get_data(bufferlist& bl) override;
-
-  virtual std::string canonical_name() const override { return fmt::format("REST.{}.OBJECT", s->info.method); }
 };
 
 class RGWPostObj_ObjStore : public RGWPostObj
@@ -319,7 +294,6 @@ public:
   ~RGWPostObj_ObjStore() override {}
 
   int verify_params() override;
-  virtual std::string canonical_name() const override { return fmt::format("REST.{}.OBJECT", s->info.method); }
 };
 
 
@@ -328,8 +302,6 @@ class RGWPutMetadataAccount_ObjStore : public RGWPutMetadataAccount
 public:
   RGWPutMetadataAccount_ObjStore() {}
   ~RGWPutMetadataAccount_ObjStore() override {}
-
-  virtual std::string canonical_name() const override { return fmt::format("REST.{}.ACCOUNT_METADATA", s->info.method); }
 };
 
 class RGWPutMetadataBucket_ObjStore : public RGWPutMetadataBucket
@@ -337,8 +309,6 @@ class RGWPutMetadataBucket_ObjStore : public RGWPutMetadataBucket
 public:
   RGWPutMetadataBucket_ObjStore() {}
   ~RGWPutMetadataBucket_ObjStore() override {}
-
-  virtual std::string canonical_name() const override { return fmt::format("REST.{}.BUCKET_METADATA", s->info.method); }
 };
 
 class RGWPutMetadataObject_ObjStore : public RGWPutMetadataObject
@@ -346,24 +316,18 @@ class RGWPutMetadataObject_ObjStore : public RGWPutMetadataObject
 public:
   RGWPutMetadataObject_ObjStore() {}
   ~RGWPutMetadataObject_ObjStore() override {}
-
-  virtual std::string canonical_name() const override { return fmt::format("REST.{}.OBJECT_METADATA", s->info.method); }
 };
 
 class RGWRestoreObj_ObjStore : public RGWRestoreObj {
 public:
   RGWRestoreObj_ObjStore() {}
   ~RGWRestoreObj_ObjStore() override {}
-
-  virtual std::string canonical_name() const override { return fmt::format("REST.{}.OBJECT", s->info.method); }
 };
 
 class RGWDeleteObj_ObjStore : public RGWDeleteObj {
 public:
   RGWDeleteObj_ObjStore() {}
   ~RGWDeleteObj_ObjStore() override {}
-
-  virtual std::string canonical_name() const override { return fmt::format("REST.{}.OBJECT", s->info.method); }
 };
 
 class  RGWGetCrossDomainPolicy_ObjStore : public RGWGetCrossDomainPolicy {
@@ -382,33 +346,36 @@ class RGWCopyObj_ObjStore : public RGWCopyObj {
 public:
   RGWCopyObj_ObjStore() {}
   ~RGWCopyObj_ObjStore() override {}
-
-  virtual std::string canonical_name() const override { return fmt::format("REST.{}.OBJECT", s->info.method); }
 };
 
 class RGWGetACLs_ObjStore : public RGWGetACLs {
 public:
   RGWGetACLs_ObjStore() {}
   ~RGWGetACLs_ObjStore() override {}
-
-  virtual std::string canonical_name() const override { return fmt::format("REST.{}.ACL", s->info.method); }
 };
 
 class RGWPutACLs_ObjStore : public RGWPutACLs {
 public:
   RGWPutACLs_ObjStore() {}
   ~RGWPutACLs_ObjStore() override {}
-
   int get_params(optional_yield y) override;
-  virtual std::string canonical_name() const override { return fmt::format("REST.{}.ACL", s->info.method); }
+};
+
+class RGWGetObjAttrs_ObjStore : public RGWGetObjAttrs {
+public:
+  RGWGetObjAttrs_ObjStore() {}
+  ~RGWGetObjAttrs_ObjStore() override {}
+
+  int get_params(optional_yield y) = 0;
+  /* not actually used */
+  int send_response_data_error(optional_yield y) override { return 0; };
+  int send_response_data(bufferlist& bl, off_t ofs, off_t len) override { return 0; };
 };
 
 class RGWGetLC_ObjStore : public RGWGetLC {
 public:
   RGWGetLC_ObjStore() {}
   ~RGWGetLC_ObjStore() override {}
-
-  virtual std::string canonical_name() const override { return fmt::format("REST.{}.LIFECYCLE", s->info.method); }
 };
 
 class RGWPutLC_ObjStore : public RGWPutLC {
@@ -417,47 +384,36 @@ public:
   ~RGWPutLC_ObjStore() override {}
 
   int get_params(optional_yield y) override;
-  virtual std::string canonical_name() const override { return fmt::format("REST.{}.LIFECYCLE", s->info.method); }
 };
 
 class RGWDeleteLC_ObjStore : public RGWDeleteLC {
 public:
   RGWDeleteLC_ObjStore() {}
   ~RGWDeleteLC_ObjStore() override {}
-
-  virtual std::string canonical_name() const override { return fmt::format("REST.{}.LIFECYCLE", s->info.method); }
 };
 
 class RGWGetCORS_ObjStore : public RGWGetCORS {
 public:
   RGWGetCORS_ObjStore() {}
   ~RGWGetCORS_ObjStore() override {}
-
-  virtual std::string canonical_name() const override { return fmt::format("REST.{}.CORS", s->info.method); }
 };
 
 class RGWPutCORS_ObjStore : public RGWPutCORS {
 public:
   RGWPutCORS_ObjStore() {}
   ~RGWPutCORS_ObjStore() override {}
-
-  virtual std::string canonical_name() const override { return fmt::format("REST.{}.CORS", s->info.method); }
 };
 
 class RGWDeleteCORS_ObjStore : public RGWDeleteCORS {
 public:
   RGWDeleteCORS_ObjStore() {}
   ~RGWDeleteCORS_ObjStore() override {}
-
-  virtual std::string canonical_name() const override { return fmt::format("REST.{}.CORS", s->info.method); }
 };
 
 class RGWOptionsCORS_ObjStore : public RGWOptionsCORS {
 public:
   RGWOptionsCORS_ObjStore() {}
   ~RGWOptionsCORS_ObjStore() override {}
-
-  virtual std::string canonical_name() const override { return fmt::format("REST.{}.CORS", s->info.method); }
 };
 
 class RGWGetBucketEncryption_ObjStore : public RGWGetBucketEncryption {
@@ -478,20 +434,22 @@ public:
   ~RGWDeleteBucketEncryption_ObjStore() override {}
 };
 
+class RGWGetBucketOwnershipControls_ObjStore : public RGWGetBucketOwnershipControls {};
+
+class RGWPutBucketOwnershipControls_ObjStore : public RGWPutBucketOwnershipControls {};
+
+class RGWDeleteBucketOwnershipControls_ObjStore : public RGWDeleteBucketOwnershipControls {};
+
 class RGWInitMultipart_ObjStore : public RGWInitMultipart {
 public:
   RGWInitMultipart_ObjStore() {}
   ~RGWInitMultipart_ObjStore() override {}
-
-  virtual std::string canonical_name() const override { return fmt::format("REST.{}.UPLOADS", s->info.method); }
 };
 
 class RGWCompleteMultipart_ObjStore : public RGWCompleteMultipart {
 public:
   RGWCompleteMultipart_ObjStore() {}
   ~RGWCompleteMultipart_ObjStore() override {}
-
-  virtual std::string canonical_name() const override { return fmt::format("REST.{}.UPLOAD", s->info.method); }
   int get_params(optional_yield y) override;
 };
 
@@ -499,16 +457,12 @@ class RGWAbortMultipart_ObjStore : public RGWAbortMultipart {
 public:
   RGWAbortMultipart_ObjStore() {}
   ~RGWAbortMultipart_ObjStore() override {}
-
-  virtual std::string canonical_name() const override { return fmt::format("REST.{}.UPLOAD", s->info.method); }
 };
 
 class RGWListMultipart_ObjStore : public RGWListMultipart {
 public:
   RGWListMultipart_ObjStore() {}
   ~RGWListMultipart_ObjStore() override {}
-
-  virtual std::string canonical_name() const override { return fmt::format("REST.{}.UPLOAD", s->info.method); }
   int get_params(optional_yield y) override;
 };
 
@@ -516,8 +470,6 @@ class RGWListBucketMultiparts_ObjStore : public RGWListBucketMultiparts {
 public:
   RGWListBucketMultiparts_ObjStore() {}
   ~RGWListBucketMultiparts_ObjStore() override {}
-
-  virtual std::string canonical_name() const override { return fmt::format("REST.{}.UPLOADS", s->info.method); }
   int get_params(optional_yield y) override;
 };
 
@@ -525,16 +477,12 @@ class RGWBulkDelete_ObjStore : public RGWBulkDelete {
 public:
   RGWBulkDelete_ObjStore() {}
   ~RGWBulkDelete_ObjStore() override {}
-
-  virtual std::string canonical_name() const override { return fmt::format("REST.{}.BULK_DELETE", s->info.method); }
 };
 
 class RGWBulkUploadOp_ObjStore : public RGWBulkUploadOp {
 public:
   RGWBulkUploadOp_ObjStore() = default;
   ~RGWBulkUploadOp_ObjStore() = default;
-
-  virtual std::string canonical_name() const override { return fmt::format("REST.{}.BULK_UPLOAD", s->info.method); }
 };
 
 class RGWDeleteMultiObj_ObjStore : public RGWDeleteMultiObj {
@@ -543,7 +491,6 @@ public:
   ~RGWDeleteMultiObj_ObjStore() override {}
 
   int get_params(optional_yield y) override;
-  virtual std::string canonical_name() const override { return fmt::format("REST.{}.DELETE_MULTI_OBJECT", s->info.method); }
 };
 
 class RGWInfo_ObjStore : public RGWInfo {
@@ -808,13 +755,7 @@ inline void dump_header_prefixed(req_state* s,
 				 const std::string_view& name_prefix,
 				 const std::string_view& name,
 				 Args&&... args) {
-  char full_name_buf[name_prefix.size() + name.size() + 1];
-  const auto len = snprintf(full_name_buf, sizeof(full_name_buf), "%.*s%.*s",
-                            static_cast<int>(name_prefix.length()),
-                            name_prefix.data(),
-                            static_cast<int>(name.length()),
-                            name.data());
-  std::string_view full_name(full_name_buf, len);
+  const auto full_name = fmt::format("{}{}", name_prefix, name);
   return dump_header(s, std::move(full_name), std::forward<Args>(args)...);
 }
 
@@ -824,15 +765,7 @@ inline void dump_header_infixed(req_state* s,
 				const std::string_view& infix,
 				const std::string_view& sufix,
 				Args&&... args) {
-  char full_name_buf[prefix.size() + infix.size() + sufix.size() + 1];
-  const auto len = snprintf(full_name_buf, sizeof(full_name_buf), "%.*s%.*s%.*s",
-                            static_cast<int>(prefix.length()),
-                            prefix.data(),
-                            static_cast<int>(infix.length()),
-                            infix.data(),
-                            static_cast<int>(sufix.length()),
-                            sufix.data());
-  std::string_view full_name(full_name_buf, len);
+  auto full_name = fmt::format("{}{}{}", prefix, infix, sufix);
   return dump_header(s, std::move(full_name), std::forward<Args>(args)...);
 }
 
@@ -841,10 +774,8 @@ inline void dump_header_quoted(req_state* s,
 			       const std::string_view& name,
 			       const std::string_view& val) {
   /* We need two extra bytes for quotes. */
-  char qvalbuf[val.size() + 2 + 1];
-  const auto len = snprintf(qvalbuf, sizeof(qvalbuf), "\"%.*s\"",
-                            static_cast<int>(val.length()), val.data());
-  return dump_header(s, name, std::string_view(qvalbuf, len));
+  auto qval = fmt::format("\"{}\"", val);
+  return dump_header(s, name, std::move(qval));
 }
 
 template <class ValueT>
@@ -877,8 +808,7 @@ inline std::string compute_domain_uri(const req_state *s) {
   std::string uri = (!s->info.domain.empty()) ? s->info.domain :
     [&s]() -> std::string {
     RGWEnv const &env(*(s->info.env));
-    std::string uri =
-    env.get("SERVER_PORT_SECURE") ? "https://" : "http://";
+    std::string uri = rgw_transport_is_secure(s->cct, env) ? "https://" : "http://";
     if (env.exists("SERVER_NAME")) {
       uri.append(env.get("SERVER_NAME", "<SERVER_NAME>"));
     } else {
@@ -888,6 +818,12 @@ inline std::string compute_domain_uri(const req_state *s) {
   }();
   return uri;
 }
+
+// Transform S3 virtual-host style requests to a path-style request.
+// When the Host header includes the bucket name as a subdomain, prepend
+// that bucket name to s->info.request_uri then re-url-decode that
+// into s->decoded_uri.
+int rgw_rest_transform_s3_vhost_style(req_state* s);
 
 extern void dump_content_length(req_state *s, uint64_t len);
 extern void dump_etag(req_state *s,
@@ -903,6 +839,7 @@ extern void dump_range(req_state* s, uint64_t ofs, uint64_t end,
 extern void dump_continue(req_state *s);
 extern void list_all_buckets_end(req_state *s);
 extern void dump_time(req_state *s, const char *name, real_time t);
+extern void dump_time_exact_seconds(req_state *s, const char *name, real_time t);
 extern std::string dump_time_to_str(const real_time& t);
 extern void dump_bucket_from_state(req_state *s);
 extern void dump_redirect(req_state *s, const std::string& redirect);

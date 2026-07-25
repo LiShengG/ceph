@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph - scalable distributed file system
  *
@@ -12,13 +13,18 @@
  * 
  */
 
-
-#include "OSDMonitor.h"
-
 #include "FSCommands.h"
+#include "OSDMonitor.h"
 #include "MDSMonitor.h"
 #include "MgrStatMonitor.h"
+#include "Monitor.h"
+#include "Paxos.h"
 #include "mds/cephfs_features.h"
+#include "mds/FSMap.h"
+#include "osd/OSDMap.h"
+#include "common/strtol.h" // for strict_strtoll()
+
+#include <boost/optional.hpp>
 
 using TOPNSPC::common::cmd_getval;
 
@@ -108,29 +114,29 @@ class FailHandler : public FileSystemCommandHandler
       return -ENOENT;
     }
 
-  bool confirm = false;
-  cmd_getval(cmdmap, "yes_i_really_mean_it", confirm);
-  if (!confirm &&
-      mon->mdsmon()->has_health_warnings({
-	MDS_HEALTH_TRIM, MDS_HEALTH_CACHE_OVERSIZED})) {
-    ss << errmsg_for_unhealthy_mds;
-    return -EPERM;
-  }
+    vector<mds_gid_t> mds_gids_to_fail;
+    for (const auto& p : fsp->get_mds_map().get_mds_info()) {
+      mds_gids_to_fail.push_back(p.first);
+    }
+
+    bool confirm = false;
+    cmd_getval(cmdmap, "yes_i_really_mean_it", confirm);
+    if (!confirm &&
+	mon->mdsmon()->has_health_warnings({
+	  MDS_HEALTH_TRIM, MDS_HEALTH_CACHE_OVERSIZED}, mds_gids_to_fail)) {
+      ss << errmsg_for_unhealthy_mds;
+      return -EPERM;
+    }
 
     auto f = [](auto&& fs) {
       fs.get_mds_map().set_flag(CEPH_MDSMAP_NOT_JOINABLE);
     };
     fsmap.modify_filesystem(fsp->get_fscid(), std::move(f));
 
-    vector<mds_gid_t> to_fail;
-    for (const auto& p : fsp->get_mds_map().get_mds_info()) {
-      to_fail.push_back(p.first);
-    }
-
-    for (const auto& gid : to_fail) {
+    for (const auto& gid : mds_gids_to_fail) {
       mon->mdsmon()->fail_mds_gid(fsmap, gid);
     }
-    if (!to_fail.empty()) {
+    if (!mds_gids_to_fail.empty()) {
       mon->osdmon()->propose_pending();
     }
 
@@ -416,9 +422,10 @@ int FileSystemCommandHandler::set_val(Monitor *mon, FSMap& fsmap, MonOpRequestRe
   const Filesystem* fsp;
   if (std::holds_alternative<Filesystem*>(fsv)) {
     fsp = std::get<Filesystem*>(fsv);
-  } else if (std::holds_alternative<fs_cluster_id_t>(fsv)) {
+  } else {
+    ceph_assert(std::holds_alternative<fs_cluster_id_t>(fsv));
     fsp = &fsmap.get_filesystem(std::get<fs_cluster_id_t>(fsv));
-  } else ceph_assert(0);
+  }
 
   {
     std::string interr;

@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph - scalable distributed file system
  *
@@ -16,14 +17,22 @@
 #ifndef FS_COMMANDS_H_
 #define FS_COMMANDS_H_
 
-#include "Monitor.h"
+#include "MonOpRequest.h"
 #include "CommandHandler.h"
 
-#include "osd/OSDMap.h"
-#include "mds/FSMap.h"
+#include "include/cephfs/types.h" // for fs_cluster_id_t"
 
+#include <iosfwd>
+#include <list>
+#include <memory>
 #include <string>
-#include <ostream>
+#include <variant>
+
+class Filesystem;
+class FSMap;
+class Monitor;
+class OSDMap;
+class Paxos;
 
 class FileSystemCommandHandler : protected CommandHandler
 {

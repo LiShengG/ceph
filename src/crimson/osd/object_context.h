@@ -1,5 +1,5 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
 
 #pragma once
 
@@ -64,6 +64,7 @@ class ObjectContext : public ceph::common::intrusive_lru_base<
 {
 private:
   tri_mutex lock;
+  bool recovery_read_marker = false;
 
 public:
   ObjectState obs;
@@ -74,14 +75,19 @@ public:
   using watch_key_t = std::pair<uint64_t, entity_name_t>;
   std::map<watch_key_t, seastar::shared_ptr<crimson::osd::Watch>> watchers;
 
+  // attr cache. ECTransaction is the initial user
+  using attr_cache_t = std::map<std::string, ceph::buffer::list, std::less<>>;
+  attr_cache_t attr_cache;
+
   CommonOBCPipeline obc_pipeline;
 
-  ObjectContext(hobject_t hoid) : lock(hoid),
+  ObjectContext(hobject_t hoid) : lock(hoid.to_str()),
                                   obs(std::move(hoid)) {}
 
-  void update_from(const ObjectContext &obc) {
-    obs = obc.obs;
-    ssc = obc.ssc;
+  void update_from(
+    std::pair<ObjectState, SnapSetContextRef> obc_data) {
+    obs = obc_data.first;
+    ssc = obc_data.second;
   }
 
   const hobject_t &get_oid() const {
@@ -106,12 +112,22 @@ public:
     ceph_assert(is_head());
     obs = std::move(_obs);
     ssc = std::move(_ssc);
+    // ObjectContextLoader::load_and_lock* rely on this to determine whether to
+    // start loading from disk.  As this method fills in the metadata, such
+    // loading will not be necessary in the future. loading_started will already
+    // be set if this is invoked from ObjectContextLoader::load_and_lock*
+    loading_started = true;
     fully_loaded = true;
   }
 
   void set_clone_state(ObjectState &&_obs) {
     ceph_assert(!is_head());
     obs = std::move(_obs);
+    // ObjectContextLoader::load_and_lock* rely on this to determine whether to
+    // start loading from disk.  As this method fills in the metadata, such
+    // loading will not be necessary in the future. loading_started will already
+    // be set if this is invoked from ObjectContextLoader::load_and_lock*
+    loading_started = true;
     fully_loaded = true;
   }
 
@@ -124,6 +140,9 @@ public:
   template<typename Exception>
   void interrupt(Exception ex) {
     lock.abort(std::move(ex));
+    if (recovery_read_marker) {
+      drop_recovery_read();
+    }
   }
 
   bool is_loaded() const {
@@ -214,6 +233,29 @@ public:
   bool is_request_pending() const {
     return lock.is_acquired();
   }
+
+  bool try_get_read_lock() {
+    return lock.try_lock_for_read();
+  }
+  void put_read_lock() {
+    lock.unlock_for_read();
+  }
+  bool get_recovery_read() {
+    if (lock.try_lock_for_read()) {
+      recovery_read_marker = true;
+      return true;
+    } else {
+      return false;
+    }
+  }
+  void wait_recovery_read() {
+    assert(lock.get_readers() > 0);
+    recovery_read_marker = true;
+  }
+  void drop_recovery_read() {
+    assert(recovery_read_marker);
+    recovery_read_marker = false;
+  }
 };
 using ObjectContextRef = ObjectContext::Ref;
 
@@ -249,7 +291,7 @@ public:
     obc_lru.for_each(std::forward<F>(f));
   }
 
-  const char** get_tracked_conf_keys() const final;
+  std::vector<std::string> get_tracked_keys() const noexcept final;
   void handle_conf_change(const crimson::common::ConfigProxy& conf,
                           const std::set <std::string> &changed) final;
 };

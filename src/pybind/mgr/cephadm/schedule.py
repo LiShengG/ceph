@@ -2,16 +2,74 @@ import ipaddress
 import hashlib
 import logging
 import random
-from typing import List, Optional, Callable, TypeVar, Tuple, NamedTuple, Dict
+from typing import (
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    NamedTuple,
+    Optional,
+    Protocol,
+    Tuple,
+    TypeVar,
+)
 
 import orchestrator
-from ceph.deployment.service_spec import ServiceSpec
+from ceph.deployment.service_spec import ServiceSpec, HostPlacementSpec
 from orchestrator._interface import DaemonDescription
 from orchestrator import OrchestratorValidationError
 from .utils import RESCHEDULE_FROM_OFFLINE_HOSTS_TYPES
 
 logger = logging.getLogger(__name__)
 T = TypeVar('T')
+
+
+def get_placement_hosts(
+    spec: ServiceSpec,
+    hosts: List[orchestrator.HostSpec],
+    draining_hosts: List[orchestrator.HostSpec]
+) -> List[HostPlacementSpec]:
+    """
+    Get the list of candidate host placement specs based on placement specifications.
+    Args:
+        spec: The service specification
+        hosts: List of available hosts
+        draining_hosts: List of hosts that are draining
+    Returns:
+        List[HostPlacementSpec]: List of host placement specs that match the placement criteria
+    """
+    if spec.placement.hosts:
+        host_specs = [
+            h for h in spec.placement.hosts
+            if h.hostname not in [dh.hostname for dh in draining_hosts]
+        ]
+    elif spec.placement.label:
+        labeled_hosts = [h for h in hosts if spec.placement.label in h.labels]
+        host_specs = [
+            HostPlacementSpec(hostname=x.hostname, network='', name='')
+            for x in labeled_hosts
+        ]
+        if spec.placement.host_pattern:
+            matching_hostnames = spec.placement.filter_matching_hostspecs(hosts)
+            host_specs = [h for h in host_specs if h.hostname in matching_hostnames]
+    elif spec.placement.host_pattern:
+        matching_hostnames = spec.placement.filter_matching_hostspecs(hosts)
+        host_specs = [
+            HostPlacementSpec(hostname=hostname, network='', name='')
+            for hostname in matching_hostnames
+        ]
+    elif (
+            spec.placement.count is not None
+            or spec.placement.count_per_host is not None
+    ):
+        host_specs = [
+            HostPlacementSpec(hostname=x.hostname, network='', name='')
+            for x in hosts
+        ]
+    else:
+        raise OrchestratorValidationError(
+            "placement spec is empty: no hosts, no label, no pattern, no count")
+    return host_specs
 
 
 class DaemonPlacement(NamedTuple):
@@ -97,7 +155,7 @@ class DaemonPlacement(NamedTuple):
             gen,
         )
 
-    def matches_daemon(self, dd: DaemonDescription) -> bool:
+    def matches_daemon(self, dd: DaemonDescription, upgrade_in_progress: bool = False) -> bool:
         if self.daemon_type != dd.daemon_type:
             return False
         if self.hostname != dd.hostname:
@@ -105,11 +163,16 @@ class DaemonPlacement(NamedTuple):
         # fixme: how to match against network?
         if self.name and self.name != dd.daemon_id:
             return False
-        if self.ports:
-            if self.ports != dd.ports and dd.ports:
-                return False
-            if self.ip != dd.ip and dd.ip:
-                return False
+        # only consider daemon "not matching" on port/ip
+        # differences if we're not mid upgrade. During upgrade
+        # it's very likely we'll deploy the daemon with the
+        # new port/ips as part of the upgrade process
+        if not upgrade_in_progress:
+            if self.ports:
+                if self.ports != dd.ports and dd.ports:
+                    return False
+                if self.ip and dd.ip and self.ip != dd.ip:
+                    return False
         return True
 
     def matches_rank_map(
@@ -138,6 +201,15 @@ class DaemonPlacement(NamedTuple):
         return rank_map[dd.rank][dd.rank_generation] == dd.daemon_id
 
 
+class HostSelector(Protocol):
+    def filter_host_candidates(
+        self,
+        spec: ServiceSpec,
+        candidates: Iterable[DaemonPlacement],
+    ) -> List[DaemonPlacement]:
+        "Filter candidates for host/ip matching."
+
+
 class HostAssignment(object):
 
     def __init__(self,
@@ -147,12 +219,16 @@ class HostAssignment(object):
                  draining_hosts: List[orchestrator.HostSpec],
                  daemons: List[orchestrator.DaemonDescription],
                  related_service_daemons: Optional[List[DaemonDescription]] = None,
+                 related_service_required_count: Optional[int] = None,
                  networks: Dict[str, Dict[str, Dict[str, List[str]]]] = {},
                  filter_new_host: Optional[Callable[[str, ServiceSpec], bool]] = None,
                  allow_colo: bool = False,
                  primary_daemon_type: Optional[str] = None,
                  per_host_daemon_type: Optional[str] = None,
                  rank_map: Optional[Dict[int, Dict[int, Optional[str]]]] = None,
+                 blocking_daemon_hosts: Optional[List[orchestrator.HostSpec]] = None,
+                 upgrade_in_progress: bool = False,
+                 host_selector: Optional[HostSelector] = None,
                  ):
         assert spec
         self.spec = spec  # type: ServiceSpec
@@ -160,15 +236,19 @@ class HostAssignment(object):
         self.hosts: List[orchestrator.HostSpec] = hosts
         self.unreachable_hosts: List[orchestrator.HostSpec] = unreachable_hosts
         self.draining_hosts: List[orchestrator.HostSpec] = draining_hosts
+        self.blocking_daemon_hosts: List[orchestrator.HostSpec] = blocking_daemon_hosts or []
         self.filter_new_host = filter_new_host
         self.service_name = spec.service_name()
         self.daemons = daemons
         self.related_service_daemons = related_service_daemons
+        self.related_service_required_count = related_service_required_count
         self.networks = networks
         self.allow_colo = allow_colo
         self.per_host_daemon_type = per_host_daemon_type
         self.ports_start = spec.get_port_start()
         self.rank_map = rank_map
+        self.upgrade_in_progress = upgrade_in_progress
+        self.host_selector = host_selector
 
     def hosts_by_label(self, label: str) -> List[orchestrator.HostSpec]:
         return [h for h in self.hosts if label in h.labels]
@@ -232,7 +312,7 @@ class HostAssignment(object):
             for dd in existing:
                 found = False
                 for p in host_slots:
-                    if p.matches_daemon(dd):
+                    if p.matches_daemon(dd, self.upgrade_in_progress):
                         host_slots.remove(p)
                         found = True
                         break
@@ -262,6 +342,7 @@ class HostAssignment(object):
 
         # get candidate hosts based on [hosts, label, host_pattern]
         candidates = self.get_candidates()  # type: List[DaemonPlacement]
+        all_candidates = candidates
         if self.primary_daemon_type in RESCHEDULE_FROM_OFFLINE_HOSTS_TYPES:
             # remove unreachable hosts that are not in maintenance so daemons
             # on these hosts will be rescheduled
@@ -269,6 +350,24 @@ class HostAssignment(object):
 
         def expand_candidates(ls: List[DaemonPlacement], num: int) -> List[DaemonPlacement]:
             r = []
+            # Check if spec has custom colocation ports (converted to list format)
+            if hasattr(self.spec, 'get_colocation_ports_list'):
+                custom_ports_list = self.spec.get_colocation_ports_list()
+                if custom_ports_list:
+                    # First daemon (i=0) always uses base ports from spec
+                    # Additional daemons (i=1,2,...) use colocation_ports if available
+                    for i in range(num):
+                        if i == 0:
+                            r.extend([dp.renumber_ports(0) for dp in ls])
+                        elif i - 1 < len(custom_ports_list):
+                            ports = custom_ports_list[i - 1]
+                            r.extend([DaemonPlacement(
+                                dp.daemon_type, dp.hostname, dp.network, dp.name,
+                                dp.ip, ports, dp.rank, dp.rank_generation
+                            ) for dp in ls])
+                        else:
+                            r.extend([dp.renumber_ports(i) for dp in ls])
+                    return r
             for offset in range(num):
                 r.extend([dp.renumber_ports(offset) for dp in ls])
             return r
@@ -304,12 +403,12 @@ class HostAssignment(object):
         existing_slots: List[DaemonPlacement] = []
         to_add: List[DaemonPlacement] = []
         to_remove: List[orchestrator.DaemonDescription] = []
-        ranks: List[int] = list(range(len(candidates)))
+        ranks: List[int] = list(range(len(all_candidates if len(all_candidates) > len(candidates) else candidates)))
         others: List[DaemonPlacement] = candidates.copy()
         for dd in daemons:
             found = False
             for p in others:
-                if p.matches_daemon(dd) and p.matches_rank_map(dd, self.rank_map, ranks):
+                if p.matches_daemon(dd, self.upgrade_in_progress) and p.matches_rank_map(dd, self.rank_map, ranks):
                     others.remove(p)
                     if dd.is_active:
                         existing_active.append(dd)
@@ -333,17 +432,80 @@ class HostAssignment(object):
         existing = existing_active + existing_standby
 
         # build to_add
+        blocking_daemon_hostnames = [
+            h.hostname for h in self.blocking_daemon_hosts
+        ]
+        unreachable_hostnames = [
+            h.hostname for h in self.unreachable_hosts
+        ]
         if not count:
-            to_add = [dd for dd in others if dd.hostname not in [
-                h.hostname for h in self.unreachable_hosts]]
+            to_add = [
+                dd for dd in others if (
+                    dd.hostname not in blocking_daemon_hostnames
+                    and dd.hostname not in unreachable_hostnames
+                )
+            ]
         else:
+            if blocking_daemon_hostnames:
+                to_remove.extend([
+                    dd for dd in existing if dd.hostname in blocking_daemon_hostnames
+                ])
+                existing = [
+                    dd for dd in existing if dd.hostname not in blocking_daemon_hostnames
+                ]
+
             # The number of new slots that need to be selected in order to fulfill count
             need = count - len(existing)
 
-            # we don't need any additional placements
-            if need <= 0:
-                to_remove.extend(existing[count:])
-                del existing_slots[count:]
+            # Scaling down: more daemons exist than required.
+            # When related services exist, prioritize keeping daemons co-located with them
+            # by removing from non-related hosts first, then from related hosts if needed.
+            if need < 0:
+                non_matching_daemons = []
+                if self.related_service_daemons:
+                    # Get unique hostnames where related service daemons are running
+                    related_service_hosts = list(set(dd.hostname for dd in self.related_service_daemons))
+
+                    total_excess = len(existing) - count
+                    to_delete = []
+                    # First, prefer removing daemons from hosts that don't have related services
+                    non_related = [dd for dd in existing if dd.hostname not in related_service_hosts]
+                    to_delete.extend(non_related[-total_excess:])
+
+                    # If we still need to remove more, remove from hosts with related services
+                    remaining_needed = total_excess - len(to_delete)
+                    if remaining_needed > 0:
+                        # Restrict defer-removal behavior to ingress only.
+                        should_defer_related_removal = False
+                        if self.spec.service_type == 'ingress':
+                            related_service_count = len(self.related_service_daemons)
+                            related_service_required_count = (
+                                self.related_service_required_count or count
+                            )
+                            related_service_is_ranked = any(
+                                dd.rank is not None
+                                for dd in self.related_service_daemons
+                            )
+                            # For ingress with ranked backends (e.g. NFS), if backend
+                            # scale-down is still pending, defer deleting co-located
+                            # ingress daemons until a later iteration.
+                            should_defer_related_removal = (
+                                related_service_is_ranked
+                                and related_service_count > related_service_required_count
+                            )
+                        if not should_defer_related_removal:
+                            remaining = [dd for dd in existing if dd not in to_delete]
+                            to_delete.extend(remaining[count:])
+
+                    non_matching_daemons = to_delete
+                else:
+                    # No related services - simply remove excess daemons beyond target count
+                    non_matching_daemons = existing[count:]
+
+                to_remove.extend(non_matching_daemons)
+                # remove from  existing_slots
+                non_matching_hostnames = {dd.hostname for dd in non_matching_daemons}
+                existing_slots = [slot for slot in existing_slots if slot.hostname not in non_matching_hostnames]
                 return self.place_per_host_daemons(existing_slots, [], to_remove)
 
             if self.related_service_daemons:
@@ -356,7 +518,7 @@ class HostAssignment(object):
                 for dp in matching_dps:
                     if need <= 0:
                         break
-                    if dp.hostname in related_service_hosts and dp.hostname not in [h.hostname for h in self.unreachable_hosts]:
+                    if dp.hostname in related_service_hosts and dp.hostname not in unreachable_hostnames:
                         logger.debug(f'Preferring {dp.hostname} for service {self.service_name} as related daemons have been placed there')
                         to_add.append(dp)
                         need -= 1  # this is last use of need so it can work as a counter
@@ -370,7 +532,10 @@ class HostAssignment(object):
             for dp in others:
                 if need <= 0:
                     break
-                if dp.hostname not in [h.hostname for h in self.unreachable_hosts]:
+                if (
+                    dp.hostname not in unreachable_hostnames
+                    and dp.hostname not in blocking_daemon_hostnames
+                ):
                     to_add.append(dp)
                     need -= 1  # this is last use of need in this function so it can work as a counter
 
@@ -385,6 +550,8 @@ class HostAssignment(object):
 
     def find_ip_on_host(self, hostname: str, subnets: List[str]) -> Optional[str]:
         for subnet in subnets:
+            # to normalize subnet
+            subnet = str(ipaddress.ip_network(subnet))
             ips: List[str] = []
             # following is to allow loopback interfaces for both ipv4 and ipv6. Since we
             # only have the subnet (and no IP) we assume default loopback IP address.
@@ -400,53 +567,48 @@ class HostAssignment(object):
         return None
 
     def get_candidates(self) -> List[DaemonPlacement]:
-        if self.spec.placement.hosts:
-            ls = [
-                DaemonPlacement(daemon_type=self.primary_daemon_type,
-                                hostname=h.hostname, network=h.network, name=h.name,
-                                ports=self.ports_start)
-                for h in self.spec.placement.hosts if h.hostname not in [dh.hostname for dh in self.draining_hosts]
-            ]
-        elif self.spec.placement.label:
-            ls = [
-                DaemonPlacement(daemon_type=self.primary_daemon_type,
-                                hostname=x.hostname, ports=self.ports_start)
-                for x in self.hosts_by_label(self.spec.placement.label)
-            ]
-            if self.spec.placement.host_pattern:
-                ls = [h for h in ls if h.hostname in self.spec.placement.filter_matching_hostspecs(self.hosts)]
-        elif self.spec.placement.host_pattern:
-            ls = [
-                DaemonPlacement(daemon_type=self.primary_daemon_type,
-                                hostname=x, ports=self.ports_start)
-                for x in self.spec.placement.filter_matching_hostspecs(self.hosts)
-            ]
-        elif (
-                self.spec.placement.count is not None
-                or self.spec.placement.count_per_host is not None
-        ):
-            ls = [
-                DaemonPlacement(daemon_type=self.primary_daemon_type,
-                                hostname=x.hostname, ports=self.ports_start)
-                for x in self.hosts
-            ]
-        else:
-            raise OrchestratorValidationError(
-                "placement spec is empty: no hosts, no label, no pattern, no count")
+        host_specs = get_placement_hosts(self.spec, self.hosts, self.draining_hosts)
+
+        ls = [
+            DaemonPlacement(daemon_type=self.primary_daemon_type,
+                            hostname=h.hostname,
+                            network=h.network,
+                            name=h.name,
+                            ports=self.ports_start)
+            for h in host_specs
+        ]
 
         # allocate an IP?
-        if self.spec.networks:
+        if self.host_selector:
+            ls = self.host_selector.filter_host_candidates(self.spec, ls)
+        elif self.spec.networks or self.spec.ip_addrs:
             orig = ls.copy()
             ls = []
             for p in orig:
-                ip = self.find_ip_on_host(p.hostname, self.spec.networks)
+                ip = None
+                # daemon can have specific ip if 'ip_addrs' is specified in spec, we can use this
+                # parameter for all services, if they need to bind to specific ip
+                # If ip not present and networks is passed, ip of that network will be used
+                if self.spec.ip_addrs:
+                    ip = self.spec.ip_addrs.get(p.hostname)
+                    host_ips: List[str] = []
+                    for net_details in self.networks.get(p.hostname, {}).values():
+                        for ips in net_details.values():
+                            host_ips.extend(ips)
+                    if ip and ip not in host_ips:
+                        logger.debug(f"IP {ip} is not configured on host {p.hostname}.")
+                        ip = None
+                if not ip and self.spec.networks:
+                    ip = self.find_ip_on_host(p.hostname, self.spec.networks)
                 if ip:
                     ls.append(DaemonPlacement(daemon_type=self.primary_daemon_type,
                                               hostname=p.hostname, network=p.network,
                                               name=p.name, ports=p.ports, ip=ip))
                 else:
                     logger.debug(
-                        f'Skipping {p.hostname} with no IP in network(s) {self.spec.networks}'
+                        f"Skipping {p.hostname} with no IP in provided networks or ip_addrs "
+                        f"{f'networks: {self.spec.networks}' if self.spec.networks else ''}"
+                        f"{f'ip_addrs: {self.spec.ip_addrs}' if self.spec.ip_addrs else ''}"
                     )
 
         if self.filter_new_host:

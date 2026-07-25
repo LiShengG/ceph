@@ -3,7 +3,7 @@ import { ComponentFixture, TestBed } from '@angular/core/testing';
 import { RouterTestingModule } from '@angular/router/testing';
 
 import { NgbActiveModal } from '@ng-bootstrap/ng-bootstrap';
-import { ToastrModule } from 'ngx-toastr';
+
 import { of } from 'rxjs';
 
 import { CrushRuleService } from '~/app/shared/api/crush-rule.service';
@@ -65,7 +65,7 @@ describe('CrushRuleFormComponent', () => {
   };
 
   configureTestBed({
-    imports: [HttpClientTestingModule, RouterTestingModule, ToastrModule.forRoot(), PoolModule],
+    imports: [HttpClientTestingModule, RouterTestingModule, PoolModule],
     providers: [CrushRuleService, NgbActiveModal]
   });
 
@@ -107,9 +107,20 @@ describe('CrushRuleFormComponent', () => {
   describe('lists', () => {
     afterEach(() => {
       // The available buckets should not change
-      expect(component.buckets).toEqual(
-        get.nodesByNames(['default', 'hdd-rack', 'mix-host', 'ssd-host', 'ssd-rack'])
-      );
+      const expectedBuckets = get.nodesByNames([
+        'default',
+        'hdd-rack',
+        'mix-host',
+        'ssd-host',
+        'ssd-rack'
+      ]);
+      // Add the 'content' and 'selected' properties that are added by the component
+      const mockBuckets = expectedBuckets.map((bucket: CrushNode) => ({
+        ...bucket,
+        content: bucket.name,
+        selected: bucket.type === 'root'
+      }));
+      expect(component.buckets).toEqual(mockBuckets);
     });
 
     it('has the following lists after init', () => {
@@ -139,6 +150,7 @@ describe('CrushRuleFormComponent', () => {
     });
 
     it('should select all values automatically by selecting "ssd-host" as root', () => {
+      formHelper.setValue('device_class', 'ssd', true);
       assert.valuesOnRootChange('ssd-host', 'osd', 'ssd');
     });
 
@@ -149,7 +161,9 @@ describe('CrushRuleFormComponent', () => {
 
     it('should override automatic selections', () => {
       assert.formFieldValues(get.nodeByName('default'), 'osd-rack', '');
+      formHelper.setValue('device_class', 'ssd', true);
       assert.valuesOnRootChange('ssd-host', 'osd', 'ssd');
+      formHelper.setValue('device_class', '', true);
       assert.valuesOnRootChange('mix-host', 'osd-rack', '');
     });
 
@@ -160,6 +174,7 @@ describe('CrushRuleFormComponent', () => {
     });
 
     it('should preselect device by domain selection', () => {
+      formHelper.setValue('device_class', 'ssd', true);
       formHelper.setValue('failure_domain', 'osd', true);
       assert.formFieldValues(get.nodeByName('default'), 'osd', 'ssd');
     });
@@ -203,6 +218,7 @@ describe('CrushRuleFormComponent', () => {
     });
 
     it('creates a rule with all fields', () => {
+      formHelper.setValue('device_class', 'ssd', true);
       assert.valuesOnRootChange('ssd-host', 'osd', 'ssd');
       assert.creation(Mocks.getCrushRuleConfig('ssd-host-rule', 'ssd-host', 'osd', 'ssd'));
     });

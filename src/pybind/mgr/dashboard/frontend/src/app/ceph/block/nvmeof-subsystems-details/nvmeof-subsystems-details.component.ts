@@ -1,16 +1,20 @@
 import { Component, Input, OnChanges } from '@angular/core';
 import { NvmeofSubsystem } from '~/app/shared/models/nvmeof';
+import { Permissions } from '~/app/shared/models/permissions';
 
 @Component({
   selector: 'cd-nvmeof-subsystems-details',
   templateUrl: './nvmeof-subsystems-details.component.html',
-  styleUrls: ['./nvmeof-subsystems-details.component.scss']
+  styleUrls: ['./nvmeof-subsystems-details.component.scss'],
+  standalone: false
 })
 export class NvmeofSubsystemsDetailsComponent implements OnChanges {
   @Input()
   selection: NvmeofSubsystem;
   @Input()
-  group: NvmeofSubsystem;
+  group: string;
+  @Input()
+  permissions: Permissions;
 
   selectedItem: any;
   data: any;

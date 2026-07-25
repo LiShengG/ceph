@@ -5,6 +5,7 @@ import datetime
 import logging
 import os
 import tempfile
+import json
 
 from contextlib import contextmanager
 from pathlib import Path
@@ -23,6 +24,7 @@ def write_new(
     owner: Optional[Tuple[int, int]] = None,
     perms: Optional[int] = DEFAULT_MODE,
     encoding: Optional[str] = None,
+    binary: bool = False,
 ) -> Generator[IO, None, None]:
     """Write a new file in a robust manner, optionally specifying the owner,
     permissions, or encoding. This function takes care to never leave a file in
@@ -37,8 +39,9 @@ def write_new(
     open_kwargs: Dict[str, Any] = {}
     if encoding:
         open_kwargs['encoding'] = encoding
+    file_mode = 'wb' if binary else 'w'
     try:
-        with open(tempname, 'w', **open_kwargs) as fh:
+        with open(tempname, file_mode, **open_kwargs) as fh:
             yield fh
             fh.flush()
             os.fsync(fh.fileno())
@@ -53,7 +56,7 @@ def write_new(
 
 
 def populate_files(
-    config_dir: str, config_files: Dict, uid: int, gid: int
+    config_dir: Union[str, Path], config_files: Dict, uid: int, gid: int
 ) -> None:
     """create config files for different services"""
     for fname in config_files:
@@ -157,3 +160,26 @@ def unlink_file(
     except Exception:
         if not ignore_errors:
             raise
+
+
+def update_meta_file(file_path: str, update_key_val: dict) -> None:
+    """Update key in the file with provided value"""
+    try:
+        with open(file_path, 'r') as fh:
+            data = json.load(fh)
+        file_stat = os.stat(file_path)
+    except FileNotFoundError:
+        raise
+    except Exception:
+        logger.exception(f'Failed to update {file_path}')
+        raise
+    data.update(
+        {key: value for key, value in update_key_val.items() if key in data}
+    )
+
+    with write_new(
+        file_path,
+        owner=(file_stat.st_uid, file_stat.st_gid),
+        perms=(file_stat.st_mode & 0o777),
+    ) as fh:
+        fh.write(json.dumps(data, indent=4) + '\n')

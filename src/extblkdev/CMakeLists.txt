@@ -3,13 +3,15 @@
 set(extblkdev_plugin_dir ${CEPH_INSTALL_PKGLIBDIR}/extblkdev)
 
 add_subdirectory(vdo)
+add_subdirectory(fcm)
 
 add_library(extblkdev STATIC ExtBlkDevPlugin.cc)
 
-if(NOT WIN32)
-find_package(cap)
-target_link_libraries(extblkdev cap)
+if(LINUX)
+  find_package(cap REQUIRED)
+  target_link_libraries(extblkdev cap)
 endif()
 
 add_custom_target(extblkdev_plugins DEPENDS
-    ceph_ebd_vdo)
+    ceph_ebd_vdo
+    ceph_ebd_fcm)

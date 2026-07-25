@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph - scalable distributed file system
  *
@@ -31,13 +32,13 @@ public:
   std::string path;
   std::string description;
   std::string nick;
-  enum perfcounter_type_d type;
+  enum perfcounter_type_d type = PERFCOUNTER_NONE;
 
   // For older clients that did not send priority, pretend everything
   // is "useful" so that mgr plugins filtering on prio will get some
   // data (albeit probably more than they wanted)
   uint8_t priority = PerfCountersBuilder::PRIO_USEFUL;
-  enum unit_t unit;
+  enum unit_t unit = UNIT_NONE;
 
   void encode(ceph::buffer::list &bl) const
   {
@@ -84,16 +85,18 @@ public:
     f->dump_int("priority", priority);
     f->dump_int("unit", unit);
   }
-  static void generate_test_instances(std::list<PerfCounterType*>& ls)
+  static std::list<PerfCounterType> generate_test_instances()
   {
-    ls.push_back(new PerfCounterType);
-    ls.push_back(new PerfCounterType);
-    ls.back()->path = "mycounter";
-    ls.back()->description = "mycounter description";
-    ls.back()->nick = "mycounter nick";
-    ls.back()->type = PERFCOUNTER_COUNTER;
-    ls.back()->priority = PerfCountersBuilder::PRIO_CRITICAL;
-    ls.back()->unit = UNIT_BYTES;
+    std::list<PerfCounterType> ls;
+    ls.emplace_back();
+    ls.emplace_back();
+    ls.back().path = "mycounter";
+    ls.back().description = "mycounter description";
+    ls.back().nick = "mycounter nick";
+    ls.back().type = PERFCOUNTER_COUNTER;
+    ls.back().priority = PerfCountersBuilder::PRIO_CRITICAL;
+    ls.back().unit = UNIT_BYTES;
+    return ls;
   }
 };
 WRITE_CLASS_ENCODER(PerfCounterType)

@@ -1,7 +1,7 @@
 #include "mds/QuiesceAgent.h"
 #include "common/debug.h"
 #include "include/ceph_assert.h"
-#include <future>
+#include "include/Context.h"
 
 #define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_mds_quiesce
@@ -176,7 +176,7 @@ void* QuiesceAgent::agent_thread_main() {
       dout(20) << "asynchronous ack for " << (new_version ? "a new" : "the current") << " version: " << ack << dendl;
       int rc = quiesce_control.agent_ack(std::move(ack));
       if (rc != 0) {
-        dout(3) << "got error: " << rc << " trying to send " << ack << dendl;
+        dout(3) << "asynchronous ack for " << (new_version ? "a new" : "the current") << " version got error: " << rc << dendl;
       }
     }
     old.clear();

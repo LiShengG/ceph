@@ -10,6 +10,9 @@ import { configureTestBed } from '~/testing/unit-test-helper';
 import { MgrModuleService } from '../api/mgr-module.service';
 import { ModuleStatusGuardService } from './module-status-guard.service';
 
+import { CdDatePipe } from '../pipes/cd-date.pipe';
+import { SharedModule } from '../shared.module';
+
 describe('ModuleStatusGuardService', () => {
   let service: ModuleStatusGuardService;
   let httpClient: HttpClient;
@@ -18,7 +21,7 @@ describe('ModuleStatusGuardService', () => {
   let ngZone: NgZone;
   let mgrModuleService: MgrModuleService;
 
-  @Component({ selector: 'cd-foo', template: '' })
+  @Component({ selector: 'cd-foo', template: '', standalone: false })
   class FooComponent {}
 
   const fakeService = {
@@ -53,8 +56,12 @@ describe('ModuleStatusGuardService', () => {
   };
 
   configureTestBed({
-    imports: [RouterTestingModule.withRoutes(routes)],
-    providers: [ModuleStatusGuardService, { provide: HttpClient, useValue: fakeService }],
+    imports: [RouterTestingModule.withRoutes(routes), SharedModule],
+    providers: [
+      ModuleStatusGuardService,
+      { provide: HttpClient, useValue: fakeService },
+      CdDatePipe
+    ],
     declarations: [FooComponent]
   });
 

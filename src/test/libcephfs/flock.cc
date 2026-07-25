@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph - scalable distributed file system
  *
@@ -91,12 +92,12 @@ TEST(LibCephFS, BasicLocking) {
 
   // Lock exclusively twice
   ASSERT_EQ(0, ceph_flock(cmount, fd, LOCK_EX, 42));
-  ASSERT_EQ(-CEPHFS_EWOULDBLOCK, ceph_flock(cmount, fd, LOCK_EX | LOCK_NB, 43));
-  ASSERT_EQ(-CEPHFS_EWOULDBLOCK, ceph_flock(cmount, fd, LOCK_EX | LOCK_NB, 44));
+  ASSERT_EQ(-EAGAIN, ceph_flock(cmount, fd, LOCK_EX | LOCK_NB, 43));
+  ASSERT_EQ(-EAGAIN, ceph_flock(cmount, fd, LOCK_EX | LOCK_NB, 44));
   ASSERT_EQ(0, ceph_flock(cmount, fd, LOCK_UN, 42));
 
   ASSERT_EQ(0, ceph_flock(cmount, fd, LOCK_EX | LOCK_NB, 43));
-  ASSERT_EQ(-CEPHFS_EWOULDBLOCK, ceph_flock(cmount, fd, LOCK_EX | LOCK_NB, 44));
+  ASSERT_EQ(-EAGAIN, ceph_flock(cmount, fd, LOCK_EX | LOCK_NB, 44));
   ASSERT_EQ(0, ceph_flock(cmount, fd, LOCK_UN, 43));
 
   // Lock shared three times
@@ -104,14 +105,14 @@ TEST(LibCephFS, BasicLocking) {
   ASSERT_EQ(0, ceph_flock(cmount, fd, LOCK_SH, 43));
   ASSERT_EQ(0, ceph_flock(cmount, fd, LOCK_SH, 44));
   // And then attempt to lock exclusively
-  ASSERT_EQ(-CEPHFS_EWOULDBLOCK, ceph_flock(cmount, fd, LOCK_EX | LOCK_NB, 45));
+  ASSERT_EQ(-EAGAIN, ceph_flock(cmount, fd, LOCK_EX | LOCK_NB, 45));
   ASSERT_EQ(0, ceph_flock(cmount, fd, LOCK_UN, 42));
-  ASSERT_EQ(-CEPHFS_EWOULDBLOCK, ceph_flock(cmount, fd, LOCK_EX | LOCK_NB, 45));
+  ASSERT_EQ(-EAGAIN, ceph_flock(cmount, fd, LOCK_EX | LOCK_NB, 45));
   ASSERT_EQ(0, ceph_flock(cmount, fd, LOCK_UN, 44));
-  ASSERT_EQ(-CEPHFS_EWOULDBLOCK, ceph_flock(cmount, fd, LOCK_EX | LOCK_NB, 45));
+  ASSERT_EQ(-EAGAIN, ceph_flock(cmount, fd, LOCK_EX | LOCK_NB, 45));
   ASSERT_EQ(0, ceph_flock(cmount, fd, LOCK_UN, 43));
   ASSERT_EQ(0, ceph_flock(cmount, fd, LOCK_EX | LOCK_NB, 45));
-  ASSERT_EQ(-CEPHFS_EWOULDBLOCK, ceph_flock(cmount, fd, LOCK_SH | LOCK_NB, 42));
+  ASSERT_EQ(-EAGAIN, ceph_flock(cmount, fd, LOCK_SH | LOCK_NB, 42));
   ASSERT_EQ(0, ceph_flock(cmount, fd, LOCK_UN, 45));
 
   // Lock shared with upgrade to exclusive (POSIX) 
@@ -126,6 +127,62 @@ TEST(LibCephFS, BasicLocking) {
 
   ASSERT_EQ(0, ceph_close(cmount, fd));
   ASSERT_EQ(0, ceph_unlink(cmount, c_file));
+  CLEANUP_CEPH();
+}
+
+TEST(LibCephFS, BasicLLLocking) {
+  struct ceph_mount_info *cmount = NULL;
+  STARTUP_CEPH();
+
+  char c_file[1024];
+  sprintf(c_file, "ll_flock_test_%d", getpid());
+  Fh *fh = NULL;
+  Inode *root = NULL, *inode = NULL;
+  struct ceph_statx stx;
+  UserPerm *perms = ceph_mount_perms(cmount);
+
+  ASSERT_EQ(0, ceph_ll_lookup_root(cmount, &root));
+  ASSERT_EQ(0, ceph_ll_create(cmount, root, c_file, fileMode,
+			      O_RDWR | O_CREAT, &inode, &fh, &stx,
+			      0, 0, perms));
+
+  // Lock exclusively twice
+  ASSERT_EQ(0, ceph_ll_flock(cmount, fh, LOCK_EX, 42));
+  ASSERT_EQ(-EAGAIN, ceph_ll_flock(cmount, fh, LOCK_EX | LOCK_NB, 43));
+  ASSERT_EQ(-EAGAIN, ceph_ll_flock(cmount, fh, LOCK_EX | LOCK_NB, 44));
+  ASSERT_EQ(0, ceph_ll_flock(cmount, fh, LOCK_UN, 42));
+
+  ASSERT_EQ(0, ceph_ll_flock(cmount, fh, LOCK_EX | LOCK_NB, 43));
+  ASSERT_EQ(-EAGAIN, ceph_ll_flock(cmount, fh, LOCK_EX | LOCK_NB, 44));
+  ASSERT_EQ(0, ceph_ll_flock(cmount, fh, LOCK_UN, 43));
+
+  // Lock shared three times
+  ASSERT_EQ(0, ceph_ll_flock(cmount, fh, LOCK_SH, 42));
+  ASSERT_EQ(0, ceph_ll_flock(cmount, fh, LOCK_SH, 43));
+  ASSERT_EQ(0, ceph_ll_flock(cmount, fh, LOCK_SH, 44));
+  // And then attempt to lock exclusively
+  ASSERT_EQ(-EAGAIN, ceph_ll_flock(cmount, fh, LOCK_EX | LOCK_NB, 45));
+  ASSERT_EQ(0, ceph_ll_flock(cmount, fh, LOCK_UN, 42));
+  ASSERT_EQ(-EAGAIN, ceph_ll_flock(cmount, fh, LOCK_EX | LOCK_NB, 45));
+  ASSERT_EQ(0, ceph_ll_flock(cmount, fh, LOCK_UN, 44));
+  ASSERT_EQ(-EAGAIN, ceph_ll_flock(cmount, fh, LOCK_EX | LOCK_NB, 45));
+  ASSERT_EQ(0, ceph_ll_flock(cmount, fh, LOCK_UN, 43));
+  ASSERT_EQ(0, ceph_ll_flock(cmount, fh, LOCK_EX | LOCK_NB, 45));
+  ASSERT_EQ(-EAGAIN, ceph_ll_flock(cmount, fh, LOCK_SH | LOCK_NB, 42));
+  ASSERT_EQ(0, ceph_ll_flock(cmount, fh, LOCK_UN, 45));
+
+  // Lock shared with upgrade to exclusive (POSIX)
+  ASSERT_EQ(0, ceph_ll_flock(cmount, fh, LOCK_SH, 42));
+  ASSERT_EQ(0, ceph_ll_flock(cmount, fh, LOCK_EX, 42));
+  ASSERT_EQ(0, ceph_ll_flock(cmount, fh, LOCK_UN, 42));
+
+  // Lock exclusive with downgrade to shared (POSIX)
+  ASSERT_EQ(0, ceph_ll_flock(cmount, fh, LOCK_EX, 42));
+  ASSERT_EQ(0, ceph_ll_flock(cmount, fh, LOCK_SH, 42));
+  ASSERT_EQ(0, ceph_ll_flock(cmount, fh, LOCK_UN, 42));
+
+  ASSERT_EQ(0, ceph_ll_close(cmount, fh));
+  ASSERT_EQ(0, ceph_ll_unlink(cmount, root, c_file, perms));
   CLEANUP_CEPH();
 }
 
@@ -182,7 +239,7 @@ static void thread_ConcurrentLocking(str_ConcurrentLocking& s) {
   const int fd = ceph_open(cmount, s.file, O_RDWR | O_CREAT, fileMode);
   ASSERT_GE(fd, 0); 
 
-  ASSERT_EQ(-CEPHFS_EWOULDBLOCK,
+  ASSERT_EQ(-EAGAIN,
 	    ceph_flock(cmount, fd, LOCK_EX | LOCK_NB, ceph_pthread_self()));
   PING_MAIN(1); // (1)
   ASSERT_EQ(0, ceph_flock(cmount, fd, LOCK_EX, ceph_pthread_self()));
@@ -252,7 +309,7 @@ TEST(LibCephFS, ConcurrentLocking) {
 
   // Wait for thread to share lock
   WAIT_WORKER(4); // (4)
-  ASSERT_EQ(-CEPHFS_EWOULDBLOCK,
+  ASSERT_EQ(-EAGAIN,
 	    ceph_flock(cmount, fd, LOCK_EX | LOCK_NB, ceph_pthread_self()));
   ASSERT_EQ(0, ceph_flock(cmount, fd, LOCK_SH | LOCK_NB, ceph_pthread_self()));
 
@@ -275,9 +332,9 @@ TEST(LibCephFS, ConcurrentLocking) {
   WAIT_WORKER(6); // (6)
 
   // We no longer have the lock
-  ASSERT_EQ(-CEPHFS_EWOULDBLOCK,
+  ASSERT_EQ(-EAGAIN,
 	    ceph_flock(cmount, fd, LOCK_EX | LOCK_NB, ceph_pthread_self()));
-  ASSERT_EQ(-CEPHFS_EWOULDBLOCK,
+  ASSERT_EQ(-EAGAIN,
 	    ceph_flock(cmount, fd, LOCK_SH | LOCK_NB, ceph_pthread_self()));
 
   // Wake up thread to unlock exclusive lock
@@ -336,7 +393,7 @@ TEST(LibCephFS, ThreesomeLocking) {
   
   // Wait for thread to share lock
   TWICE(WAIT_WORKER(4)); // (4)
-  ASSERT_EQ(-CEPHFS_EWOULDBLOCK,
+  ASSERT_EQ(-EAGAIN,
 	    ceph_flock(cmount, fd, LOCK_EX | LOCK_NB, ceph_pthread_self()));
   ASSERT_EQ(0, ceph_flock(cmount, fd, LOCK_SH | LOCK_NB, ceph_pthread_self()));
 
@@ -359,9 +416,9 @@ TEST(LibCephFS, ThreesomeLocking) {
   TWICE(WAIT_WORKER(6); // (6)
 	
 	// We no longer have the lock
-	ASSERT_EQ(-CEPHFS_EWOULDBLOCK,
+	ASSERT_EQ(-EAGAIN,
 		  ceph_flock(cmount, fd, LOCK_EX | LOCK_NB, ceph_pthread_self()));
-	ASSERT_EQ(-CEPHFS_EWOULDBLOCK,
+	ASSERT_EQ(-EAGAIN,
 		  ceph_flock(cmount, fd, LOCK_SH | LOCK_NB, ceph_pthread_self()));
 	
 	// Wake up thread to unlock exclusive lock
@@ -406,7 +463,7 @@ static void process_ConcurrentLocking(str_ConcurrentLocking& s) {
   ASSERT_GE(fd, 0); 
   WAIT_MAIN(1); // (R1)
 
-  ASSERT_EQ(-CEPHFS_EWOULDBLOCK,
+  ASSERT_EQ(-EAGAIN,
 	    ceph_flock(cmount, fd, LOCK_EX | LOCK_NB, mypid));
   PING_MAIN(1); // (1)
   ASSERT_EQ(0, ceph_flock(cmount, fd, LOCK_EX, mypid));
@@ -491,7 +548,7 @@ TEST(LibCephFS, DISABLED_InterProcessLocking) {
 
   // Wait for process to share lock
   WAIT_WORKER(4); // (4)
-  ASSERT_EQ(-CEPHFS_EWOULDBLOCK, ceph_flock(cmount, fd, LOCK_EX | LOCK_NB, mypid));
+  ASSERT_EQ(-EAGAIN, ceph_flock(cmount, fd, LOCK_EX | LOCK_NB, mypid));
   ASSERT_EQ(0, ceph_flock(cmount, fd, LOCK_SH | LOCK_NB, mypid));
 
   // Wake up process to unlock shared lock
@@ -513,8 +570,8 @@ TEST(LibCephFS, DISABLED_InterProcessLocking) {
   WAIT_WORKER(6); // (6)
 
   // We no longer have the lock
-  ASSERT_EQ(-CEPHFS_EWOULDBLOCK, ceph_flock(cmount, fd, LOCK_EX | LOCK_NB, mypid));
-  ASSERT_EQ(-CEPHFS_EWOULDBLOCK, ceph_flock(cmount, fd, LOCK_SH | LOCK_NB, mypid));
+  ASSERT_EQ(-EAGAIN, ceph_flock(cmount, fd, LOCK_EX | LOCK_NB, mypid));
+  ASSERT_EQ(-EAGAIN, ceph_flock(cmount, fd, LOCK_SH | LOCK_NB, mypid));
 
   // Wake up process to unlock exclusive lock
   PING_WORKER(4); // (R4)
@@ -600,7 +657,7 @@ TEST(LibCephFS, DISABLED_ThreesomeInterProcessLocking) {
   
   // Wait for process to share lock
   TWICE(WAIT_WORKER(4)); // (4)
-  ASSERT_EQ(-CEPHFS_EWOULDBLOCK,
+  ASSERT_EQ(-EAGAIN,
 	    ceph_flock(cmount, fd, LOCK_EX | LOCK_NB, mypid));
   ASSERT_EQ(0, ceph_flock(cmount, fd, LOCK_SH | LOCK_NB, mypid));
 
@@ -623,9 +680,9 @@ TEST(LibCephFS, DISABLED_ThreesomeInterProcessLocking) {
   TWICE(WAIT_WORKER(6); // (6)
 	
 	// We no longer have the lock
-	ASSERT_EQ(-CEPHFS_EWOULDBLOCK,
+	ASSERT_EQ(-EAGAIN,
 		  ceph_flock(cmount, fd, LOCK_EX | LOCK_NB, mypid));
-	ASSERT_EQ(-CEPHFS_EWOULDBLOCK,
+	ASSERT_EQ(-EAGAIN,
 		  ceph_flock(cmount, fd, LOCK_SH | LOCK_NB, mypid));
 	
 	// Wake up process to unlock exclusive lock

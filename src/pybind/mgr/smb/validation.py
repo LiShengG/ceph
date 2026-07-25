@@ -3,6 +3,8 @@ from typing import Dict, Optional
 import posixpath
 import re
 
+import ceph.smb.constants
+
 # Initially, this regex is pretty restrictive.  But I (JJM) find that
 # starting out more restricitive is better than not because it's generally
 # easier to relax strict rules then discover someone relies on lax rules
@@ -16,6 +18,10 @@ _name_re = re.compile('^[a-zA-Z0-9]($|[a-zA-Z0-9-]{,16}[a-zA-Z0-9]$)')
 # We might want to open up share names to non-special unicode chars too.
 # but as above it's easier to start strict.
 _share_re = re.compile('^[a-zA-Z0-9_][a-zA-Z0-9. _-]{,63}$')
+
+_fscrypt_key_name_re = re.compile(
+    '^[a-zA-Z0-9]($|[a-zA-Z0-9-]{,61}[a-zA-Z0-9]$)'
+)
 
 
 def valid_id(value: str) -> bool:
@@ -38,6 +44,17 @@ def check_share_name(value: str) -> None:
     """Raise ValueError if value is not a valid share name."""
     if not valid_share_name(value):
         raise ValueError(f"{value!r} is not a valid share name")
+
+
+def valid_fscrypt_key_name(value: str) -> bool:
+    """Return true if value is a valid fscrypt key name."""
+    return bool(_fscrypt_key_name_re.match(value))
+
+
+def check_fscrypt_key_name(value: str) -> None:
+    """Raise ValueError if value is not a valid fscrypt key name."""
+    if not valid_fscrypt_key_name(value):
+        raise ValueError(f"{value!r} is not a valid fscrypt key name")
 
 
 # alias for normpath so other smb libs can just import validation module
@@ -106,9 +123,60 @@ def clean_custom_options(
 
 
 def check_access_name(name: str) -> None:
-    if ' ' in name or '\t' in name or '\n' in name:
-        raise ValueError(
-            'login name may not contain spaces, tabs, or newlines'
-        )
+    if '\t' in name or '\n' in name:
+        raise ValueError('login name may not contain tabs or newlines')
     if len(name) > 128:
         raise ValueError('login name may not exceed 128 characters')
+
+
+_MAX_PORT = (1 << 16) - 1
+
+
+def check_custom_ports(ports: Optional[Dict[str, int]]) -> None:
+    if ports is None:
+        return
+    _defaults = ceph.smb.constants.DEFAULT_PORTS
+    other = set(ports) - set(_defaults)
+    if other:
+        raise ValueError(
+            "invalid service names for custom ports:"
+            f' {", ".join(sorted(other))}'
+        )
+    invalid = {str(p) for p in ports.values() if not 0 < p <= _MAX_PORT}
+    if invalid:
+        raise ValueError(
+            f'invalid port number(s): {", ".join(sorted(invalid))}'
+        )
+    # make sure ports are unique per service
+    all_ports = _defaults | ports
+    for port in all_ports.values():
+        using_port = {s for s, p in all_ports.items() if p == port}
+        if len(using_port) > 1:
+            raise ValueError(
+                'port numbers must be unique:'
+                f' {port} used for {", ".join(sorted(using_port))}'
+            )
+
+
+def check_debug_level(debug_level: Optional[dict[str, str]]) -> None:
+    """Check the types of the debug_level parameter.
+    NOTE: this is intentionally fairly loose with regards to values in order
+    to retain state and lazily translate values as needed.
+    """
+    if debug_level is None:
+        return
+    if not isinstance(debug_level, dict):
+        raise ValueError(f'invalid debug_level type: {type(debug_level)}')
+    _keys = {'samba', 'ctdb'}
+    for key, value in debug_level.items():
+        if not isinstance(key, str):
+            raise ValueError(f'invalid type in debug_level: {type(key)}')
+        if not isinstance(value, str):
+            raise ValueError(f'invalid type in debug_level: {type(value)}')
+        if key not in _keys:
+            raise ValueError(f'invalid key in debug_level: {key!r}')
+        if not (
+            value.isdigit()
+            or value.upper() in ceph.smb.constants.DEBUG_LEVEL_TERMS
+        ):
+            raise ValueError(f'invalid value in debug_level: {value!r}')

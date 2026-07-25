@@ -5,10 +5,12 @@ import _ from 'lodash';
 import { BehaviorSubject, of as observableOf } from 'rxjs';
 import { catchError, map, mapTo } from 'rxjs/operators';
 import { Bucket } from '~/app/ceph/rgw/models/rgw-bucket';
+import { RgwRateLimitConfig } from '~/app/ceph/rgw/models/rgw-rate-limit';
 
 import { ApiClient } from '~/app/shared/api/api-client';
 import { RgwDaemonService } from '~/app/shared/api/rgw-daemon.service';
 import { cdEncode } from '~/app/shared/decorators/cd-encode';
+import { KmipConfig, VaultConfig } from '../models/rgw-encryption-config-keys';
 
 @cdEncode
 @Injectable({
@@ -25,7 +27,10 @@ export class RgwBucketService extends ApiClient {
   totalUsedCapacity$ = this.totalUsedCapacitySubject.asObservable();
   averageObjectSize$ = this.averageObjectSizeSubject.asObservable();
 
-  constructor(private http: HttpClient, private rgwDaemonService: RgwDaemonService) {
+  constructor(
+    private http: HttpClient,
+    private rgwDaemonService: RgwDaemonService
+  ) {
     super();
   }
 
@@ -168,10 +173,9 @@ export class RgwBucketService extends ApiClient {
     lifecycle: string
   ) {
     return this.rgwDaemonService.request((params: HttpParams) => {
-      params = params.appendAll({
+      const paramsObject: Record<string, string> = {
         bucket_id: bucketId,
         uid: uid,
-        versioning_state: versioningState,
         encryption_state: String(encryptionState),
         encryption_type: encryptionType,
         key_id: keyId,
@@ -185,14 +189,17 @@ export class RgwBucketService extends ApiClient {
         canned_acl: cannedAcl,
         replication: replication,
         lifecycle: lifecycle
-      });
+      };
+      if (versioningState) {
+        paramsObject['versioning_state'] = versioningState;
+      }
+      params = params.appendAll(paramsObject);
       return this.http.put(`${this.url}/${bucket}`, null, { params: params });
     });
   }
 
-  delete(bucket: string, purgeObjects = true) {
+  delete(bucket: string) {
     return this.rgwDaemonService.request((params: HttpParams) => {
-      params = params.append('purge_objects', purgeObjects ? 'true' : 'false');
       return this.http.delete(`${this.url}/${bucket}`, { params: params });
     });
   }
@@ -222,36 +229,12 @@ export class RgwBucketService extends ApiClient {
     return bucketData['lock_retention_period_days'] || 0;
   }
 
-  setEncryptionConfig(
-    encryption_type: string,
-    kms_provider: string,
-    auth_method: string,
-    secret_engine: string,
-    secret_path: string,
-    namespace: string,
-    address: string,
-    token: string,
-    owner: string,
-    ssl_cert: string,
-    client_cert: string,
-    client_key: string
-  ) {
+  setEncryptionConfig(config: VaultConfig | KmipConfig) {
+    const reqBody = {
+      ...config
+    };
     return this.rgwDaemonService.request((params: HttpParams) => {
-      params = params.appendAll({
-        encryption_type: encryption_type,
-        kms_provider: kms_provider,
-        auth_method: auth_method,
-        secret_engine: secret_engine,
-        secret_path: secret_path,
-        namespace: namespace,
-        address: address,
-        token: token,
-        owner: owner,
-        ssl_cert: ssl_cert,
-        client_cert: client_cert,
-        client_key: client_key
-      });
-      return this.http.put(`${this.url}/setEncryptionConfig`, null, { params: params });
+      return this.http.put(`${this.url}/setEncryptionConfig`, reqBody, { params: params });
     });
   }
 
@@ -270,6 +253,68 @@ export class RgwBucketService extends ApiClient {
   getEncryptionConfig() {
     return this.rgwDaemonService.request((params: HttpParams) => {
       return this.http.get(`${this.url}/getEncryptionConfig`, { params: params });
+    });
+  }
+
+  setLifecycle(bucket_name: string, lifecycle: string, owner: string, tenant: string) {
+    return this.rgwDaemonService.request((params: HttpParams) => {
+      params = params.appendAll({
+        bucket_name: bucket_name,
+        lifecycle: lifecycle,
+        owner: owner,
+        tenant: tenant
+      });
+      return this.http.put(`${this.url}/lifecycle`, null, { params: params });
+    });
+  }
+
+  getLifecycle(bucket_name: string, owner: string, tenant: string) {
+    return this.rgwDaemonService.request((params: HttpParams) => {
+      params = params.appendAll({
+        bucket_name: bucket_name,
+        owner: owner,
+        tenant: tenant
+      });
+      return this.http.get(`${this.url}/lifecycle`, { params: params });
+    });
+  }
+  updateBucketRateLimit(bid: string, bucketRateLimitArgs: RgwRateLimitConfig) {
+    return this.http.put(`${this.url}/${bid}/ratelimit`, bucketRateLimitArgs);
+  }
+  getBucketRateLimit(uid: string) {
+    return this.http.get(`${this.url}/${uid}/ratelimit`);
+  }
+  getGlobalBucketRateLimit() {
+    return this.http.get(`${this.url}/ratelimit`);
+  }
+
+  listNotification(bucket_name: string) {
+    return this.rgwDaemonService.request((params: HttpParams) => {
+      params = params.appendAll({
+        bucket_name: bucket_name
+      });
+      return this.http.get(`${this.url}/notification`, { params: params });
+    });
+  }
+
+  setNotification(bucket_name: string, notification: string, owner: string) {
+    return this.rgwDaemonService.request((params: HttpParams) => {
+      params = params.appendAll({
+        bucket_name: bucket_name,
+        notification: notification,
+        owner: owner
+      });
+      return this.http.put(`${this.url}/notification`, null, { params: params });
+    });
+  }
+
+  deleteNotification(bucket_name: string, notification_id: string) {
+    return this.rgwDaemonService.request((params: HttpParams) => {
+      params = params.appendAll({
+        bucket_name: bucket_name,
+        notification_id: notification_id
+      });
+      return this.http.delete(`${this.url}/notification`, { params });
     });
   }
 }

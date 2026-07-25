@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph - scalable distributed file system
  *
@@ -12,184 +13,230 @@
  *
  */
 
-#ifndef ECTRANSACTION_H
-#define ECTRANSACTION_H
+#pragma once
 
+#include "common/dout.h"
 #include "ECUtil.h"
-#include "ExtentCache.h"
+#include "common/ceph_releases.h"
 #include "erasure-code/ErasureCodeInterface.h"
 #include "os/Transaction.h"
+#include "OSDMap.h"
 #include "PGTransaction.h"
+#include "osd/ECOmapJournal.h"
+
+class PGLog;
 
 namespace ECTransaction {
-  struct WritePlan {
-    bool invalidates_cache = false; // Yes, both are possible
-    std::map<hobject_t,extent_set> to_read;
-    std::map<hobject_t,extent_set> will_write; // superset of to_read
+class WritePlanObj {
+ public:
+  const hobject_t hoid;
+  std::optional<ECUtil::shard_extent_set_t> to_read;
+  ECUtil::shard_extent_set_t will_write;
+  const uint64_t orig_size;
+  const uint64_t projected_size;
+  bool invalidates_cache;
+  bool do_parity_delta_write = false;
 
-    std::map<hobject_t,ECUtil::HashInfoRef> hash_infos;
-  };
+  WritePlanObj(
+      const hobject_t &hoid,
+      const PGTransaction::ObjectOperation &op,
+      const ECUtil::stripe_info_t &sinfo,
+      const shard_id_set readable_shards,
+      const shard_id_set writable_shards,
+      const bool object_in_cache,
+      uint64_t orig_size,
+      const std::optional<object_info_t> &oi,
+      const std::optional<object_info_t> &soi,
+      unsigned pdw_write_mode);
 
-  template <typename F>
-  WritePlan get_write_plan(
-    const ECUtil::stripe_info_t &sinfo,
-    PGTransaction& t,
-    F &&get_hinfo,
-    DoutPrefixProvider *dpp) {
-    WritePlan plan;
-    t.safe_create_traverse(
-      [&](std::pair<const hobject_t, PGTransaction::ObjectOperation> &i) {
-        const auto& [obj, op] = i;
-	ECUtil::HashInfoRef hinfo = get_hinfo(obj);
-	plan.hash_infos[obj] = hinfo;
-
-	uint64_t projected_size =
-	  hinfo->get_projected_total_logical_size(sinfo);
-
-	if (op.deletes_first()) {
-	  ldpp_dout(dpp, 20) << __func__ << ": delete, setting projected size"
-			     << " to 0" << dendl;
-	  projected_size = 0;
-	}
-
-	hobject_t source;
-	if (op.has_source(&source)) {
-	  // typically clone or mv
-	  plan.invalidates_cache = true;
-
-	  ECUtil::HashInfoRef shinfo = get_hinfo(source);
-	  projected_size = shinfo->get_projected_total_logical_size(sinfo);
-	  plan.hash_infos[source] = shinfo;
-	}
-
-	auto &will_write = plan.will_write[obj];
-	if (op.truncate &&
-	    op.truncate->first < projected_size) {
-	  if (!(sinfo.logical_offset_is_stripe_aligned(
-		  op.truncate->first))) {
-	    plan.to_read[obj].union_insert(
-	      sinfo.logical_to_prev_stripe_offset(op.truncate->first),
-	      sinfo.get_stripe_width());
-
-	    ldpp_dout(dpp, 20) << __func__ << ": unaligned truncate" << dendl;
-
-	    will_write.union_insert(
-	      sinfo.logical_to_prev_stripe_offset(op.truncate->first),
-	      sinfo.get_stripe_width());
-	  }
-	  projected_size = sinfo.logical_to_next_stripe_offset(
-	    op.truncate->first);
-	}
-
-	extent_set raw_write_set;
-	for (auto &&extent: op.buffer_updates) {
-	  using BufferUpdate = PGTransaction::ObjectOperation::BufferUpdate;
-	  if (boost::get<BufferUpdate::CloneRange>(&(extent.get_val()))) {
-	    ceph_assert(
-	      0 ==
-	      "CloneRange is not allowed, do_op should have returned ENOTSUPP");
-	  }
-	  raw_write_set.insert(extent.get_off(), extent.get_len());
-	}
-
-	auto orig_size = projected_size;
-	for (auto extent = raw_write_set.begin();
-	     extent != raw_write_set.end();
-	     ++extent) {
-	  uint64_t head_start =
-	    sinfo.logical_to_prev_stripe_offset(extent.get_start());
-	  uint64_t head_finish =
-	    sinfo.logical_to_next_stripe_offset(extent.get_start());
-	  if (head_start > projected_size) {
-	    head_start = projected_size;
-	  }
-	  if (head_start != head_finish &&
-	      head_start < orig_size) {
-	    ceph_assert(head_finish <= orig_size);
-	    ceph_assert(head_finish - head_start == sinfo.get_stripe_width());
-	    ldpp_dout(dpp, 20) << __func__ << ": reading partial head stripe "
-			       << head_start << "~" << sinfo.get_stripe_width()
-			       << dendl;
-	    plan.to_read[obj].union_insert(
-	      head_start, sinfo.get_stripe_width());
-	  }
-
-	  uint64_t tail_start =
-	    sinfo.logical_to_prev_stripe_offset(
-	      extent.get_start() + extent.get_len());
-	  uint64_t tail_finish =
-	    sinfo.logical_to_next_stripe_offset(
-	      extent.get_start() + extent.get_len());
-	  if (tail_start != tail_finish &&
-	      (head_start == head_finish || tail_start != head_start) &&
-	      tail_start < orig_size) {
-	    ceph_assert(tail_finish <= orig_size);
-	    ceph_assert(tail_finish - tail_start == sinfo.get_stripe_width());
-	    ldpp_dout(dpp, 20) << __func__ << ": reading partial tail stripe "
-			       << tail_start << "~" << sinfo.get_stripe_width()
-			       << dendl;
-	    plan.to_read[obj].union_insert(
-	      tail_start, sinfo.get_stripe_width());
-	  }
-
-	  if (head_start != tail_finish) {
-	    ceph_assert(
-	      sinfo.logical_offset_is_stripe_aligned(
-		tail_finish - head_start)
-	      );
-	    will_write.union_insert(
-	      head_start, tail_finish - head_start);
-	    if (tail_finish > projected_size)
-	      projected_size = tail_finish;
-	  } else {
-	    ceph_assert(tail_finish <= projected_size);
-	  }
-	}
-
-	if (op.truncate && op.truncate->second > projected_size) {
-	  uint64_t truncating_to =
-	    sinfo.logical_to_next_stripe_offset(op.truncate->second);
-	  ldpp_dout(dpp, 20) << __func__ << ": truncating out to "
-			     <<  truncating_to
-			     << dendl;
-	  will_write.union_insert(projected_size,
-				  truncating_to - projected_size);
-	  projected_size = truncating_to;
-	}
-
-	ldpp_dout(dpp, 20) << __func__ << ": " << obj
-			   << " projected size "
-			   << projected_size
-			   << dendl;
-	hinfo->set_projected_total_logical_size(
-	  sinfo,
-	  projected_size);
-
-	/* validate post conditions:
-	 * to_read should have an entry for `obj` if it isn't empty
-	 * and if we are reading from `obj`, we can't be renaming or
-	 * cloning it */
-	ceph_assert(plan.to_read.count(obj) == 0 ||
-	       (!plan.to_read.at(obj).empty() &&
-		!i.second.has_source()));
-      });
-    return plan;
+  void print(std::ostream &os) const {
+    os << "{hoid: " << hoid
+       << " to_read: " << to_read
+       << " will_write: " << will_write
+       << " orig_size: " << orig_size
+       << " projected_size: " << projected_size
+       << " invalidates_cache: " << invalidates_cache
+       << " do_pdw: " << do_parity_delta_write
+       << "}";
   }
+};
 
-  void generate_transactions(
-    PGTransaction* _t,
+struct WritePlan {
+  bool want_read;
+  std::list<WritePlanObj> plans;
+
+  void print(std::ostream &os) const {
+    os << " plans: [";
+    bool first = true;
+    for (auto && p : plans) {
+      if (first) {
+        first = false;
+      } else {
+        os << ", ";
+      }
+      os << "{" << p << "}";
+    }
+   os << "]";
+  }
+};
+
+/**
+ * Decode and accumulate omap updates from encoded operation list.
+ * Handles Insert, Remove, and RemoveRange operations.
+ */
+void accumulate_omap_updates(
+  bool clear_omap,
+  const std::optional<ceph::buffer::list>& header,
+  const std::vector<std::pair<OmapUpdateType, ceph::buffer::list>>& updates,
+  std::optional<ceph::buffer::list>& out_header,
+  std::map<std::string, std::optional<ceph::buffer::list>>& key_updates,
+  std::list<std::pair<std::string, std::optional<std::string>>>& removed_ranges);
+
+/**
+ * Apply accumulated omap updates to primary-capable shard transactions.
+ */
+void apply_omap_to_transactions(
+  shard_id_map<ceph::os::Transaction>& transactions,
+  const pg_t& pgid,
+  const hobject_t& target_oid,
+  const ECUtil::stripe_info_t& sinfo,
+  bool clear_omap,
+  const std::optional<ceph::buffer::list>& header,
+  const std::map<std::string, std::optional<ceph::buffer::list>>& key_updates,
+  const std::list<std::pair<std::string, std::optional<std::string>>>& removed_ranges,
+  const DoutPrefixProvider* dpp);
+
+
+/**
+ * OmapCloneVisitor - Visitor to extract and apply omap updates to clone transactions
+ *
+ * This visitor implements ObjectModDesc::Visitor to traverse PG log entries and
+ * accumulate omap updates (key-value pairs, range removals, header changes) that
+ * need to be applied to a cloned object. It ensures that incomplete omap updates
+ * from the PG log are properly transferred to the clone.
+ */
+class OmapCloneVisitor : public ObjectModDesc::Visitor {
+private:
+  shard_id_map<ceph::os::Transaction> &transactions;
+  const pg_t &pgid;
+  const hobject_t &source_oid;
+  const hobject_t &dest_oid;
+  const ECUtil::stripe_info_t &sinfo;
+  ECOmapJournal &ec_omap_journal;
+  const DoutPrefixProvider *dpp;
+  
+  // Accumulated omap state
+  bool has_clear_omap = false;
+  std::optional<ceph::buffer::list> omap_header;
+  std::map<std::string, std::optional<ceph::buffer::list>> omap_updates;
+  std::list<std::pair<std::string, std::optional<std::string>>> removed_ranges;
+
+public:
+  OmapCloneVisitor(
+    shard_id_map<ceph::os::Transaction> &txns,
+    const pg_t &pg,
+    const hobject_t &src,
+    const hobject_t &dst,
+    const ECUtil::stripe_info_t &stripe_info,
+    ECOmapJournal &journal,
+    const DoutPrefixProvider *dpp)
+    : transactions(txns), pgid(pg), source_oid(src), dest_oid(dst),
+      sinfo(stripe_info), ec_omap_journal(journal), dpp(dpp) {}
+
+  /**
+   * Called by ObjectModDesc::visit() when an ec_omap modification is encountered
+   * Accumulates omap updates from the PG log entry
+   */
+  void ec_omap(
+    bool clear_omap,
+    std::optional<ceph::buffer::list> header,
+    std::vector<std::pair<OmapUpdateType, ceph::buffer::list>> &updates) override;
+  
+  /**
+   * Apply accumulated omap updates to the clone transaction
+   * This should be called after visiting all relevant log entries
+   */
+  void apply_to_clone();
+};
+
+class Generate {
+  PGTransaction &t;
+  const ErasureCodeInterfaceRef &ec_impl;
+  const pg_t &pgid;
+  const ECUtil::stripe_info_t &sinfo;
+  shard_id_map<ceph::os::Transaction> &transactions;
+  DoutPrefixProvider *dpp;
+  const OSDMapRef &osdmap;
+  pg_log_entry_t *entry;
+  const hobject_t &oid;
+  PGTransaction::ObjectOperation& op;
+  ObjectContextRef obc;
+  std::map<std::string, std::optional<bufferlist>> xattr_rollback;
+  const WritePlanObj &plan;
+  std::optional<ECUtil::shard_extent_map_t> read_sem;
+  ECUtil::shard_extent_map_t to_write;
+  std::vector<std::pair<uint64_t, uint64_t>> rollback_extents;
+  std::vector<shard_id_set> rollback_shards;
+  uint32_t fadvise_flags = 0;
+  bool written_shards_final{false};
+  ECOmapJournal &ec_omap_journal;
+  const PGLog &pg_log;
+
+  void all_shards_written();
+  void shard_written(const shard_id_t shard);
+  void shards_written(const shard_id_set &shards);
+  void delete_first();
+  void zero_truncate_to_delete();
+  void process_init();
+  void encode_and_write();
+  void truncate();
+  void overlay_writes();
+  void appends_and_clone_ranges();
+  void written_shards();
+  void attr_updates();
+  std::vector<const pg_log_entry_t*> get_incomplete_ec_omap_log_entries(
+    const hobject_t &hoid,
+    eversion_t can_rollback_to);
+  /**
+   * Apply omap updates directly to transactions without journaling.
+   * Should only be called when entry is null (temporary/non-journaled operations).
+   * For journaled operations, use entry->mod_desc.ec_omap() instead.
+   */
+  void apply_omap_updates_without_journal();
+
+ public:
+  Generate(PGTransaction &t,
+    ErasureCodeInterfaceRef &ec_impl, pg_t &pgid,
+    const ECUtil::stripe_info_t &sinfo,
+    const std::map<hobject_t, ECUtil::shard_extent_map_t> &partial_extents,
+    std::map<hobject_t, ECUtil::shard_extent_map_t> *written_map,
+    shard_id_map<ceph::os::Transaction> &transactions,
+    const OSDMapRef &osdmap,
+    const hobject_t &oid, PGTransaction::ObjectOperation &op,
+    WritePlanObj &plan,
+    DoutPrefixProvider *dpp,
+    pg_log_entry_t *entry,
+    bool &first_write_in_interval,
+    ECOmapJournal &ec_omap_journal,
+    const PGLog &pg_log);
+};
+
+void generate_transactions(
+    PGTransaction *_t,
     WritePlan &plan,
-    ceph::ErasureCodeInterfaceRef &ecimpl,
+    ceph::ErasureCodeInterfaceRef &ec_impl,
     pg_t pgid,
     const ECUtil::stripe_info_t &sinfo,
-    const std::map<hobject_t,extent_map> &partial_extents,
+    const std::map<hobject_t, ECUtil::shard_extent_map_t> &partial_extents,
     std::vector<pg_log_entry_t> &entries,
-    std::map<hobject_t,extent_map> *written,
-    std::map<shard_id_t, ceph::os::Transaction> *transactions,
+    std::map<hobject_t, ECUtil::shard_extent_map_t> *written_map,
+    shard_id_map<ceph::os::Transaction> *transactions,
     std::set<hobject_t> *temp_added,
     std::set<hobject_t> *temp_removed,
     DoutPrefixProvider *dpp,
-    const ceph_release_t require_osd_release = ceph_release_t::unknown);
-};
-
-#endif
+    const OSDMapRef &osdmap,
+    bool &first_write_in_interval,
+    ECOmapJournal &ec_omap_journal,
+    const PGLog &pg_log
+  );
+}

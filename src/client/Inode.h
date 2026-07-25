@@ -1,5 +1,5 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
 
 #ifndef CEPH_CLIENT_INODE_H
 #define CEPH_CLIENT_INODE_H
@@ -15,12 +15,20 @@
 #include "mds/mdstypes.h" // hrm
 #include "include/cephfs/types.h"
 
+#include "messages/MClientReply.h"
+
 #include "osdc/ObjectCacher.h"
 
 #include "InodeRef.h"
 #include "MetaSession.h"
 #include "UserPerm.h"
 #include "Delegation.h"
+
+#include "FSCrypt.h"
+
+#ifndef S_ENCRYPTED
+#define S_ENCRYPTED (1 << 14)
+#endif
 
 class Client;
 class Dentry;
@@ -30,6 +38,7 @@ struct Inode;
 class MetaRequest;
 class filepath;
 class Fh;
+class FSCrypt;
 
 class Cap {
 public:
@@ -90,6 +99,8 @@ struct CapSnap {
   gid_t      gid = 0;
   std::map<std::string,bufferptr> xattrs;
   version_t xattr_version = 0;
+  std::vector<uint8_t> fscrypt_auth;
+  std::vector<uint8_t> fscrypt_file;
 
   bufferlist inline_data;
   version_t inline_version = 0;
@@ -131,6 +142,7 @@ struct Inode : RefCountedObject {
   uint32_t   mode = 0;
   uid_t      uid = 0;
   gid_t      gid = 0;
+  uint32_t   i_flags = 0;
 
   // nlink
   int32_t    nlink = 0;
@@ -164,14 +176,35 @@ struct Inode : RefCountedObject {
 
   std::vector<uint8_t> fscrypt_auth;
   std::vector<uint8_t> fscrypt_file;
+
+  decltype(InodeStat::optmetadata) optmetadata;
+  using optkind_t = decltype(InodeStat::optmetadata)::optkind_t;
+#if defined(__linux__)
+  FSCryptContextRef fscrypt_ctx;
+  FSCryptKeyValidatorRef fscrypt_key_validator;
+#endif
+  uint64_t effective_size() const;
+  void set_effective_size(uint64_t size);
+
+  // this method returns true if inode is de facto ecrypted.
+  // semantics of "enabled" is a bit confusing since it may mean
+  // "enabled but not encrypted de facto".
   bool is_fscrypt_enabled() {
     return !!fscrypt_auth.size();
   }
+#if defined(__linux__)
 
+  FSCryptContextRef init_fscrypt_ctx(FSCrypt *fscrypt);
+
+  void gen_inherited_fscrypt_auth(std::vector<uint8_t> *ctx);
+#endif
   bool is_root()    const { return ino == CEPH_INO_ROOT; }
   bool is_symlink() const { return (mode & S_IFMT) == S_IFLNK; }
   bool is_dir()     const { return (mode & S_IFMT) == S_IFDIR; }
   bool is_file()    const { return (mode & S_IFMT) == S_IFREG; }
+
+  // use i_flags as 1 << 14 will overlap with other mode bits.
+  bool is_encrypted() const { return (i_flags & S_ENCRYPTED) == S_ENCRYPTED; }
 
   bool has_dir_layout() const {
     return layout != file_layout_t();
@@ -310,6 +343,7 @@ struct Inode : RefCountedObject {
 
   void get_cap_ref(int cap);
   int put_cap_ref(int cap);
+  bool is_last_cap_ref(int c);
   bool is_any_caps();
   bool cap_is_valid(const Cap &cap) const;
   int caps_issued(int *implemented = 0) const;
@@ -329,11 +363,21 @@ struct Inode : RefCountedObject {
   void rm_fh(Fh *f) {fhs.erase(f);}
   void set_async_err(int r);
   void dump(Formatter *f) const;
+  void print(std::ostream&) const;
+
+  bool has_charmap() const {
+    return optmetadata.has_opt(optkind_t::CHARMAP);
+  }
+  auto& get_charmap() const {
+    auto& opt = optmetadata.get_opt(optkind_t::CHARMAP);
+    return opt.template get_meta< charmap_md_t >();
+  }
 
   void break_all_delegs() { break_deleg(false); };
 
   void recall_deleg(bool skip_read);
   bool has_recalled_deleg();
+  bool is_write_delegated();
   int set_deleg(Fh *fh, unsigned type, ceph_deleg_cb_t cb, void *priv);
   void unset_deleg(Fh *fh);
 
@@ -359,7 +403,5 @@ private:
   bool delegations_broken(bool skip_read);
 
 };
-
-std::ostream& operator<<(std::ostream &out, const Inode &in);
 
 #endif

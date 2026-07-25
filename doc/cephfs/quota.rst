@@ -29,6 +29,12 @@ value::
 .. note:: Values will be strictly cast to IEC units even when SI units
    are input, e.g. 1K to 1024 bytes.
 
+.. note:: To enable a client to set a quota by modifying the corresponding
+   extended attribute, in the client's authentication capabilities the ``p``
+   flag needs to be set in addition to ``rw``. See :ref:`CephFS Client
+   Capabilities - Layout and Quota restriction (the 'p'
+   flag)<cephfs-layout-and-quota-restriction>` for more details.
+
 To view quota limit::
 
   $ getfattr -n ceph.quota.max_bytes /some/dir
@@ -95,7 +101,7 @@ Limitations
    reached.  They will inevitably be allowed to write some amount of
    data over the configured limit.  How far over the quota they are
    able to go depends primarily on the amount of time, not the amount
-   of data.  Generally speaking writers will be stopped within 10s of
+   of data.  Generally speaking writers will be stopped within tens of
    seconds of crossing the configured limit.
 
 #. *Quotas are implemented in the kernel client 4.17 and higher.*
@@ -112,8 +118,8 @@ Limitations
    (e.g., ``/home/user``) based on the MDS capability, and a quota is
    configured on an ancestor directory they do not have access to
    (e.g., ``/home``), the client will not enforce it.  When using
-   path-based access restrictions be sure to configure the quota on
-   the directory the client is restricted too (e.g., ``/home/user``)
+   path-based access restrictions, be sure to configure the quota on
+   the directory the client is restricted to (e.g., ``/home/user``)
    or something nested beneath it.
 
    In case of a kernel client, it needs to have access to the parent
@@ -122,7 +128,7 @@ Limitations
    (e.g., ``/home/volumes/group``), the kclient needs to have access
    to the parent (e.g., ``/home/volumes``).
 
-   An example command to create such an user is as below::
+   An example command to create such a user::
 
      $ ceph auth get-or-create client.guest mds 'allow r path=/home/volumes, allow rw path=/home/volumes/group' mgr 'allow rw' osd 'allow rw tag cephfs metadata=*' mon 'allow r'
 

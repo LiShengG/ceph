@@ -833,7 +833,7 @@ class TestDF(TestCephFSShell):
     def test_df_for_invalid_directory(self):
         dir_abspath = path.join(self.mount_a.mountpoint, 'non-existent-dir')
         self.negtest_cephfs_shell_cmd(cmd='df ' + dir_abspath,
-                                      errmsg='error in stat')
+                                      errmsg='statfs failed')
 
     def test_df_for_valid_file(self):
         s = 'df test' * 14145016
@@ -980,6 +980,13 @@ class TestXattr(TestCephFSShell):
             cmd=['getxattr', self.dir_name, input_val[0]])
         self.negtest_cephfs_shell_cmd(cmd=['listxattr', self.dir_name])
 
+    def test_remove_xattr(self):
+        self.test_set()
+        self.get_cephfs_shell_cmd_output(
+            ['removexattr', self.dir_name, 'user.key'])
+        self.negtest_cephfs_shell_cmd(
+            cmd=['getxattr', self.dir_name, 'user.key'])
+
 
 class TestLS(TestCephFSShell):
     dir_name = 'test_dir'
@@ -1102,6 +1109,17 @@ class TestShellOpts(TestCephFSShell):
     Contains tests for shell options from conf file and shell prompt.
     """
 
+    def extract_set_editor_output(self, out):
+        res = None
+        for line in out.splitlines():
+            line_parts = line.split()
+            if len(line_parts) > 4 and line_parts[0] == "editor":
+                res = line_parts
+                break
+
+        self.assertIsNotNone(res, f"didn't find editor output in: {out}")
+        return res[1]
+
     def setUp(self):
         super(type(self), self).setUp()
 
@@ -1112,9 +1130,8 @@ class TestShellOpts(TestCephFSShell):
         # ====================================================================================================
         # editor  ?                               Program used by 'edit'
         self.editor_val = self.get_cephfs_shell_cmd_output(
-            'set editor ?, set editor').split('\n')[4]
-        self.editor_val = self.editor_val.split()[1].strip(). \
-            replace("'", "", 2)
+            'set editor ?, set editor')
+        self.editor_val = self.extract_set_editor_output(self.editor_val)
 
     def write_tempconf(self, confcontents):
         self.tempconfpath = self.mount_a.client_remote.mktemp(
@@ -1132,9 +1149,7 @@ class TestShellOpts(TestCephFSShell):
         # editor  ???                             Program used by 'edit'
         final_editor_val = self.get_cephfs_shell_cmd_output(
             cmd='set editor', shell_conf_path=self.tempconfpath)
-        final_editor_val = final_editor_val.split('\n')[2]
-        final_editor_val = final_editor_val.split()[1].strip(). \
-            replace("'", "", 2)
+        final_editor_val = self.extract_set_editor_output(final_editor_val)
 
         self.assertNotEqual(self.editor_val, final_editor_val)
 
@@ -1152,9 +1167,7 @@ class TestShellOpts(TestCephFSShell):
         # editor  ?                               Program used by 'edit'
         final_editor_val = self.get_cephfs_shell_cmd_output(
             cmd='set editor', shell_conf_path=self.tempconfpath)
-        final_editor_val = final_editor_val.split('\n')[2]
-        final_editor_val = final_editor_val.split()[1].strip(). \
-            replace("'", "", 2)
+        final_editor_val = self.extract_set_editor_output(final_editor_val)
 
         self.assertEqual(self.editor_val, final_editor_val)
 
@@ -1170,8 +1183,6 @@ class TestShellOpts(TestCephFSShell):
         final_editor_val = self.get_cephfs_shell_cmd_output(
             cmd='set editor %s, set editor' % self.editor_val,
             shell_conf_path=self.tempconfpath)
-        final_editor_val = final_editor_val.split('\n')[4]
-        final_editor_val = final_editor_val.split()[1].strip(). \
-            replace("'", "", 2)
+        final_editor_val = self.extract_set_editor_output(final_editor_val)
 
         self.assertEqual(self.editor_val, final_editor_val)

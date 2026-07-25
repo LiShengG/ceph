@@ -1,5 +1,5 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
 
 #pragma once
 
@@ -8,6 +8,7 @@
 #include <string>
 #include <boost/container/flat_set.hpp>
 
+#include "include/expected.hpp"
 #include "include/rados.h"
 
 #include "crimson/os/futurized_store.h"
@@ -18,21 +19,23 @@
 #include "messages/MOSDOpReply.h"
 #include "os/Transaction.h"
 #include "osd/osd_types.h"
+#include "crimson/os/futurized_store.h"
 #include "crimson/osd/object_context.h"
 #include "crimson/osd/osd_operation.h"
 #include "crimson/osd/osd_operations/osdop_params.h"
 
 struct hobject_t;
+struct ECListener;
+class PGLog;
 
 namespace ceph::os {
   class Transaction;
 }
 
 namespace crimson::osd {
-  class ShardServices;
-  class PG;
-  class ObjectContextLoader;
-}
+class ShardServices;
+class PG;
+class ObjectContextLoader;
 
 class PGBackend
 {
@@ -48,7 +51,8 @@ protected:
 
 public:
   using load_metadata_ertr = crimson::errorator<
-    crimson::ct_error::object_corrupted>;
+    crimson::ct_error::object_corrupted,
+    crimson::ct_error::enoent>;
   using load_metadata_iertr =
     ::crimson::interruptible::interruptible_errorator<
       ::crimson::osd::IOInterruptCondition,
@@ -62,20 +66,22 @@ public:
       ::crimson::osd::IOInterruptCondition, T>;
   using rep_op_ret_t = 
     std::tuple<interruptible_future<>,
-	       interruptible_future<crimson::osd::acked_peers_t>>;
+	       interruptible_future<>>;
   using rep_op_fut_t = interruptible_future<rep_op_ret_t>;
-  PGBackend(shard_id_t shard, CollectionRef coll,
+  PGBackend(pg_shard_t whoami, CollectionRef coll,
             crimson::osd::ShardServices &shard_services,
+            store_index_t store_index,
             DoutPrefixProvider &dpp);
   virtual ~PGBackend() = default;
   static std::unique_ptr<PGBackend> create(pg_t pgid,
-					   const pg_shard_t pg_shard,
+					   const pg_shard_t whoami,
 					   const pg_pool_t& pool,
 					   crimson::osd::PG &pg,
 					   crimson::os::CollectionRef coll,
 					   crimson::osd::ShardServices& shard_services,
 					   const ec_profile_t& ec_profile,
-					   DoutPrefixProvider &dpp);
+					   DoutPrefixProvider &dpp,
+					   ECListener &eclistener);
   using attrs_t =
     std::map<std::string, ceph::bufferptr, std::less<>>;
   using read_errorator = ll_read_errorator::extend<
@@ -268,7 +274,8 @@ public:
     ObjectState& os,
     const OSDOp& osd_op,
     ceph::os::Transaction& trans,
-    object_stat_sum_t& delta_stats);
+    object_stat_sum_t& delta_stats,
+    ObjectContext::attr_cache_t& attr_cache);
   using get_attr_errorator = crimson::os::FuturizedStore::Shard::get_attr_errorator;
   using get_attr_ierrorator =
     ::crimson::interruptible::interruptible_errorator<
@@ -276,16 +283,15 @@ public:
       get_attr_errorator>;
   get_attr_ierrorator::future<> getxattr(
     const ObjectState& os,
+    const ObjectContext::attr_cache_t& attr_cache,
     OSDOp& osd_op,
     object_stat_sum_t& delta_stats) const;
-  get_attr_ierrorator::future<ceph::bufferlist> getxattr(
+  virtual get_attr_ierrorator::future<ceph::bufferlist> getxattr(
     const hobject_t& soid,
-    std::string_view key) const;
-  get_attr_ierrorator::future<ceph::bufferlist> getxattr(
-    const hobject_t& soid,
-    std::string&& key) const;
+    std::string&& key) const = 0;
   get_attr_ierrorator::future<> get_xattrs(
     const ObjectState& os,
+    const ObjectContext::attr_cache_t& attr_cache,
     OSDOp& osd_op,
     object_stat_sum_t& delta_stats) const;
   using cmp_xattr_errorator = get_attr_errorator::extend<
@@ -307,7 +313,8 @@ public:
   rm_xattr_iertr::future<> rm_xattr(
     ObjectState& os,
     const OSDOp& osd_op,
-    ceph::os::Transaction& trans);
+    ceph::os::Transaction& trans,
+    ObjectContext::attr_cache_t& attr_cache);
   interruptible_future<struct stat> stat(
     CollectionRef c,
     const ghobject_t& oid) const;
@@ -315,7 +322,8 @@ public:
     CollectionRef c,
     const ghobject_t& oid,
     uint64_t off,
-    uint64_t len);
+    uint64_t len,
+    uint32_t op_flags = 0);
 
   write_iertr::future<> tmapput(
     ObjectState& os,
@@ -375,11 +383,13 @@ public:
     object_stat_sum_t& delta_stats);
   ll_read_ierrorator::future<ceph::bufferlist> omap_get_header(
     const crimson::os::CollectionRef& c,
-    const ghobject_t& oid) const;
+    const ghobject_t& oid,
+    uint32_t op_flags = 0) const;
   ll_read_ierrorator::future<> omap_get_header(
     const ObjectState& os,
     OSDOp& osd_op,
-    object_stat_sum_t& delta_stats) const;
+    object_stat_sum_t& delta_stats,
+    uint32_t op_flags = 0) const;
   interruptible_future<> omap_set_header(
     ObjectState& os,
     const OSDOp& osd_op,
@@ -394,7 +404,9 @@ public:
   interruptible_future<> omap_remove_key(
     ObjectState& os,
     const OSDOp& osd_op,
-    ceph::os::Transaction& trans);
+    ceph::os::Transaction& trans,
+    osd_op_params_t &osd_op_params,
+    object_stat_sum_t &delta_stats);
   using omap_clear_ertr = crimson::errorator<crimson::ct_error::enoent>;
   using omap_clear_iertr =
     ::crimson::interruptible::interruptible_errorator<
@@ -422,38 +434,53 @@ public:
 
   virtual rep_op_fut_t
   submit_transaction(const std::set<pg_shard_t> &pg_shards,
-		     const hobject_t& hoid,
-		     crimson::osd::ObjectContextRef&& new_clone,
-		     ceph::os::Transaction&& txn,
-		     osd_op_params_t&& osd_op_p,
-		     epoch_t min_epoch, epoch_t max_epoch,
-		     std::vector<pg_log_entry_t>&& log_entries) = 0;
+       crimson::osd::ObjectContextRef&& obc,
+       crimson::osd::ObjectContextRef&& new_clone,
+       ceph::os::Transaction&& txn,
+       osd_op_params_t&& osd_op_p,
+       epoch_t min_epoch, epoch_t max_epoch,
+       std::vector<pg_log_entry_t>&& log_entries,
+       const PGLog &pg_log) = 0;
 
   virtual void got_rep_op_reply(const MOSDRepOpReply&) {}
   virtual seastar::future<> stop() = 0;
   virtual void on_actingset_changed(bool same_primary) = 0;
 protected:
-  const shard_id_t shard;
+  const pg_shard_t whoami;
   CollectionRef coll;
   crimson::osd::ShardServices &shard_services;
   DoutPrefixProvider &dpp; ///< provides log prefix context
-  crimson::os::FuturizedStore::Shard* store;
+  crimson::os::BackendStore store;
   virtual seastar::future<> request_committed(
     const osd_reqid_t& reqid,
     const eversion_t& at_version) = 0;
+  const shard_id_t& get_shard() const {
+    return whoami.shard;
+  }
 public:
   struct loaded_object_md_t {
     ObjectState os;
     crimson::osd::SnapSetContextRef ssc;
+    crimson::os::FuturizedStore::Shard::attrs_t attr_cache;
     using ref = std::unique_ptr<loaded_object_md_t>;
   };
+
+  tl::expected<typename loaded_object_md_t::ref, std::error_code>
+  decode_metadata2(
+    const hobject_t& oid,
+    crimson::os::FuturizedStore::Shard::attrs_t attrs);
+
   load_metadata_iertr::future<loaded_object_md_t::ref>
   load_metadata(
     const hobject_t &oid);
 
 private:
+  bool is_offset_and_length_valid(
+    std::uint64_t offset, std::uint64_t length) const;
+
   virtual ll_read_ierrorator::future<ceph::bufferlist> _read(
     const hobject_t& hoid,
+    size_t object_size,
     size_t offset,
     size_t length,
     uint32_t flags) = 0;
@@ -513,4 +540,8 @@ private:
   boost::container::flat_set<hobject_t> temp_contents;
 
   friend class RecoveryBackend;
+
+  virtual bool is_erasure() const { return false; }
 };
+
+}

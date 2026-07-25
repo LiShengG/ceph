@@ -11,17 +11,17 @@ import { Node } from 'carbon-components-angular/treeview/tree-node.types';
 import { NgbModalRef } from '@ng-bootstrap/ng-bootstrap';
 import _ from 'lodash';
 
-import { forkJoin, Subscription, timer as observableTimer } from 'rxjs';
+import { forkJoin, Subscription } from 'rxjs';
 import { RgwRealmService } from '~/app/shared/api/rgw-realm.service';
 import { RgwZoneService } from '~/app/shared/api/rgw-zone.service';
 import { RgwZonegroupService } from '~/app/shared/api/rgw-zonegroup.service';
-import { CriticalConfirmationModalComponent } from '~/app/shared/components/critical-confirmation-modal/critical-confirmation-modal.component';
+import { DeleteConfirmationModalComponent } from '~/app/shared/components/delete-confirmation-modal/delete-confirmation-modal.component';
 import { ActionLabelsI18n, TimerServiceInterval } from '~/app/shared/constants/app.constants';
 import { Icons } from '~/app/shared/enum/icons.enum';
 import { NotificationType } from '~/app/shared/enum/notification-type.enum';
 import { CdTableAction } from '~/app/shared/models/cd-table-action';
 import { CdTableSelection } from '~/app/shared/models/cd-table-selection';
-import { Permission } from '~/app/shared/models/permissions';
+import { Permissions } from '~/app/shared/models/permissions';
 import { AuthStorageService } from '~/app/shared/services/auth-storage.service';
 import { ModalService } from '~/app/shared/services/modal.service';
 import { NotificationService } from '~/app/shared/services/notification.service';
@@ -37,12 +37,12 @@ import { RgwMultisiteZoneFormComponent } from '../rgw-multisite-zone-form/rgw-mu
 import { RgwMultisiteZonegroupFormComponent } from '../rgw-multisite-zonegroup-form/rgw-multisite-zonegroup-form.component';
 import { RgwDaemonService } from '~/app/shared/api/rgw-daemon.service';
 import { MgrModuleService } from '~/app/shared/api/mgr-module.service';
-import { BlockUI, NgBlockUI } from 'ng-block-ui';
 import { Router } from '@angular/router';
 import { RgwMultisiteWizardComponent } from '../rgw-multisite-wizard/rgw-multisite-wizard.component';
 import { RgwMultisiteSyncPolicyComponent } from '../rgw-multisite-sync-policy/rgw-multisite-sync-policy.component';
 import { ModalCdsService } from '~/app/shared/services/modal-cds.service';
 import { RgwMultisiteService } from '~/app/shared/api/rgw-multisite.service';
+import { CdForm } from '~/app/shared/forms/cd-form';
 
 const BASE_URL = 'rgw/multisite/configuration';
 
@@ -50,30 +50,26 @@ const BASE_URL = 'rgw/multisite/configuration';
   selector: 'cd-rgw-multisite-details',
   templateUrl: './rgw-multisite-details.component.html',
   styleUrls: ['./rgw-multisite-details.component.scss'],
-  changeDetection: ChangeDetectionStrategy.OnPush
+  changeDetection: ChangeDetectionStrategy.OnPush,
+  standalone: false
 })
-export class RgwMultisiteDetailsComponent implements OnDestroy, OnInit {
+export class RgwMultisiteDetailsComponent extends CdForm implements OnDestroy, OnInit {
   private sub = new Subscription();
   @ViewChild('treeNodeTemplate') labelTpl: TemplateRef<any>;
   @ViewChild(RgwMultisiteSyncPolicyComponent) syncPolicyComp: RgwMultisiteSyncPolicyComponent;
 
   messages = {
     noDefaultRealm: $localize`Please create a default realm first to enable this feature`,
-    noMasterZone: $localize`Please create a master zone for each zone group to enable this feature`,
+    noMasterZone: $localize`Please create a master zone for each zonegroup to enable this feature`,
     noRealmExists: $localize`No realm exists`,
-    disableExport: $localize`Please create master zone group and master zone for each of the realms`
+    disableExport: $localize`Please create master zonegroup and master zone for each of the realms`
   };
 
-  @BlockUI()
-  blockUI: NgBlockUI;
-
   icons = Icons;
-  permission: Permission;
+  permissions: Permissions;
   selection = new CdTableSelection();
   createTableActions: CdTableAction[];
   migrateTableAction: CdTableAction[];
-  importAction: CdTableAction[];
-  exportAction: CdTableAction[];
   multisiteReplicationActions: CdTableAction[];
   loadingIndicator = true;
 
@@ -126,6 +122,12 @@ export class RgwMultisiteDetailsComponent implements OnDestroy, OnInit {
   rgwModuleData: string | any[] = [];
   activeId: string;
   activeNodeId?: string;
+  MODULE_NAME = 'rgw';
+  NAVIGATE_TO = '/rgw/multisite';
+
+  get disableActions(): boolean {
+    return !this.permissions?.rgw?.create;
+  }
 
   constructor(
     private modalService: ModalService,
@@ -144,12 +146,13 @@ export class RgwMultisiteDetailsComponent implements OnDestroy, OnInit {
     private rgwMultisiteService: RgwMultisiteService,
     private changeDetectionRef: ChangeDetectorRef
   ) {
-    this.permission = this.authStorageService.getPermissions().rgw;
+    super();
+    this.permissions = this.authStorageService.getPermissions();
   }
 
   openModal(entity: any | string, edit = false) {
     const entityName = edit ? entity?.data?.type : entity;
-    const action = edit ? 'edit' : 'create';
+    const action = edit ? this.actionLabels.EDIT : this.actionLabels.CREATE;
     const initialState = {
       resource: entityName,
       action: action,
@@ -158,14 +161,18 @@ export class RgwMultisiteDetailsComponent implements OnDestroy, OnInit {
       multisiteInfo: this.multisiteInfo
     };
     if (entityName === 'realm') {
-      this.bsModalRef = this.cdsModalService.show(RgwMultisiteRealmFormComponent, initialState);
+      this.cdsModalService.show(RgwMultisiteRealmFormComponent, initialState);
     } else if (entityName === 'zonegroup') {
       this.bsModalRef = this.modalService.show(RgwMultisiteZonegroupFormComponent, initialState, {
         size: 'lg'
       });
     } else {
-      this.bsModalRef = this.modalService.show(RgwMultisiteZoneFormComponent, initialState, {
-        size: 'lg'
+      this.cdsModalService.show(RgwMultisiteZoneFormComponent, {
+        resource: entityName,
+        action: action,
+        info: entity,
+        defaultsInfo: this.defaultsInfo,
+        multisiteInfo: this.multisiteInfo
       });
     }
   }
@@ -187,9 +194,7 @@ export class RgwMultisiteDetailsComponent implements OnDestroy, OnInit {
     const initialState = {
       multisiteInfo: this.multisiteInfo
     };
-    this.bsModalRef = this.modalService.show(RgwMultisiteImportComponent, initialState, {
-      size: 'lg'
-    });
+    this.cdsModalService.show(RgwMultisiteImportComponent, initialState);
   }
 
   openExportModal() {
@@ -197,9 +202,7 @@ export class RgwMultisiteDetailsComponent implements OnDestroy, OnInit {
       defaultsInfo: this.defaultsInfo,
       multisiteInfo: this.multisiteInfo
     };
-    this.bsModalRef = this.modalService.show(RgwMultisiteExportComponent, initialState, {
-      size: 'lg'
-    });
+    this.cdsModalService.show(RgwMultisiteExportComponent, initialState);
   }
 
   getDisableExport() {
@@ -238,20 +241,37 @@ export class RgwMultisiteDetailsComponent implements OnDestroy, OnInit {
         permission: 'create',
         icon: Icons.add,
         name: this.actionLabels.CREATE + ' Realm',
-        click: () => this.openModal('realm')
+        click: () => this.openModal('realm'),
+        visible: () => !this.showMigrateAndReplicationActions
       },
       {
         permission: 'create',
         icon: Icons.add,
-        name: this.actionLabels.CREATE + ' Zone Group',
+        name: this.actionLabels.CREATE + ' Zonegroup',
         click: () => this.openModal('zonegroup'),
-        disable: () => this.getDisable()
+        disable: () => this.getDisable(),
+        visible: () => !this.showMigrateAndReplicationActions
       },
       {
         permission: 'create',
         icon: Icons.add,
         name: this.actionLabels.CREATE + ' Zone',
-        click: () => this.openModal('zone')
+        click: () => this.openModal('zone'),
+        visible: () => !this.showMigrateAndReplicationActions
+      },
+      {
+        permission: 'create',
+        icon: Icons.download,
+        name: this.actionLabels.IMPORT,
+        click: () => this.openImportModal(),
+        disable: () => this.getDisableImport()
+      },
+      {
+        permission: 'create',
+        icon: Icons.upload,
+        name: this.actionLabels.EXPORT,
+        click: () => this.openExportModal(),
+        disable: () => this.getDisableExport()
       }
     ];
     this.migrateTableAction = [
@@ -260,24 +280,6 @@ export class RgwMultisiteDetailsComponent implements OnDestroy, OnInit {
         icon: Icons.wrench,
         name: this.actionLabels.MIGRATE,
         click: () => this.openMigrateModal()
-      }
-    ];
-    this.importAction = [
-      {
-        permission: 'create',
-        icon: Icons.download,
-        name: this.actionLabels.IMPORT,
-        click: () => this.openImportModal(),
-        disable: () => this.getDisableImport()
-      }
-    ];
-    this.exportAction = [
-      {
-        permission: 'create',
-        icon: Icons.upload,
-        name: this.actionLabels.EXPORT,
-        click: () => this.openExportModal(),
-        disable: () => this.getDisableExport()
       }
     ];
     this.multisiteReplicationActions = [
@@ -290,11 +292,26 @@ export class RgwMultisiteDetailsComponent implements OnDestroy, OnInit {
       }
     ];
 
+    this.startPollingMultisiteInfo();
+    this.mgrModuleService.updateCompleted$.subscribe(() => {
+      this.startPollingMultisiteInfo();
+      this.getRgwModuleStatus();
+    });
+    // Only get the module status if you can read from configOpt
+    if (this.permissions.configOpt.read) this.getRgwModuleStatus();
+  }
+
+  startPollingMultisiteInfo(): void {
     const observables = [
       this.rgwRealmService.getAllRealmsInfo(),
       this.rgwZonegroupService.getAllZonegroupsInfo(),
       this.rgwZoneService.getAllZonesInfo()
     ];
+
+    if (this.sub) {
+      this.sub.unsubscribe();
+    }
+
     this.sub = this.timerService
       .get(() => forkJoin(observables), this.timerServiceVariable.TIMER_SERVICE_PERIOD * 2)
       .subscribe(
@@ -305,25 +322,16 @@ export class RgwMultisiteDetailsComponent implements OnDestroy, OnInit {
         },
         (_error) => {}
       );
-    this.mgrModuleService.list().subscribe((moduleData: any) => {
-      this.rgwModuleData = moduleData.filter((module: object) => module['name'] === 'rgw');
-      if (this.rgwModuleData.length > 0) {
-        this.rgwModuleStatus = this.rgwModuleData[0].enabled;
-      }
-    });
   }
-  /* setConfigValues() {
-    this.rgwDaemonService
-      .setMultisiteConfig(
-        this.defaultsInfo['defaultRealmName'],
-        this.defaultsInfo['defaultZonegroupName'],
-        this.defaultsInfo['defaultZoneName']
-      )
-      .subscribe(() => {});
-  }*/
 
   ngOnDestroy() {
     this.sub.unsubscribe();
+  }
+
+  private getRgwModuleStatus() {
+    this.rgwMultisiteService.getRgwModuleStatus().subscribe((status: boolean) => {
+      this.rgwModuleStatus = status;
+    });
   }
 
   private abstractTreeData(multisiteInfo: [object, object, object]): any[] {
@@ -581,7 +589,7 @@ export class RgwMultisiteDetailsComponent implements OnDestroy, OnInit {
 
   delete(node: Node) {
     if (node?.data?.type === 'realm') {
-      const modalRef = this.cdsModalService.show(CriticalConfirmationModalComponent, {
+      const modalRef = this.cdsModalService.show(DeleteConfirmationModalComponent, {
         itemDescription: $localize`${node?.data?.type} ${node?.data?.name}`,
         itemNames: [`${node?.data?.name}`],
         submitAction: () => {
@@ -600,55 +608,24 @@ export class RgwMultisiteDetailsComponent implements OnDestroy, OnInit {
         }
       });
     } else if (node?.data?.type === 'zonegroup') {
-      this.modalRef = this.modalService.show(RgwMultisiteZonegroupDeletionFormComponent, {
+      this.cdsModalService.show(RgwMultisiteZonegroupDeletionFormComponent, {
         zonegroup: node.data
       });
     } else if (node?.data?.type === 'zone') {
-      this.modalRef = this.modalService.show(RgwMultisiteZoneDeletionFormComponent, {
+      this.cdsModalService.show(RgwMultisiteZoneDeletionFormComponent, {
         zone: node.data
       });
     }
   }
 
   enableRgwModule() {
-    let $obs;
-    const fnWaitUntilReconnected = () => {
-      observableTimer(2000).subscribe(() => {
-        // Trigger an API request to check if the connection is
-        // re-established.
-        this.mgrModuleService.list().subscribe(
-          () => {
-            // Resume showing the notification toasties.
-            this.notificationService.suspendToasties(false);
-            // Unblock the whole UI.
-            this.blockUI.stop();
-            // Reload the data table content.
-            this.notificationService.show(NotificationType.success, $localize`Enabled RGW Module`);
-            this.router.navigateByUrl('/', { skipLocationChange: true }).then(() => {
-              this.router.navigate(['/rgw/multisite']);
-            });
-            // Reload the data table content.
-          },
-          () => {
-            fnWaitUntilReconnected();
-          }
-        );
-      });
-    };
-
-    if (!this.rgwModuleStatus) {
-      $obs = this.mgrModuleService.enable('rgw');
-    }
-    $obs.subscribe(
-      () => undefined,
-      () => {
-        // Suspend showing the notification toasties.
-        this.notificationService.suspendToasties(true);
-        // Block the whole UI to prevent user interactions until
-        // the connection to the backend is reestablished
-        this.blockUI.start($localize`Reconnecting, please wait ...`);
-        fnWaitUntilReconnected();
-      }
+    this.mgrModuleService.updateModuleState(
+      this.MODULE_NAME,
+      false,
+      null,
+      this.NAVIGATE_TO,
+      'Enabled RGW Module',
+      true
     );
   }
 }

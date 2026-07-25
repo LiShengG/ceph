@@ -1,5 +1,5 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
 
 #pragma once
 
@@ -35,7 +35,11 @@ int64_t HybridAllocatorBase<T>::allocate(
     max_alloc_size = p2align(uint64_t(cap), (uint64_t)T::get_block_size());
   }
 
+  auto lock_wait_start = mono_clock::now();
+
   std::lock_guard l(T::get_lock());
+
+  auto lock_acquired = mono_clock::now();
 
   // try bitmap first to avoid unneeded contiguous extents split if
   // desired amount is less than shortes range in AVL or Btree2
@@ -63,6 +67,12 @@ int64_t HybridAllocatorBase<T>::allocate(
       ceph_assert(orig_size == extents->size());
     }
   }
+  this->logger->tinc_with_max(
+      l_bluestore_allocator_alloc_process_lat,
+      mono_clock::now() - lock_acquired);
+  this->logger->tinc_with_max(
+      l_bluestore_allocator_lock_wait_lat,
+      lock_acquired - lock_wait_start);
   return res ? res : -ENOSPC;
 }
 
@@ -120,7 +130,7 @@ void HybridAllocatorBase<T>::_spillover_range(uint64_t start, uint64_t end)
     dout(1) << __func__
       << " constructing fallback allocator"
       << dendl;
-    bmap_alloc = new BitmapAllocator(T::get_context(),
+    bmap_alloc = std::make_unique<BitmapAllocator>(T::get_context(),
       T::get_capacity(),
       T::get_block_size(),
       T::get_name() + ".fallback");

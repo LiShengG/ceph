@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph - scalable distributed file system
  *
@@ -41,135 +42,113 @@ int main(int argc, char** argv)
 
   {
     ceph::async::io_context_pool p(1);
-    auto r = R::RADOS::make_with_cct(cct.get(), p,
-					 boost::asio::use_future).get();
+    auto r = R::RADOS::make_with_cct(cct, p, boost::asio::use_future).get();
     std::this_thread::sleep_for(30s);
   }
   std::this_thread::sleep_for(30s);
   {
     ceph::async::io_context_pool p(1);
-    auto r = R::RADOS::make_with_cct(cct.get(), p,
-					 boost::asio::use_future).get();
+    auto r = R::RADOS::make_with_cct(cct, p, boost::asio::use_future).get();
     std::this_thread::sleep_for(30s);
   }
   {
     ceph::async::io_context_pool p(1);
-    auto r = R::RADOS::make_with_cct(cct.get(), p,
-					 boost::asio::use_future).get();
+    auto r = R::RADOS::make_with_cct(cct, p, boost::asio::use_future).get();
     std::this_thread::sleep_for(1s);
   }
   {
     ceph::async::io_context_pool p(1);
-    auto r = R::RADOS::make_with_cct(cct.get(), p,
-					 boost::asio::use_future).get();
+    auto r = R::RADOS::make_with_cct(cct, p, boost::asio::use_future).get();
     std::this_thread::sleep_for(1s);
   }
   {
     ceph::async::io_context_pool p(1);
-    auto r = R::RADOS::make_with_cct(cct.get(), p,
-					 boost::asio::use_future).get();
+    auto r = R::RADOS::make_with_cct(cct, p, boost::asio::use_future).get();
     std::this_thread::sleep_for(1s);
   }
   {
     ceph::async::io_context_pool p(1);
-    auto r = R::RADOS::make_with_cct(cct.get(), p,
-					 boost::asio::use_future).get();
+    auto r = R::RADOS::make_with_cct(cct, p, boost::asio::use_future).get();
     std::this_thread::sleep_for(1s);
   }
   {
     ceph::async::io_context_pool p(1);
-    auto r = R::RADOS::make_with_cct(cct.get(), p,
-					 boost::asio::use_future).get();
+    auto r = R::RADOS::make_with_cct(cct, p, boost::asio::use_future).get();
     std::this_thread::sleep_for(1s);
   }
   {
     ceph::async::io_context_pool p(1);
-    auto r = R::RADOS::make_with_cct(cct.get(), p,
-					 boost::asio::use_future).get();
+    auto r = R::RADOS::make_with_cct(cct, p, boost::asio::use_future).get();
     std::this_thread::sleep_for(1s);
   }
   {
     ceph::async::io_context_pool p(1);
-    auto r = R::RADOS::make_with_cct(cct.get(), p,
-					 boost::asio::use_future).get();
+    auto r = R::RADOS::make_with_cct(cct, p, boost::asio::use_future).get();
     std::this_thread::sleep_for(1s);
   }
   {
     ceph::async::io_context_pool p(1);
-    auto r = R::RADOS::make_with_cct(cct.get(), p,
-					 boost::asio::use_future).get();
+    auto r = R::RADOS::make_with_cct(cct, p, boost::asio::use_future).get();
     std::this_thread::sleep_for(500ms);
   }
   {
     ceph::async::io_context_pool p(1);
-    auto r = R::RADOS::make_with_cct(cct.get(), p,
-					 boost::asio::use_future).get();
+    auto r = R::RADOS::make_with_cct(cct, p, boost::asio::use_future).get();
     std::this_thread::sleep_for(500ms);
   }
   {
     ceph::async::io_context_pool p(1);
-    auto r = R::RADOS::make_with_cct(cct.get(), p,
-					 boost::asio::use_future).get();
+    auto r = R::RADOS::make_with_cct(cct, p, boost::asio::use_future).get();
     std::this_thread::sleep_for(50ms);
   }
   {
     ceph::async::io_context_pool p(1);
-    auto r = R::RADOS::make_with_cct(cct.get(), p,
-					 boost::asio::use_future).get();
+    auto r = R::RADOS::make_with_cct(cct, p, boost::asio::use_future).get();
     std::this_thread::sleep_for(50ms);
   }
   {
     ceph::async::io_context_pool p(1);
-    auto r = R::RADOS::make_with_cct(cct.get(), p,
-					 boost::asio::use_future).get();
+    auto r = R::RADOS::make_with_cct(cct, p, boost::asio::use_future).get();
     std::this_thread::sleep_for(50ms);
   }
   {
     ceph::async::io_context_pool p(1);
-    auto r = R::RADOS::make_with_cct(cct.get(), p,
-					 boost::asio::use_future).get();
+    auto r = R::RADOS::make_with_cct(cct, p, boost::asio::use_future).get();
     std::this_thread::sleep_for(5ms);
   }
   {
     ceph::async::io_context_pool p(1);
-    auto r = R::RADOS::make_with_cct(cct.get(), p,
-					 boost::asio::use_future).get();
+    auto r = R::RADOS::make_with_cct(cct, p, boost::asio::use_future).get();
     std::this_thread::sleep_for(5ms);
   }
   {
     ceph::async::io_context_pool p(1);
-    auto r = R::RADOS::make_with_cct(cct.get(), p,
-					 boost::asio::use_future).get();
+    auto r = R::RADOS::make_with_cct(cct, p, boost::asio::use_future).get();
     std::this_thread::sleep_for(5ms);
   }
   {
     ceph::async::io_context_pool p(1);
-    auto r = R::RADOS::make_with_cct(cct.get(), p,
-					 boost::asio::use_future).get();
+    auto r = R::RADOS::make_with_cct(cct, p, boost::asio::use_future).get();
     std::this_thread::sleep_for(5ms);
   }
   {
     ceph::async::io_context_pool p(1);
-    auto r = R::RADOS::make_with_cct(cct.get(), p,
-					 boost::asio::use_future).get();
+    auto r = R::RADOS::make_with_cct(cct, p, boost::asio::use_future).get();
     std::this_thread::sleep_for(5ms);
   }
   {
     ceph::async::io_context_pool p(1);
-    auto r = R::RADOS::make_with_cct(cct.get(), p,
-					 boost::asio::use_future).get();
+    auto r = R::RADOS::make_with_cct(cct, p, boost::asio::use_future).get();
     std::this_thread::sleep_for(5us);
   }
   {
     ceph::async::io_context_pool p(1);
-    auto r = R::RADOS::make_with_cct(cct.get(), p,
-					 boost::asio::use_future).get();
+    auto r = R::RADOS::make_with_cct(cct, p, boost::asio::use_future).get();
     std::this_thread::sleep_for(5us);
   }
   {
     ceph::async::io_context_pool p(1);
-    auto r = R::RADOS::make_with_cct(cct.get(), p,
-					 boost::asio::use_future).get();
+    auto r = R::RADOS::make_with_cct(cct, p, boost::asio::use_future).get();
     std::this_thread::sleep_for(5us);
   }
   return 0;

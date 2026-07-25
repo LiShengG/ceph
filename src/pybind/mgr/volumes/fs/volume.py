@@ -10,6 +10,7 @@ from urllib.parse import urlsplit, urlunsplit
 import cephfs
 
 from ceph.fs.earmarking import CephFSVolumeEarmarking, EarmarkException
+from ceph.fs.enctag import CephFSVolumeEncryptionTag, EncryptionTagException
 
 from mgr_util import CephfsClient
 
@@ -22,7 +23,7 @@ from .operations.volume import create_volume, delete_volume, rename_volume, \
     list_volumes, open_volume, get_pool_names, get_pool_ids, \
     get_pending_subvol_deletions_count, get_all_pending_clones_count
 from .operations.subvolume import open_subvol, create_subvol, remove_subvol, \
-    create_clone, open_subvol_in_group
+    create_clone, open_subvol_in_group, open_subvol_in_vol
 
 from .vol_spec import VolSpec
 from .exception import VolumeException, ClusterError, ClusterTimeout, \
@@ -120,8 +121,8 @@ class VolumeClient(CephfsClient["Module"]):
 
     ### volume operations -- create, rm, ls
 
-    def create_fs_volume(self, volname, placement):
-        return create_volume(self.mgr, volname, placement)
+    def create_fs_volume(self, volname, placement, data_pool, meta_pool):
+        return create_volume(self.mgr, volname, placement, data_pool, meta_pool)
 
     def delete_fs_volume(self, volname, confirm):
         if confirm != "--yes-i-really-mean-it":
@@ -232,12 +233,15 @@ class VolumeClient(CephfsClient["Module"]):
         mode       = kwargs['mode']
         isolate_nspace = kwargs['namespace_isolated']
         earmark    = kwargs['earmark'] or ''  # if not set, default to empty string --> no earmark
+        normalization = kwargs['normalization']
+        casesensitive = kwargs['casesensitive']
+        enctag = kwargs['enctag'] or '' # if not set, default to empty string
 
         oct_mode = octal_str_to_decimal_int(mode)
 
         try:
             create_subvol(
-                self.mgr, fs_handle, self.volspec, group, subvolname, size, isolate_nspace, pool, oct_mode, uid, gid, earmark)
+                self.mgr, fs_handle, self.volspec, group, subvolname, size, isolate_nspace, pool, oct_mode, uid, gid, earmark, normalization, casesensitive, enctag)
         except VolumeException as ve:
             # kick the purge threads for async removal -- note that this
             # assumes that the subvolume is moved to trashcan for cleanup on error.
@@ -256,6 +260,9 @@ class VolumeClient(CephfsClient["Module"]):
         mode       = kwargs['mode']
         isolate_nspace = kwargs['namespace_isolated']
         earmark    = kwargs['earmark'] or ''  # if not set, default to empty string --> no earmark
+        normalization = kwargs['normalization']
+        casesensitive = kwargs['casesensitive']
+        enctag    = kwargs['enctag'] or ''  # if not set, default to empty string --> no encryption tag
 
         try:
             with open_volume(self, volname) as fs_handle:
@@ -270,7 +277,10 @@ class VolumeClient(CephfsClient["Module"]):
                                 'data_pool': pool,
                                 'pool_namespace': subvolume.namespace if isolate_nspace else None,
                                 'quota': size,
-                                'earmark': earmark
+                                'earmark': earmark,
+                                'normalization': normalization,
+                                'casesensitive': casesensitive,
+                                'enctag': enctag,
                             }
                             subvolume.set_attrs(subvolume.path, attrs)
                     except VolumeException as ve:
@@ -419,6 +429,58 @@ class VolumeClient(CephfsClient["Module"]):
                     with open_subvol(self.mgr, fs_handle, self.volspec, group, subvolname, SubvolumeOpType.PIN) as subvolume:
                         subvolume.pin(pin_type, pin_setting)
                         ret = 0, json.dumps({}), ""
+        except VolumeException as ve:
+            ret = self.volume_exception_to_retval(ve)
+        return ret
+
+    def subvolume_charmap_set(self, **kwargs):
+        ret         = 0, "", ""
+        volname     = kwargs['vol_name']
+        subvolname  = kwargs['sub_name']
+        setting     = kwargs['setting']
+        value       = kwargs['value']
+        groupname   = kwargs['group_name']
+
+        try:
+            with open_volume(self, volname) as fs_handle:
+                with open_group(fs_handle, self.volspec, groupname) as group:
+                    with open_subvol(self.mgr, fs_handle, self.volspec, group, subvolname, SubvolumeOpType.CHARMAP) as subvolume:
+                        v = subvolume.charmap_set(setting, value)
+                        ret = 0, v, ""
+        except VolumeException as ve:
+            ret = self.volume_exception_to_retval(ve)
+        return ret
+
+    def subvolume_charmap_rm(self, **kwargs):
+        ret         = 0, "", ""
+        volname     = kwargs['vol_name']
+        subvolname  = kwargs['sub_name']
+        groupname   = kwargs['group_name']
+
+        try:
+            with open_volume(self, volname) as fs_handle:
+                with open_group(fs_handle, self.volspec, groupname) as group:
+                    with open_subvol(self.mgr, fs_handle, self.volspec, group, subvolname, SubvolumeOpType.CHARMAP) as subvolume:
+                        subvolume.charmap_rm()
+                        ret = 0, json.dumps({}), ""
+        except VolumeException as ve:
+            ret = self.volume_exception_to_retval(ve)
+        return ret
+
+
+    def subvolume_charmap_get(self, **kwargs):
+        ret         = 0, "", ""
+        volname     = kwargs['vol_name']
+        subvolname  = kwargs['sub_name']
+        setting     = kwargs['setting']
+        groupname   = kwargs['group_name']
+
+        try:
+            with open_volume(self, volname) as fs_handle:
+                with open_group(fs_handle, self.volspec, groupname) as group:
+                    with open_subvol(self.mgr, fs_handle, self.volspec, group, subvolname, SubvolumeOpType.CHARMAP) as subvolume:
+                        v = subvolume.charmap_get(setting)
+                        ret = 0, v, ""
         except VolumeException as ve:
             ret = self.volume_exception_to_retval(ve)
         return ret
@@ -674,6 +736,68 @@ class VolumeClient(CephfsClient["Module"]):
             ret = ee.to_tuple()  # type: ignore
         return ret
 
+    def get_enctag(self, **kwargs) -> Tuple[int, Optional[str], str]:
+        ret: Tuple[int, Optional[str], str] = 0, "", ""
+        volname    = kwargs['vol_name']
+        subvolname = kwargs['sub_name']
+        groupname  = kwargs['group_name']
+
+        try:
+            with open_volume(self, volname) as fs_handle:
+                with open_group(fs_handle, self.volspec, groupname) as group:
+                    with open_subvol(self.mgr, fs_handle, self.volspec, group, subvolname, SubvolumeOpType.ENCTAG_GET) as subvolume:
+                        log.info("Getting enctag for subvolume %s", subvolume.path)
+                        fs_enctag = CephFSVolumeEncryptionTag(fs_handle, subvolume.path)
+                        enctag = fs_enctag.get_tag()
+                        ret = 0, enctag, ""
+        except VolumeException as ve:
+            ret = self.volume_exception_to_retval(ve)
+        except EncryptionTagException as ee:
+            log.error(f"EncryptionTag error occurred: {ee}")
+            ret = ee.to_tuple()
+        return ret
+
+    def set_enctag(self, **kwargs):  # type: ignore
+        ret       = 0, "", ""
+        volname   = kwargs['vol_name']
+        subvolname = kwargs['sub_name']
+        groupname = kwargs['group_name']
+        enctag   = kwargs['enctag']
+
+        try:
+            with open_volume(self, volname) as fs_handle:
+                with open_group(fs_handle, self.volspec, groupname) as group:
+                    with open_subvol(self.mgr, fs_handle, self.volspec, group, subvolname, SubvolumeOpType.ENCTAG_SET) as subvolume:
+                        log.info("Setting enctag %s for subvolume %s", enctag, subvolume.path)
+                        fs_enctag = CephFSVolumeEncryptionTag(fs_handle, subvolume.path)
+                        fs_enctag.set_tag(enctag)
+        except VolumeException as ve:
+            ret = self.volume_exception_to_retval(ve)
+        except EncryptionTagException as ee:
+            log.error(f"EncryptionTag error occurred: {ee}")
+            ret = ee.to_tuple()  # type: ignore
+        return ret
+
+    def clear_enctag(self, **kwargs):  # type: ignore
+        ret       = 0, "", ""
+        volname   = kwargs['vol_name']
+        subvolname = kwargs['sub_name']
+        groupname = kwargs['group_name']
+
+        try:
+            with open_volume(self, volname) as fs_handle:
+                with open_group(fs_handle, self.volspec, groupname) as group:
+                    with open_subvol(self.mgr, fs_handle, self.volspec, group, subvolname, SubvolumeOpType.ENCTAG_CLEAR) as subvolume:
+                        log.info("Removing enctag for subvolume %s", subvolume.path)
+                        fs_enctag = CephFSVolumeEncryptionTag(fs_handle, subvolume.path)
+                        fs_enctag.clear_tag()
+        except VolumeException as ve:
+            ret = self.volume_exception_to_retval(ve)
+        except EncryptionTagException as ee:
+            log.error(f"EncryptionTag error occurred: {ee}")
+            ret = ee.to_tuple()  # type: ignore
+        return ret
+
     ### subvolume snapshot
 
     def create_subvolume_snapshot(self, **kwargs):
@@ -703,7 +827,8 @@ class VolumeClient(CephfsClient["Module"]):
         try:
             with open_volume(self, volname) as fs_handle:
                 with open_group(fs_handle, self.volspec, groupname) as group:
-                    with open_subvol(self.mgr, fs_handle, self.volspec, group, subvolname, SubvolumeOpType.SNAP_REMOVE) as subvolume:
+                    op = SubvolumeOpType.SNAP_REMOVE_FORCE if force else SubvolumeOpType.SNAP_REMOVE
+                    with open_subvol(self.mgr, fs_handle, self.volspec, group, subvolname, op) as subvolume:
                         subvolume.remove_snapshot(snapname, force)
         except VolumeException as ve:
             # ESTALE serves as an error to state that subvolume is currently stale due to internal removal and,
@@ -729,6 +854,23 @@ class VolumeClient(CephfsClient["Module"]):
                         ret = 0, json.dumps(snap_info_dict, indent=4, sort_keys=True), ""
         except VolumeException as ve:
                 ret = self.volume_exception_to_retval(ve)
+        return ret
+
+    def subvolume_snapshot_getpath(self, **kwargs):
+        ret        = 0, "", ""
+        volname    = kwargs['vol_name']
+        subvolname = kwargs['sub_name']
+        snapname   = kwargs['snap_name']
+        groupname  = kwargs['group_name']
+
+        try:
+            with open_subvol_in_vol(self, self.volspec, volname, groupname, subvolname,
+                                    SubvolumeOpType.SNAP_GETPATH) \
+                                    as (vol, group, subvol):
+                snap_path = subvol.snapshot_data_path(snapname)
+                ret = 0, snap_path.decode("utf-8"), ""
+        except VolumeException as ve:
+            ret = self.volume_exception_to_retval(ve)
         return ret
 
     def set_subvolume_snapshot_metadata(self, **kwargs):
@@ -960,7 +1102,8 @@ class VolumeClient(CephfsClient["Module"]):
             return None
 
         stats = get_stats(src_path, dst_path, vol_handle)
-        stats['percentage cloned'] = str(stats['percentage cloned']) + '%'
+        if stats:
+            stats['percentage cloned'] = str(stats['percentage cloned']) + '%'
         return stats
 
     def _get_clone_status(self, vol_handle, group, subvol):
@@ -1011,6 +1154,8 @@ class VolumeClient(CephfsClient["Module"]):
         uid       = kwargs['uid']
         gid       = kwargs['gid']
         mode      = kwargs['mode']
+        normalization = kwargs['normalization']
+        casesensitive = kwargs['casesensitive']
 
         try:
             with open_volume(self, volname) as fs_handle:
@@ -1022,13 +1167,15 @@ class VolumeClient(CephfsClient["Module"]):
                             'gid': gid,
                             'mode': octal_str_to_decimal_int(mode),
                             'data_pool': pool,
-                            'quota': size
+                            'quota': size,
+                            'normalization': normalization,
+                            'casesensitive': casesensitive,
                         }
                         set_group_attrs(fs_handle, group.path, attrs)
                 except VolumeException as ve:
                     if ve.errno == -errno.ENOENT:
                         oct_mode = octal_str_to_decimal_int(mode)
-                        create_group(fs_handle, self.volspec, groupname, size, pool, oct_mode, uid, gid)
+                        create_group(fs_handle, self.volspec, groupname, size, pool, oct_mode, uid, gid, normalization, casesensitive)
                     else:
                         raise
         except VolumeException as ve:
@@ -1131,6 +1278,51 @@ class VolumeClient(CephfsClient["Module"]):
             ret = self.volume_exception_to_retval(ve)
         return ret
 
+    def subvolume_group_charmap_set(self, **kwargs):
+        ret           = 0, "", ""
+        volname       = kwargs['vol_name']
+        groupname     = kwargs['group_name']
+        setting       = kwargs['setting']
+        value         = kwargs['value']
+
+        try:
+            with open_volume(self, volname) as fs_handle:
+                with open_group(fs_handle, self.volspec, groupname) as group:
+                    v = group.charmap_set(setting, value)
+                    ret = 0, v, ""
+        except VolumeException as ve:
+            ret = self.volume_exception_to_retval(ve)
+        return ret
+
+    def subvolume_group_charmap_rm(self, **kwargs):
+        ret           = 0, "", ""
+        volname       = kwargs['vol_name']
+        groupname     = kwargs['group_name']
+
+        try:
+            with open_volume(self, volname) as fs_handle:
+                with open_group(fs_handle, self.volspec, groupname) as group:
+                    group.charmap_rm()
+                    ret = 0, json.dumps({}), ""
+        except VolumeException as ve:
+            ret = self.volume_exception_to_retval(ve)
+        return ret
+
+    def subvolume_group_charmap_get(self, **kwargs):
+        ret           = 0, "", ""
+        volname       = kwargs['vol_name']
+        groupname     = kwargs['group_name']
+        setting       = kwargs['setting']
+
+        try:
+            with open_volume(self, volname) as fs_handle:
+                with open_group(fs_handle, self.volspec, groupname) as group:
+                    v = group.charmap_get(setting)
+                    ret = 0, v, ""
+        except VolumeException as ve:
+            ret = self.volume_exception_to_retval(ve)
+        return ret
+
     def subvolume_group_exists(self, **kwargs):
         volname = kwargs['vol_name']
         ret = 0, "", ""
@@ -1197,6 +1389,41 @@ class VolumeClient(CephfsClient["Module"]):
                 with open_group(fs_handle, self.volspec, groupname) as group:
                     snapshots = group.list_snapshots()
                     ret = 0, name_to_json(snapshots), ""
+        except VolumeException as ve:
+            ret = self.volume_exception_to_retval(ve)
+        return ret
+
+    def subvolume_snapshot_visibility_set(self, **kwargs):
+        ret = 0, "", ""
+        volname = kwargs['vol_name']
+        subvolname = kwargs['sub_name']
+        groupname = kwargs['group_name']
+        value = kwargs['value']
+
+        try:
+            with open_volume(self, volname) as fs_handle:
+                with open_group(fs_handle, self.volspec, groupname) as group:
+                    with open_subvol(self.mgr, fs_handle, self.volspec, group, subvolname,
+                                     SubvolumeOpType.SNAPSHOT_VISIBILITY) as subvolume:
+                        v = subvolume.snapshot_visibility_set(value)
+                        ret = 0, v, ""
+        except VolumeException as ve:
+            ret = self.volume_exception_to_retval(ve)
+        return ret
+
+    def subvolume_snapshot_visibility_get(self, **kwargs):
+        ret = 0, "", ""
+        volname = kwargs['vol_name']
+        subvolname = kwargs['sub_name']
+        groupname = kwargs['group_name']
+
+        try:
+            with open_volume(self, volname) as fs_handle:
+                with open_group(fs_handle, self.volspec, groupname) as group:
+                    with open_subvol(self.mgr, fs_handle, self.volspec, group, subvolname,
+                                     SubvolumeOpType.SNAPSHOT_VISIBILITY) as subvolume:
+                        v = subvolume.snapshot_visibility_get()
+                        ret = 0, v, ""
         except VolumeException as ve:
             ret = self.volume_exception_to_retval(ve)
         return ret

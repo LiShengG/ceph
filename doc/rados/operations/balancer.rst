@@ -39,6 +39,22 @@ combines the upmap balancer with the read balancer so that both writes
 and reads are optimized. ``read`` mode can be used when only read optimization
 is desired. For more details, see :ref:`read_balancer`.
 
+Limitation: count-based balancing vs. size-based balancing
+----------------------------------------------------------
+
+Ceph's built-in balancer optimizes only by **PG shard count**, not by the
+actual size of the data stored in each PG.
+
+This can result in clusters whose OSDs are balanced by PG shard count,
+but very imbalanced by stored Bytes.
+At the pool level, this can cause a pool's ``%USED`` (from ``ceph df``)
+to be much higher than the cluster's ``%RAW USED``, because the
+pool's fullest OSD (which determines the pool's available space) may be
+disproportionately loaded with large PGs.
+
+Size-aware community balancers exist (for example,
+`jj-balancer <https://github.com/TheJJ/ceph-balancer>`_).
+
 Throttling
 ----------
 
@@ -46,14 +62,59 @@ If the cluster is degraded (that is, if an OSD has failed and the system hasn't
 healed itself yet), then the balancer will not make any adjustments to the PG
 distribution.
 
-When the cluster is healthy, the balancer will incrementally move a small
-fraction of unbalanced PGs in order to improve distribution.  This fraction
-will not exceed a certain threshold that defaults to 5%. To adjust this
-``target_max_misplaced_ratio`` threshold setting, run the following command:
+When the cluster is healthy, the balancer will remap
+unbalanced PGs in phases to incrementally improve the uniformity
+of PG distribution.  The maximum percentage of PGs to remap (move) in
+a single phase defaults to 5%. To adjust this
+``target_max_misplaced_ratio`` threshold setting, run a command
+of the following form:
 
    .. prompt:: bash $
 
-      ceph config set mgr target_max_misplaced_ratio .07   # 7%
+      ceph config set mgr target_max_misplaced_ratio .03   # 3%
+
+A larger value may increase the speed of cluster balancing/convergence
+at the potential cost of greater impact on client operations.
+
+There is a separate setting ``upmap_max_deviation`` for how uniform the
+distribution of PGs must be for the module to consider the cluster adequately
+balanced.  At the time of writing (June 2025), this value defaults to ``5``,
+which means that if a given OSD's PG shard count deviates by five or fewer
+from its weight-proportional target, it will be considered sufficiently
+balanced.
+
+More precisely, the balancer computes a per-OSD target shard count as::
+
+   target = osd_weight * (total_shards / total_weight)
+
+where ``osd_weight`` is the OSD's CRUSH weight times its reweight
+(the ``REWEIGHT`` value from ``ceph osd df``), ``total_shards`` is
+``pool_size * pg_num`` summed over all balanced pools,
+and ``total_weight`` is the sum of those per-OSD weights.
+The deviation is then ``actual_shard_count - target``.
+If no OSD's absolute deviation exceeds
+``upmap_max_deviation``, the balancer considers the distribution
+sufficiently balanced and makes no changes.
+
+This value of PG replicas/shards (as distinct from logical PGs) is reported
+by the ``ceph osd df`` command under the ``PGS`` column and the variance
+above or below the average under the ``VAR`` column.  It may seem desirable
+to specify a perfect or nearly perfect distribution by setting a very low
+value, but in practice this is not advised, especially when a cluster or
+individual pools have fewer PGs configured than is ideal.  An excessively
+low value for this setting may result in the balancer shuffling data
+forever as it endeavors to meet an impossible expectation.
+
+That said, clusters with multiple CRUSH device classes and/or OSDs that
+differ in capacity will benefit from a smaller value.  In this situation
+run a command of the following form:
+
+  .. prompt:: bash $
+
+     ceph config set mgr mgr/balancer/upmap_max_deviation 1
+
+This value is reasonable and safe for most clusters.  Note that this is
+an absolute integer number of PGs, not a percentage.
 
 The balancer sleeps between runs. To set the number of seconds for this
 interval of sleep, run the following command:
@@ -144,8 +205,8 @@ There are four supported balancer modes:
    placement calculation. These ``pg-upmap-primary`` entries provide fine-grained
    control over primary PG mappings. This mode optimizes the placement of individual
    primary PGs in order to achieve balanced reads, or primary PGs, in a cluster.
-   In ``read`` mode, upmap behavior is not excercised, so this mode is best for
-   uses cases in which only read balancing is desired.
+   In ``read`` mode, upmap behavior is not exercised, so this mode is best for
+   use cases in which only read balancing is desired.
 
    To use ``pg-upmap-primary``, all clients must be Reef or newer. For more
    details about client compatibility, see :ref:`read_balancer`.

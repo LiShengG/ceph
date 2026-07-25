@@ -15,7 +15,7 @@ import { of } from 'rxjs';
 import { RbdService } from '~/app/shared/api/rbd.service';
 import { CdHelperClass } from '~/app/shared/classes/cd-helper.class';
 import { ConfirmationModalComponent } from '~/app/shared/components/confirmation-modal/confirmation-modal.component';
-import { CriticalConfirmationModalComponent } from '~/app/shared/components/critical-confirmation-modal/critical-confirmation-modal.component';
+import { DeleteConfirmationModalComponent } from '~/app/shared/components/delete-confirmation-modal/delete-confirmation-modal.component';
 import { ActionLabelsI18n } from '~/app/shared/constants/app.constants';
 import { CellTemplate } from '~/app/shared/enum/cell-template.enum';
 import { CdTableAction } from '~/app/shared/models/cd-table-action';
@@ -37,13 +37,15 @@ import { RbdSnapshotFormModalComponent } from '../rbd-snapshot-form/rbd-snapshot
 import { RbdSnapshotActionsModel } from './rbd-snapshot-actions.model';
 import { RbdSnapshotModel } from './rbd-snapshot.model';
 import { ModalCdsService } from '~/app/shared/services/modal-cds.service';
+import { DeletionImpact } from '~/app/shared/enum/delete-confirmation-modal-impact.enum';
 
 @Component({
   selector: 'cd-rbd-snapshot-list',
   templateUrl: './rbd-snapshot-list.component.html',
   styleUrls: ['./rbd-snapshot-list.component.scss'],
   providers: [TaskListService],
-  changeDetection: ChangeDetectionStrategy.OnPush
+  changeDetection: ChangeDetectionStrategy.OnPush,
+  standalone: false
 })
 export class RbdSnapshotListComponent implements OnInit, OnChanges {
   @Input()
@@ -127,11 +129,11 @@ export class RbdSnapshotListComponent implements OnInit, OnChanges {
         name: $localize`State`,
         prop: 'is_protected',
         flexGrow: 1,
-        cellTransformation: CellTemplate.badge,
+        cellTransformation: CellTemplate.tag,
         customTemplateConfig: {
           map: {
-            true: { value: $localize`PROTECTED`, class: 'badge-success' },
-            false: { value: $localize`UNPROTECTED`, class: 'badge-info' }
+            true: { value: $localize`PROTECTED`, class: 'tag-success' },
+            false: { value: $localize`UNPROTECTED`, class: 'tag-info' }
           }
         }
       },
@@ -324,7 +326,8 @@ export class RbdSnapshotListComponent implements OnInit, OnChanges {
 
   deleteSnapshotModal() {
     const snapshotName = this.selection.selected[0].name;
-    this.modalRef = this.cdsModalService.show(CriticalConfirmationModalComponent, {
+    this.modalRef = this.cdsModalService.show(DeleteConfirmationModalComponent, {
+      impact: DeletionImpact.high,
       itemDescription: $localize`RBD snapshot`,
       itemNames: [snapshotName],
       submitAction: () => this._asyncTask('deleteSnapshot', 'rbd/snap/delete', snapshotName)

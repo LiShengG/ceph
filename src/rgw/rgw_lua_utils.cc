@@ -1,4 +1,6 @@
+#include <charconv> // for std::to_chars()
 #include <string>
+#include <variant>
 #include <lua.hpp>
 #include "common/ceph_context.h"
 #include "common/debug.h"
@@ -93,38 +95,33 @@ void open_standard_libs(lua_State* L) {
 
 // allocator function that verifies against maximum allowed memory value
 void* allocator(void* ud, void* ptr, std::size_t osize, std::size_t nsize) {
-  auto mem = reinterpret_cast<std::size_t*>(ud); // remaining memory
+  auto guard = reinterpret_cast<lua_state_guard*>(ud);
+  auto mem_in_use = guard->get_mem_in_use();
+
   // free memory
   if (nsize == 0) {
-    if (mem && ptr) {
-      *mem += osize;
+    if (ptr) {
+      guard->set_mem_in_use(mem_in_use - osize);
     }
     free(ptr);
     return nullptr;
   }
   // re/alloc memory
-  if (mem) {
-    const std::size_t realloc_size = ptr ? osize : 0;
-    if (nsize > realloc_size && (nsize - realloc_size) > *mem) {
-      return nullptr;
-    }
-    *mem += realloc_size;
-    *mem -= nsize;
+  const std::size_t new_total = mem_in_use - (ptr ? osize : 0) + nsize;
+  if (guard->get_max_memory() > 0 && new_total > guard->get_max_memory()) {
+    return nullptr;
   }
+  guard->set_mem_in_use(new_total);
   return realloc(ptr, nsize);
 }
 
-// create new lua state together with its memory counter
-lua_State* newstate(int max_memory) {
-  std::size_t* remaining_memory = nullptr;
-  if (max_memory > 0) {
-    remaining_memory = new std::size_t(max_memory);
-  }
-  lua_State* L = lua_newstate(allocator, remaining_memory);
-  if (!L) {
-    delete remaining_memory;
-    remaining_memory = nullptr;
-  }
+// create new lua state together with reference to the guard
+lua_State* newstate(lua_state_guard* guard) {
+#if LUA_VERSION_NUM >= 505
+  lua_State* L = lua_newstate(allocator, guard, 0);
+#else
+  lua_State* L = lua_newstate(allocator, guard);
+#endif
   if (L) {
     lua_atpanic(L, [](lua_State* L) -> int {
       const char* msg = lua_tostring(L, -1);
@@ -136,12 +133,22 @@ lua_State* newstate(int max_memory) {
 }
 
 // lua_state_guard ctor
-lua_state_guard::lua_state_guard(std::size_t  _max_memory, const DoutPrefixProvider* _dpp) :
-  max_memory(_max_memory),
-  dpp(_dpp),
-  state(newstate(_max_memory)) {
-  if (state &&  perfcounter) {
-    perfcounter->inc(l_rgw_lua_current_vms, 1);
+lua_state_guard::lua_state_guard(std::size_t _max_memory,
+                                 std::uint64_t _max_runtime,
+                                 const DoutPrefixProvider* _dpp)
+    : max_memory(_max_memory),
+      mem_in_use(0),
+      max_runtime(std::chrono::milliseconds(_max_runtime)),
+      start_time(ceph::real_clock::now()),
+      dpp(_dpp),
+      state(newstate(this)) {
+  if (state) {
+    if (max_runtime.count() > 0) {
+      set_runtime_hook();
+    }
+    if (perfcounter) {
+      perfcounter->inc(l_rgw_lua_current_vms, 1);
+    }
   }
 }
 
@@ -151,30 +158,109 @@ lua_state_guard::~lua_state_guard() {
   if (!L) {
     return;
   }
-  void* ud = nullptr;
-  lua_getallocf(L, &ud);
-  auto remaining_memory = static_cast<std::size_t*>(ud);
-
-  if (remaining_memory) {
-    const auto used_memory = max_memory - *remaining_memory;
-    ldpp_dout(dpp, 20) << "Lua is using: " << used_memory << 
-      " bytes (" << 100.0*used_memory/max_memory << "%)" << dendl;
-    // dont limit memory during cleanup
-    *remaining_memory = 0;
+  int temp_max_memory = max_memory;
+  if (mem_in_use > 0) {
+    ldpp_dout(dpp, 20) << "Lua is using: " << mem_in_use << " bytes ("
+                       << std::to_string(100.0 -
+                                         (100.0 * mem_in_use / max_memory))
+                       << "%)" << dendl;
   }
+  // dont limit memory during cleanup
+  max_memory = 0;
+  // clear any runtime hooks
+  lua_sethook(L, nullptr, 0, 0);
   try {
     lua_close(L);
   } catch (const std::runtime_error& e) {
     ldpp_dout(dpp, 20) << "Lua cleanup failed with: " << e.what() << dendl;
   }
 
-  // TODO: use max_memory and remaining memory to check for leaks
-  // this could be done only if we don't zero the remianing memory during clanup
+  // Check for memory leaks
+  if (temp_max_memory > 0 && mem_in_use > 0) {
+    ldpp_dout(dpp, 1) << "ERROR: Lua memory leak detected: " << mem_in_use
+                      << " bytes still in use" << dendl;
+  }
 
-  delete remaining_memory;
   if (perfcounter) {
     perfcounter->dec(l_rgw_lua_current_vms, 1);
   }
+}
+
+void lua_state_guard::set_mem_in_use(std::size_t _mem_in_use) {
+  mem_in_use = _mem_in_use;
+}
+
+void lua_state_guard::runtime_hook(lua_State* L, lua_Debug* ar) {
+  auto now = ceph::real_clock::now();
+  lua_getfield(L, LUA_REGISTRYINDEX, max_runtime_key);
+  auto max_runtime =
+      *static_cast<std::chrono::milliseconds*>(lua_touserdata(L, -1));
+  lua_getfield(L, LUA_REGISTRYINDEX, start_time_key);
+  auto start_time =
+      *static_cast<ceph::real_clock::time_point*>(lua_touserdata(L, -1));
+  lua_pop(L, 2);
+  auto elapsed =
+      std::chrono::duration_cast<std::chrono::milliseconds>(now - start_time);
+
+  if (elapsed > max_runtime) {
+    // +1 for max digit, +1 for null terminator
+    constexpr size_t max_digits = std::numeric_limits<decltype(elapsed)::rep>::digits10 + 2;
+    char elapsed_str[max_digits] = {};
+    auto [ptr, ec] = std::to_chars(std::begin(elapsed_str), std::end(elapsed_str), elapsed.count());
+    // buffer too small, should never happen though
+    assert(ec == std::errc{});
+    *ptr = '\0';
+    // luaL_error() never returns, so we have to format the number in the hard way instead of
+    // using std::to_string or fmt::to_string
+    luaL_error(L, "Lua runtime limit exceeded: total elapsed time is %s ms", elapsed_str);
+  }
+}
+
+void lua_state_guard::set_runtime_hook() {
+  lua_pushlightuserdata(state,
+                        const_cast<std::chrono::milliseconds*>(&max_runtime));
+  lua_setfield(state, LUA_REGISTRYINDEX, max_runtime_key);
+  lua_pushlightuserdata(state,
+                        const_cast<ceph::real_clock::time_point*>(&start_time));
+  lua_setfield(state, LUA_REGISTRYINDEX, start_time_key);
+
+  // Check runtime after each line or every 1000 VM instructions
+  lua_sethook(state, runtime_hook, LUA_MASKLINE | LUA_MASKCOUNT, 1000);
+}
+
+// helper type for the visitor
+template<class... Ts>
+struct overloads : Ts... { using Ts::operator()...; };
+template<class... Ts> overloads(Ts...) -> overloads<Ts...>;
+
+int lua_execute(lua_State* L, const DoutPrefixProvider* dpp, const LuaCodeType& code) {
+  // execute the lua script or bytecode
+  return std::visit(overloads {
+        [L, dpp](const std::string& script) -> int {
+          if (luaL_dostring(L, script.c_str()) != LUA_OK) {
+            const std::string err(lua_tostring(L, -1));
+            ldpp_dout(dpp, 1) << "Lua ERROR: failed to execute script : " << err << dendl;
+            lua_pop(L, 1);
+            return -1;
+          }
+          return 0;
+        },
+        [L, dpp](const std::vector<char>& bytecode) -> int  {
+          if (luaL_loadbuffer(L, bytecode.data(), bytecode.size(), "bytecode_chunk") != LUA_OK) {
+            const std::string err(lua_tostring(L, -1));
+            ldpp_dout(dpp, 1) << "Lua ERROR: failed to load buffer for bytecode : " << err << dendl;
+            lua_pop(L, 1);
+            return -1;
+          }
+          if (lua_pcall(L, 0, 0, 0) != LUA_OK) {
+            const std::string err(lua_tostring(L, -1));
+            ldpp_dout(dpp, 1) << "Lua ERROR: failed to execute bytecode : " << err << dendl;
+            lua_pop(L, 1);
+            return -1;
+          }
+          return 0;
+      }
+    }, code);
 }
 
 } // namespace rgw::lua

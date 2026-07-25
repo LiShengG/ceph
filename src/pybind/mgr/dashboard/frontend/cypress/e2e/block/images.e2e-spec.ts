@@ -12,13 +12,14 @@ describe('Images page', () => {
     // Need pool for image testing
     pools.navigateTo('create');
     pools.create(poolName, 8, ['rbd']);
+    pools.navigateTo();
     pools.existTableCell(poolName);
   });
 
   after(() => {
     // Deletes images test pool
     pools.navigateTo();
-    pools.delete(poolName, null, null, true);
+    pools.delete(poolName, null, null, true, false, false, true);
     pools.navigateTo();
     pools.existTableCell(poolName, false);
   });
@@ -58,7 +59,7 @@ describe('Images page', () => {
     });
 
     it('should delete image', () => {
-      images.delete(newImageName, null, null, true);
+      images.delete(newImageName, null, null, true, false, false, true);
     });
   });
 

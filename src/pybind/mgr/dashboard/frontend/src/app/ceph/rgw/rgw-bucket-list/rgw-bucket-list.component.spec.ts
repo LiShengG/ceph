@@ -12,7 +12,6 @@ import { SharedModule } from '~/app/shared/shared.module';
 import { configureTestBed, PermissionHelper } from '~/testing/unit-test-helper';
 import { RgwBucketDetailsComponent } from '../rgw-bucket-details/rgw-bucket-details.component';
 import { RgwBucketListComponent } from './rgw-bucket-list.component';
-import { ToastrModule } from 'ngx-toastr';
 
 describe('RgwBucketListComponent', () => {
   let component: RgwBucketListComponent;
@@ -27,8 +26,7 @@ describe('RgwBucketListComponent', () => {
       RouterTestingModule,
       SharedModule,
       NgbNavModule,
-      HttpClientTestingModule,
-      ToastrModule.forRoot()
+      HttpClientTestingModule
     ]
   });
 
@@ -55,7 +53,7 @@ describe('RgwBucketListComponent', () => {
 
     expect(tableActions).toEqual({
       'create,update,delete': {
-        actions: ['Create', 'Edit', 'Delete'],
+        actions: ['Create', 'Edit', 'Tiering', 'Delete'],
         primary: {
           multiple: 'Create',
           executing: 'Create',
@@ -64,7 +62,7 @@ describe('RgwBucketListComponent', () => {
         }
       },
       'create,update': {
-        actions: ['Create', 'Edit'],
+        actions: ['Create', 'Edit', 'Tiering'],
         primary: {
           multiple: 'Create',
           executing: 'Create',
@@ -91,7 +89,7 @@ describe('RgwBucketListComponent', () => {
         }
       },
       'update,delete': {
-        actions: ['Edit', 'Delete'],
+        actions: ['Edit', 'Tiering', 'Delete'],
         primary: {
           multiple: '',
           executing: '',
@@ -100,12 +98,12 @@ describe('RgwBucketListComponent', () => {
         }
       },
       update: {
-        actions: ['Edit'],
+        actions: ['Edit', 'Tiering'],
         primary: {
-          multiple: 'Edit',
-          executing: 'Edit',
-          single: 'Edit',
-          no: 'Edit'
+          multiple: '',
+          executing: '',
+          single: '',
+          no: ''
         }
       },
       delete: {

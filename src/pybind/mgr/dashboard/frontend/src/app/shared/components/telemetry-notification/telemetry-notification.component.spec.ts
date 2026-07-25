@@ -2,7 +2,7 @@ import { HttpClientTestingModule } from '@angular/common/http/testing';
 import { ComponentFixture, TestBed } from '@angular/core/testing';
 
 import { NgbAlertModule } from '@ng-bootstrap/ng-bootstrap';
-import { ToastrModule } from 'ngx-toastr';
+
 import { of } from 'rxjs';
 
 import { MgrModuleService } from '~/app/shared/api/mgr-module.service';
@@ -15,6 +15,7 @@ import { NotificationService } from '~/app/shared/services/notification.service'
 import { TelemetryNotificationService } from '~/app/shared/services/telemetry-notification.service';
 import { configureTestBed } from '~/testing/unit-test-helper';
 import { TelemetryNotificationComponent } from './telemetry-notification.component';
+import { BlockUIModule } from 'ng-block-ui';
 
 describe('TelemetryActivationNotificationComponent', () => {
   let component: TelemetryNotificationComponent;
@@ -41,7 +42,7 @@ describe('TelemetryActivationNotificationComponent', () => {
 
   configureTestBed({
     declarations: [TelemetryNotificationComponent, AlertPanelComponent],
-    imports: [NgbAlertModule, HttpClientTestingModule, ToastrModule.forRoot(), PipesModule],
+    imports: [NgbAlertModule, HttpClientTestingModule, PipesModule, BlockUIModule.forRoot()],
     providers: [MgrModuleService, UserService]
   });
 

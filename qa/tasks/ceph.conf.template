@@ -32,7 +32,7 @@
         mon_warn_on_pool_no_redundancy = false
 	mon_allow_pool_size_one = true
 
-        osd pool default erasure code profile = "plugin=jerasure technique=reed_sol_van k=2 m=1 crush-failure-domain=osd"
+        osd pool default erasure code profile = "plugin=isa technique=reed_sol_van k=2 m=1 crush-failure-domain=osd"
 
 	osd default data pool replay window = 5
 
@@ -48,6 +48,7 @@
         osd scrub load threshold = 5.0
 	osd scrub max interval = 600
         osd mclock profile = high_recovery_ops
+        osd mclock skip benchmark = true
 
 	osd recover clone overlap = true
 	osd recovery max chunk = 1048576

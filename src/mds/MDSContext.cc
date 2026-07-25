@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*- 
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*- 
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph - scalable distributed file system
  *
@@ -12,12 +13,11 @@
  * 
  */
 
-
-#include "MDSRank.h"
-
 #include "MDSContext.h"
+#include "MDSRank.h"
+#include "MDLog.h"
 
-#include "common/dout.h"
+#include "common/debug.h"
 #define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_mds
 
@@ -111,7 +111,7 @@ void MDSIOContextBase::complete(int r) {
   // It's possible that the osd op requests will be stuck and then times out
   // after "rados_osd_op_timeout", the mds won't know what we should it, just
   // respawn it.
-  if (r == -CEPHFS_EBLOCKLISTED || r == -CEPHFS_ETIMEDOUT) {
+  if (r == -EBLOCKLISTED || r == -ETIMEDOUT) {
     derr << "MDSIOContextBase: failed with " << r << ", restarting..." << dendl;
     mds->respawn();
   } else {

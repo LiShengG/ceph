@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph - scalable distributed file system
  *
@@ -12,17 +13,22 @@
  *
  */
 
+#include "MDSDaemon.h"
+
 #include <unistd.h>
 
 #include "include/compat.h"
+#include "include/Context.h"
 #include "include/types.h"
 #include "include/str_list.h"
+#include "include/util.h"
 
 #include "common/Clock.h"
 #include "common/HeartbeatMap.h"
 #include "common/Timer.h"
 #include "common/ceph_argparse.h"
 #include "common/config.h"
+#include "common/debug.h"
 #include "common/entity_name.h"
 #include "common/errno.h"
 #include "common/perf_counters.h"
@@ -30,6 +36,14 @@
 #include "common/version.h"
 
 #include "global/signal_handler.h"
+#include "log/Log.h"
+
+#include "messages/MCommand.h"
+#include "messages/MCommandReply.h"
+#include "messages/MGenericMessage.h"
+#include "messages/MMDSMap.h"
+#include "messages/MMonCommand.h"
+#include "messages/MRemoveSnaps.h"
 
 #include "msg/Messenger.h"
 #include "mon/MonClient.h"
@@ -37,8 +51,8 @@
 #include "osdc/Objecter.h"
 
 #include "MDSMap.h"
+#include "MDSRank.h"
 
-#include "MDSDaemon.h"
 #include "Server.h"
 #include "Locker.h"
 
@@ -51,6 +65,8 @@
 #include "auth/AuthAuthorizeHandler.h"
 #include "auth/RotatingKeyRing.h"
 #include "auth/KeyRing.h"
+
+#include "messages/MRemoveSnaps.h"
 
 #include "perfglue/cpu_profiler.h"
 #include "perfglue/heap_profiler.h"
@@ -142,7 +158,7 @@ void MDSDaemon::asok_command(
   dout(1) << "asok_command: " << command << " " << cmdmap
 	  << " (starting...)" << dendl;
 
-  int r = -CEPHFS_ENOSYS;
+  int r = -ENOSYS;
   bufferlist outbl;
   CachedStackStringStream css;
   auto& ss = *css;
@@ -150,12 +166,16 @@ void MDSDaemon::asok_command(
     dump_status(f);
     r = 0;
   } else if (command == "lockup") {
-    int64_t millisecs;
-    cmd_getval(cmdmap, "millisecs", millisecs);
-    derr << "(lockup) sleeping with mds_lock for " << millisecs << dendl;
-    std::lock_guard l(mds_lock);
-    std::this_thread::sleep_for(std::chrono::milliseconds(millisecs));
-    r = 0;
+    int64_t millisecs{};
+    if (cmd_getval(cmdmap, "millisecs", millisecs)) {
+      derr << "(lockup) sleeping with mds_lock for " << millisecs << dendl;
+      std::lock_guard l(mds_lock);
+      std::this_thread::sleep_for(std::chrono::milliseconds(millisecs));
+      r = 0;
+    } else {
+      ss << "millisecs setting not found";
+      r = -EINVAL;
+    }
   } else if (command == "exit") {
     outbl.append("Exiting...\n");
     r = 0;
@@ -182,7 +202,7 @@ void MDSDaemon::asok_command(
   } else if (command == "heap") {
     if (!ceph_using_tcmalloc()) {
       ss << "not using tcmalloc";
-      r = -CEPHFS_EOPNOTSUPP;
+      r = -EOPNOTSUPP;
     } else {
       string heapcmd;
       cmd_getval(cmdmap, "heapcmd", heapcmd);
@@ -214,7 +234,7 @@ void MDSDaemon::asok_command(
 	return;
       } catch (const TOPNSPC::common::bad_cmd_get& e) {
 	ss << e.what();
-	r = -CEPHFS_EINVAL;
+	r = -EINVAL;
       }
     }
   }
@@ -250,6 +270,24 @@ void MDSDaemon::dump_status(Formatter *f)
   }
 
   f->dump_float("uptime", get_uptime().count());
+
+  {
+    std::map<std::string, std::string> sysinfo;
+    collect_sys_info(&sysinfo, cct);
+    f->open_object_section("sysinfo");
+    for (auto& [k, v] : sysinfo) {
+      f->dump_string(k, v);
+    }
+    f->close_section();
+  }
+
+  if constexpr (std::endian::native == std::endian::little) {
+    f->dump_string("endian", "little");
+  } else if constexpr (std::endian::native == std::endian::big) {
+    f->dump_string("endian", "big");
+  } else {
+    f->dump_string("endian", "mixed");
+  }
 
   f->close_section(); // status
 }
@@ -541,6 +579,33 @@ void MDSDaemon::set_up_admin_socket()
     asok_hook,
     "run cpu profiling on daemon");
   ceph_assert(r == 0);
+  r = admin_socket->register_command(
+    "dump stray",
+    asok_hook,
+    "dump stray folder content");
+  ceph_assert(r == 0);
+  r = admin_socket->register_command("dump qos",
+                                     asok_hook,
+                                     "dump qos info");
+  ceph_assert(r == 0);
+  r = admin_socket->register_command("qos set "
+                                     "name=path,type=CephString,req=true "
+                                     "name=reservation,type=CephInt,req=true "
+                                     "name=weight,type=CephInt,req=true "
+                                     "name=limit,type=CephInt,req=true",
+                                     asok_hook,
+                                     "set qos info");
+  ceph_assert(r == 0);
+  r = admin_socket->register_command("qos rm "
+                                     "name=path,type=CephString,req=true",
+                                     asok_hook,
+                                     "rm qos info");
+  ceph_assert(r == 0);
+  r = admin_socket->register_command("qos get "
+                                     "name=path,type=CephString,req=true",
+                                     asok_hook,
+                                     "get qos info");
+  ceph_assert(r == 0);
 }
 
 void MDSDaemon::clean_up_admin_socket()
@@ -559,7 +624,7 @@ int MDSDaemon::init()
   // to run on Windows.
   derr << "The Ceph MDS does not support running on Windows at the moment."
        << dendl;
-  return -CEPHFS_ENOSYS;
+  return -ENOSYS;
 #endif // _WIN32
 
   dout(10) << "Dumping misc struct sizes:" << dendl;
@@ -632,7 +697,7 @@ int MDSDaemon::init()
 	 << " Maybe I have a clock skew against the monitors?" << dendl;
     std::lock_guard locker{mds_lock};
     suicide();
-    return -CEPHFS_ETIMEDOUT;
+    return -ETIMEDOUT;
   }
 
   mds_lock.lock();
@@ -726,12 +791,12 @@ void MDSDaemon::handle_command(const cref_t<MCommand> &m)
       << *m->get_connection()->peer_addrs << dendl;
 
     ss << "permission denied";
-    r = -CEPHFS_EACCES;
+    r = -EACCES;
   } else if (m->cmd.empty()) {
-    r = -CEPHFS_EINVAL;
+    r = -EINVAL;
     ss << "no command given";
   } else if (!TOPNSPC::common::cmdmap_from_json(m->cmd, &cmdmap, ss)) {
-    r = -CEPHFS_EINVAL;
+    r = -EINVAL;
   } else {
     cct->get_admin_socket()->queue_tell_command(m);
     return;
@@ -904,6 +969,13 @@ void MDSDaemon::suicide()
   // to wait for us to go laggy. Only do this if we're actually in the MDSMap,
   // because otherwise the MDSMonitor will drop our message.
   beacon.set_want_state(*mdsmap, MDSMap::STATE_DNE);
+
+  /* Unlock the mds_lock while waiting for beacon ACK to avoid a
+   * deadlock with the dispatcher thread which may try to acquire
+   * mds_lock, preventing it from receiving the beacon ACK.
+   */
+  mds_lock.unlock();
+
   if (!mdsmap->is_dne_gid(mds_gid_t(monc->get_global_id()))) {
     beacon.send_and_wait(1);
   }
@@ -911,6 +983,8 @@ void MDSDaemon::suicide()
 
   if (mgrc.is_initialized())
     mgrc.shutdown();
+
+  mds_lock.lock();
 
   if (mds_rank) {
     mds_rank->shutdown();
@@ -989,7 +1063,7 @@ void MDSDaemon::respawn()
 
 
 
-bool MDSDaemon::ms_dispatch2(const ref_t<Message> &m)
+Dispatcher::dispatch_result_t MDSDaemon::ms_dispatch2(const ref_t<Message> &m)
 {
   dout(25) << __func__ << ": processing " << m << dendl;
   std::lock_guard l(mds_lock);

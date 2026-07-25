@@ -1,13 +1,15 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab ft=cpp
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab ft=cpp
 
 #pragma once
 
 #include "common/RWLock.h"
-#include "rgw_service.h"
+#include "driver/rados/rgw_service.h"
 #include "rgw_cache.h"
 
 #include "svc_sys_obj_core.h"
+
+#include <shared_mutex> // for std::shared_lock
 
 class RGWSI_Notify;
 

@@ -1,5 +1,5 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=2 sw=2 expandtab ft=cpp
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=2 sw=2 sts=2 expandtab ft=cpp
 
 /*
  * Ceph - scalable distributed file system
@@ -509,7 +509,9 @@ int DaosBucket::check_bucket_shards(const DoutPrefixProvider* dpp) {
   return DAOS_NOT_IMPLEMENTED_LOG(dpp);
 }
 
-int DaosBucket::chown(const DoutPrefixProvider* dpp, const rgw_owner& new_user,
+int DaosBucket::chown(const DoutPrefixProvider* dpp,
+                      const rgw_owner& new_user,
+                      const std::string& new_owner_name,
                       optional_yield y) {
   return DAOS_NOT_IMPLEMENTED_LOG(dpp);
 }
@@ -858,8 +860,6 @@ bool DaosZone::is_writeable() { return true; }
 
 bool DaosZone::get_redirect_endpoint(std::string* endpoint) { return false; }
 
-bool DaosZone::has_zonegroup_api(const std::string& api) const { return false; }
-
 const std::string& DaosZone::get_current_period_id() {
   return current_period->get_id();
 }
@@ -932,7 +932,7 @@ int DaosObject::get_obj_attrs(optional_yield y, const DoutPrefixProvider* dpp,
 
 int DaosObject::modify_obj_attrs(const char* attr_name, bufferlist& attr_val,
                                  optional_yield y,
-                                 const DoutPrefixProvider* dpp) {
+                                 const DoutPrefixProvider* dpp, uint32_t flags) {
   // Get object's metadata (those stored in rgw_bucket_dir_entry)
   ldpp_dout(dpp, 20) << "DEBUG: modify_obj_attrs" << dendl;
   rgw_bucket_dir_entry ent;
@@ -942,7 +942,7 @@ int DaosObject::modify_obj_attrs(const char* attr_name, bufferlist& attr_val,
   }
 
   // Update object attrs
-  set_atomic();
+  set_atomic(true);
   attrs[attr_name] = attr_val;
 
   ret = set_dir_entry_attrs(dpp, &ent, &attrs);
@@ -1030,16 +1030,14 @@ int DaosObject::transition_to_cloud(
 
 int DaosObject::restore_obj_from_cloud(Bucket* bucket,
           rgw::sal::PlacementTier* tier,
-          rgw_placement_rule& placement_rule,
-          rgw_bucket_dir_entry& o,
 	  CephContext* cct,
           RGWObjTier& tier_config,
-          real_time& mtime,
           uint64_t olh_epoch,
           std::optional<uint64_t> days,
+	  bool& in_progress,
+	  uint64_t& size,
           const DoutPrefixProvider* dpp, 
-          optional_yield y,
-          uint32_t flags)
+          optional_yield y)
 {
   return DAOS_NOT_IMPLEMENTED_LOG(dpp);
 }
@@ -1234,7 +1232,7 @@ int DaosObject::copy_object(
     RGWObjCategory category, uint64_t olh_epoch,
     boost::optional<ceph::real_time> delete_at, std::string* version_id,
     std::string* tag, std::string* etag, void (*progress_cb)(off_t, void*),
-    void* progress_data, const DoutPrefixProvider* dpp, optional_yield y) {
+    void* progress_data, rgw::sal::DataProcessorFactory* dp_factory, const DoutPrefixProvider* dpp, optional_yield y) {
   return DAOS_NOT_IMPLEMENTED_LOG(dpp);
 }
 
@@ -1698,9 +1696,6 @@ int DaosMultipartUpload::complete(
     prefix_map_t& processed_prefixes) {
   ldpp_dout(dpp, 20) << "DEBUG: complete" << dendl;
   char final_etag[CEPH_CRYPTO_MD5_DIGESTSIZE];
-  char final_etag_str[CEPH_CRYPTO_MD5_DIGESTSIZE * 2 + 16];
-  std::string etag;
-  bufferlist etag_bl;
   MD5 hash;
   // Allow use of MD5 digest in FIPS mode for non-cryptographic purposes
   hash.SetFlags(EVP_MD_CTX_FLAG_NON_FIPS_ALLOW);
@@ -1833,15 +1828,14 @@ int DaosMultipartUpload::complete(
   } while (truncated);
   hash.Final((unsigned char*)final_etag);
 
-  buf_to_hex((unsigned char*)final_etag, sizeof(final_etag), final_etag_str);
-  snprintf(&final_etag_str[CEPH_CRYPTO_MD5_DIGESTSIZE * 2],
-           sizeof(final_etag_str) - CEPH_CRYPTO_MD5_DIGESTSIZE * 2, "-%lld",
-           (long long)part_etags.size());
-  etag = final_etag_str;
-  ldpp_dout(dpp, 10) << "calculated etag: " << etag << dendl;
 
-  etag_bl.append(etag);
-
+  append_bl(etag_bl, CEPH_CRYPTO_MD5_DIGESTSIZE * 2 + 16, [&](auto iter) {
+    auto start = iter;
+    iter = buf_to_hex(final_etag, iter);
+    iter = fmt::format_to(iter, "-{}", part_etags.size());
+    ldpp_dout(dpp, 10) << "calculated etag: " << std::string_view{start, iter} << dendl;
+    return iter;
+  });
   attrs[RGW_ATTR_ETAG] = etag_bl;
 
   if (compressed) {
@@ -2141,7 +2135,8 @@ int DaosStore::list_roles(const DoutPrefixProvider *dpp,
 int DaosStore::store_oidc_provider(const DoutPrefixProvider* dpp,
                                    optional_yield y,
                                    const RGWOIDCProviderInfo& info,
-                                   bool exclusive) {
+                                   bool exclusive,
+                                   RGWObjVersionTracker* objv_tracker) {
   return DAOS_NOT_IMPLEMENTED_LOG(dpp);
 }
 
@@ -2149,7 +2144,9 @@ int DaosStore::load_oidc_provider(const DoutPrefixProvider* dpp,
                                   optional_yield y,
                                   std::string_view tenant,
                                   std::string_view url,
-                                  RGWOIDCProviderInfo& info) {
+                                  RGWOIDCProviderInfo& info,
+                                  RGWObjVersionTracker* objv_tracker)
+{
   return DAOS_NOT_IMPLEMENTED_LOG(dpp);
 }
 
@@ -2320,6 +2317,18 @@ int DaosStore::cluster_stat(RGWClusterStat& stats) {
 }
 
 std::unique_ptr<Lifecycle> DaosStore::get_lifecycle(void) {
+  DAOS_NOT_IMPLEMENTED_LOG(nullptr);
+  return 0;
+}
+
+std::unique_ptr<Restore> DaosStore::get_restore(const int n_objs,
+				const std::vector<std::string_view>& obj_names) {
+  DAOS_NOT_IMPLEMENTED_LOG(nullptr);
+  return 0;
+}
+
+bool DaosStore::process_expired_objects(const DoutPrefixProvider *dpp,
+	       				optional_yield y) {
   DAOS_NOT_IMPLEMENTED_LOG(nullptr);
   return 0;
 }

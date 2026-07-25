@@ -1,7 +1,9 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
+
 #pragma once
 
+#include <cassert>
 #include <optional>
 #include <string>
 
@@ -23,6 +25,7 @@
 #include "messages/MOSDRepScrubMap.h"
 #include "osd/scrubber_common.h"
 
+#include "scrub_machine_if.h"
 #include "scrub_machine_lstnr.h"
 #include "scrub_reservations.h"
 
@@ -105,7 +108,7 @@ OP_EV(ReplicaReserveReq);
 /// explicit release request from the Primary
 OP_EV(ReplicaRelease);
 
-template <typename T, has_formatter V>
+template <typename T, fmt::formattable V>
 struct value_event_t : sc::event<T> {
   const V value;
 
@@ -160,6 +163,11 @@ VALUE_EVENT(ReserverGranted, AsyncScrubResData);
 
 /// all replicas have granted our reserve request
 MEV(RemotesReserved)
+
+/// abort the scrub session, if in ReservingReplicas state
+/// (used when the operator issues a scrub request, and we no longer
+/// need the reservations)
+MEV(AbortIfReserving)
 
 /// initiate a new scrubbing session (relevant if we are a Primary)
 MEV(StartScrub)
@@ -240,6 +248,12 @@ MEV(IntervalChanged)
  */
 MEV(FullReset)
 
+/**
+ * (Primary only) stops the running scrub. Removes any higher-than-periodic
+ * 'urgency' attributes.
+ */
+MEV(OperatorAbort)
+
 /// finished handling this chunk. Go get the next one
 MEV(NextChunk)
 
@@ -273,33 +287,42 @@ struct ReplicaWaitUpdates;
 struct ReplicaBuildingMap;
 
 
-class ScrubMachine : public sc::state_machine<ScrubMachine, NotActive> {
+class ScrubMachine : public ScrubFsmIf, public sc::state_machine<ScrubMachine, NotActive> {
  public:
   friend class PgScrubber;
 
- public:
   explicit ScrubMachine(PG* pg, ScrubMachineListener* pg_scrub);
-  ~ScrubMachine();
+  virtual ~ScrubMachine();
 
   spg_t m_pg_id;
   ScrubMachineListener* m_scrbr;
   std::ostream& gen_prefix(std::ostream& out) const;
 
-  void assert_not_in_session() const;
-  [[nodiscard]] bool is_reserving() const;
-  [[nodiscard]] bool is_accepting_updates() const;
-  [[nodiscard]] bool is_primary_idle() const;
+  void assert_not_in_session() const final;
+  [[nodiscard]] bool is_reserving() const final;
+  [[nodiscard]] bool is_accepting_updates() const final;
+  [[nodiscard]] bool is_primary_idle() const final;
 
   /// elapsed time for the currently active scrub.session
-  ceph::timespan get_time_scrubbing() const;
+  ceph::timespan get_time_scrubbing() const final;
 
   /// replica reservation process status
-  std::optional<pg_scrubbing_status_t> get_reservation_status() const;
+  std::optional<pg_scrubbing_status_t> get_reservation_status() const final;
 
-// ///////////////// aux declarations & functions //////////////////////// //
+  void initiate() final { sc::state_machine<ScrubMachine, NotActive>::initiate(); }
 
+  void process_event(const boost::statechart::event_base& evt) final {
+    sc::state_machine<ScrubMachine, NotActive>::process_event(evt);
+  }
+
+  /// the time when the session was initiated
+  std::optional<ScrubTimePoint> m_session_started_at;
+
+
+  // ///////////////// aux declarations & functions //////////////////////// //
 
 private:
+
   /**
    * scheduled_event_state_t
    *
@@ -321,7 +344,7 @@ private:
        * retain the token until the event either fires or is canceled.
        * If a user needs/wants to relax that requirement, this assert can
        * be removed */
-      assert(!cb_token);
+      ceph_assert(!cb_token);
     }
   };
 public:
@@ -348,7 +371,7 @@ public:
       ScrubMachine *parent,
       std::shared_ptr<scheduled_event_state_t> event_state)
       :  parent(parent), event_state(event_state) {
-      assert(*this);
+      ceph_assert(*this);
     }
 
     void swap(timer_event_token_t &rhs) {
@@ -360,17 +383,17 @@ public:
     timer_event_token_t() = default;
     timer_event_token_t(timer_event_token_t &&rhs) {
       swap(rhs);
-      assert(static_cast<bool>(parent) == static_cast<bool>(event_state));
+      ceph_assert(static_cast<bool>(parent) == static_cast<bool>(event_state));
     }
 
     timer_event_token_t &operator=(timer_event_token_t &&rhs) {
       swap(rhs);
-      assert(static_cast<bool>(parent) == static_cast<bool>(event_state));
+      ceph_assert(static_cast<bool>(parent) == static_cast<bool>(event_state));
       return *this;
     }
 
     operator bool() const {
-      assert(static_cast<bool>(parent) == static_cast<bool>(event_state));
+      ceph_assert(static_cast<bool>(parent) == static_cast<bool>(event_state));
       return parent;
     }
 
@@ -412,7 +435,7 @@ public:
 	  token->cb_token = nullptr;
 	  process_event(std::move(event));
 	} else {
-	  assert(nullptr == token->cb_token);
+	  ceph_assert(nullptr == token->cb_token);
 	}
       }
     );
@@ -541,20 +564,27 @@ struct Session : sc::state<Session, PrimaryActive, ReservingReplicas>,
   ~Session();
 
   using reactions = mpl::list<sc::transition<FullReset, PrimaryIdle>,
-                              sc::custom_reaction<IntervalChanged>>;
+                              sc::custom_reaction<IntervalChanged>,
+                              sc::custom_reaction<OperatorAbort>>;
 
   sc::result react(const IntervalChanged&);
+
+  sc::result react(const OperatorAbort&);
 
   /// managing the scrub session's reservations (optional, as
   /// it's an RAII wrapper around the state of 'holding reservations')
   std::optional<ReplicaReservations> m_reservations{std::nullopt};
 
-  /// the relevant set of performance counters for this session
+  /// the relevant set of labeled performance counters for this session
   /// (relevant, i.e. for this pool type X scrub level)
   PerfCounters* m_perf_set{nullptr};
 
-  /// the time when the session was initiated
-  ScrubTimePoint m_session_started_at{ScrubClock::now()};
+  /// the OSD's unlabeled performance counters access point
+  PerfCounters* m_osd_counters{nullptr};
+
+  /// the set of performance counters for this session (relevant, i.e. for
+  /// this pool type)
+  const ScrubCounterSet* m_counters_idx{nullptr};
 
   /// abort reason - if known. Determines the delay time imposed on the
   /// failed scrub target.
@@ -570,6 +600,7 @@ struct ReservingReplicas : sc::state<ReservingReplicas, Session>, NamedSimply {
   using reactions = mpl::list<
       sc::custom_reaction<ReplicaGrant>,
       sc::custom_reaction<ReplicaReject>,
+      sc::transition<AbortIfReserving, PrimaryIdle>,
       sc::transition<RemotesReserved, ActiveScrubbing>>;
 
   ScrubTimePoint entered_at = ScrubClock::now();
