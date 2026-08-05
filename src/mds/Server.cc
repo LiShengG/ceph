@@ -12593,7 +12593,6 @@ bool Server::build_snap_diff(
 		       << " " << mtime
 		       << dendl;
 	      before.reset();
-	      continue;
 	    } else {
 	      dout(30) << __func__ << " timestamp changed " << dn->get_name() << " "
 		       << dn->first << "/" << dn->last
