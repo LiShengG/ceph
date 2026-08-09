@@ -26,6 +26,7 @@
 #include <string_view>
 #include <map>
 #include <memory>
+#include <optional>
 #include <queue>
 
 #include "MDSRank.h"
@@ -14608,18 +14609,72 @@ void MDCache::upkeep_main(void)
   }
 }
 
+namespace {
+
+struct InodeSnapshotVersionKey {
+  inodeno_t ino;
+  snapid_t first;
+  snapid_t last;
+
+  bool operator==(const InodeSnapshotVersionKey& other) const {
+    return ino == other.ino &&
+      first == other.first && last == other.last;
+  }
+};
+
+struct InodeSnapshotView {
+  InodeSnapshotVersionKey version;
+  CInode::mempool_inode inode;
+};
+
+std::optional<InodeSnapshotView> inode_snapshot_view(CInode *in,
+                                                     snapid_t snapid)
+{
+  if (in->first <= snapid && snapid <= in->last) {
+    return InodeSnapshotView{{in->ino(), in->first, in->last},
+                             *in->get_inode()};
+  }
+
+  // Multiversion hardlinks keep historical metadata in the head inode.
+  if (!in->is_head() || !in->is_auth()) {
+    return std::nullopt;
+  }
+
+  snapid_t old_last = in->pick_old_inode(snapid);
+  if (!old_last) {
+    return std::nullopt;
+  }
+
+  const auto& old_inodes = in->get_old_inodes();
+  if (!old_inodes) {
+    return std::nullopt;
+  }
+  auto it = old_inodes->find(old_last);
+  if (it == old_inodes->end()) {
+    return std::nullopt;
+  }
+
+  return InodeSnapshotView{{in->ino(), it->second.first, it->first},
+                           it->second.inode};
+}
+
+} // anonymous namespace
+
 struct C_ListSnapsAggregator : public MDSIOContext {
-  C_ListSnapsAggregator(MDSRank *mds, CInode *in1, CInode *in2, BlockDiff *block_diff,
-			Context *on_finish)
+  C_ListSnapsAggregator(MDSRank *mds, snapid_t snapid1, snapid_t snapid2,
+                        const file_layout_t& layout, BlockDiff *block_diff,
+                        Context *on_finish)
     : MDSIOContext(mds),
-      in1(in1),
-      in2(in2),
+      snapid1(snapid1),
+      snapid2(snapid2),
+      layout(layout),
       block_diff(block_diff),
       on_finish(on_finish) {
   }
 
   void finish(int r) override {
-    mds->mdcache->aggregate_snap_sets(snap_set_context, in1, in2,
+    mds->mdcache->aggregate_snap_sets(snap_set_context, snapid1, snapid2,
+                                      layout,
                                       block_diff, on_finish);
   }
 
@@ -14631,32 +14686,57 @@ struct C_ListSnapsAggregator : public MDSIOContext {
     snap_set_context.push_back(std::move(ssc));
   }
 
-  CInode *in1;
-  CInode *in2;
+  snapid_t snapid1;
+  snapid_t snapid2;
+  file_layout_t layout;
   BlockDiff *block_diff;
   Context *on_finish;
   std::vector<std::unique_ptr<MDCache::SnapSetContext>> snap_set_context;
 };
 
-void MDCache::file_blockdiff(CInode *in1, CInode *in2, BlockDiff *block_diff, uint64_t max_objects,
-			     MDSContext *ctx) {
-  ceph_assert(in1->last <= in2->last);
+void MDCache::file_blockdiff(CInode *in1, snapid_t snapid1,
+                             CInode *in2, snapid_t snapid2,
+                             BlockDiff *block_diff, uint64_t max_objects,
+                             MDSContext *ctx) {
+  ceph_assert(snapid1 <= snapid2);
+
+  auto view1 = inode_snapshot_view(in1, snapid1);
+  auto view2 = inode_snapshot_view(in2, snapid2);
+  if (!view1 || !view2) {
+    dout(1) << __func__ << ": failed to select inode versions: snapid1="
+            << snapid1 << " inode1=" << *in1 << " snapid2=" << snapid2
+            << " inode2=" << *in2 << dendl;
+    ctx->complete(-ESTALE);
+    return;
+  }
+
+  dout(20) << __func__ << ": snapid1=" << snapid1 << " version1=["
+           << view1->version.first << "," << view1->version.last
+           << "] snapid2=" << snapid2 << " version2=["
+           << view2->version.first << "," << view2->version.last << "]"
+           << dendl;
+
+  if (view1->version == view2->version) {
+    dout(20) << __func__ << ": snaps have same inode version" << dendl;
+    ctx->complete(0);
+    return;
+  }
 
   // I think this is not required since the MDS disallows setting
   // layout when truncate_seq > 1.
-  if (in1->get_inode()->layout != in2->get_inode()->layout) {
-    dout(20) << __func__ << ": snaps have different layout: " << in1->get_inode()->layout
-	     << " vs " << in2->get_inode()->layout << dendl;
-    block_diff->blocks.union_insert(0, in2->get_inode()->size);
+  if (view1->inode.layout != view2->inode.layout) {
+    dout(20) << __func__ << ": snaps have different layout: "
+             << view1->inode.layout << " vs " << view2->inode.layout << dendl;
+    block_diff->blocks.union_insert(0, view2->inode.size);
     ctx->complete(0);
     return;
   }
 
   uint64_t scan_idx = block_diff->scan_idx;
-  uint64_t num_objects1 = Striper::get_num_objects(in1->get_inode()->layout,
-						   in1->get_inode()->size);
-  uint64_t num_objects2 = Striper::get_num_objects(in2->get_inode()->layout,
-						   in2->get_inode()->size);
+  uint64_t num_objects1 = Striper::get_num_objects(view1->inode.layout,
+                                                   view1->inode.size);
+  uint64_t num_objects2 = Striper::get_num_objects(view2->inode.layout,
+                                                   view2->inode.size);
   uint64_t num_objects_pending1 = num_objects1 - scan_idx;
   uint64_t num_objects_pending2 = num_objects2 - scan_idx;
 
@@ -14677,9 +14757,9 @@ void MDCache::file_blockdiff(CInode *in1, CInode *in2, BlockDiff *block_diff, ui
 	// first snapshot has lesser number of objects - return
 	// an extent covering EOF.
 	dout(20) << __func__ << ": EOF extent" << dendl;
-	uint64_t offset = Striper::get_file_offset(g_ceph_context, &(in2->get_inode()->layout),
-						   scan_idx, 0);
-	block_diff->blocks.union_insert(offset, in2->get_inode()->size - offset);
+        uint64_t offset = Striper::get_file_offset(g_ceph_context, &view2->inode.layout,
+                                                   scan_idx, 0);
+        block_diff->blocks.union_insert(offset, view2->inode.size - offset);
 	ctx->complete(0);
       } else {
 	// num_objects_pending2 == 0
@@ -14691,7 +14771,8 @@ void MDCache::file_blockdiff(CInode *in1, CInode *in2, BlockDiff *block_diff, ui
     return;
   }
 
-  C_ListSnapsAggregator *on_finish = new C_ListSnapsAggregator(mds, in1, in2, block_diff, ctx);
+  C_ListSnapsAggregator *on_finish = new C_ListSnapsAggregator(
+    mds, snapid1, snapid2, view2->inode.layout, block_diff, ctx);
   MDSGatherBuilder gather_ctx(g_ceph_context, on_finish);
 
   while (scans > 0) {
@@ -14705,7 +14786,7 @@ void MDCache::file_blockdiff(CInode *in1, CInode *in2, BlockDiff *block_diff, ui
 
     mds->objecter->read(
         file_object_t(in1->ino(), scan_idx),
-        OSDMap::file_to_object_locator(in2->get_inode()->layout),
+        OSDMap::file_to_object_locator(view2->inode.layout),
         op, LIBRADOS_SNAP_DIR, NULL, 0,
         new LambdaContext([ssc_ptr, sub](int r) {
           // LIST_SNAPS on an absent object can fail the request with -ENOENT
@@ -14725,14 +14806,15 @@ void MDCache::file_blockdiff(CInode *in1, CInode *in2, BlockDiff *block_diff, ui
 }
 
 void MDCache::aggregate_snap_sets(const std::vector<std::unique_ptr<SnapSetContext>> &snap_set_ctx,
-                                  CInode *in1, CInode *in2, BlockDiff *block_diff, Context *on_finish) {
-  dout(20) << __func__ << dendl;
+                                  snapid_t snapid1, snapid_t snapid2,
+                                  const file_layout_t& layout,
+                                  BlockDiff *block_diff, Context *on_finish) {
+  dout(20) << __func__ << ": snapid1=" << snapid1
+           << " snapid2=" << snapid2 << dendl;
 
   // always signal to the client to request again since request
   // completion is signalled in file_blockdiff().
   int r = 1;
-  snapid_t snapid1 = in1->last;
-  snapid_t snapid2 = in2->last;
   uint64_t scans = snap_set_ctx.size();
 
   interval_set<uint64_t> extents;
@@ -14766,7 +14848,7 @@ void MDCache::aggregate_snap_sets(const std::vector<std::unique_ptr<SnapSetConte
       auto it2 = find_clone(snapid2);
 
       interval_set<uint64_t> extent;
-      uint64_t offset = Striper::get_file_offset(g_ceph_context, &(in2->get_inode()->layout),
+      uint64_t offset = Striper::get_file_offset(g_ceph_context, &layout,
 						 snap_set->objectid, 0);
 
       // No clone covers @snapid1 for one of two reasons: either the object
@@ -14822,8 +14904,8 @@ void MDCache::aggregate_snap_sets(const std::vector<std::unique_ptr<SnapSetConte
 	extent.clear();
 	extent.union_insert(offset, sz);
 	for (auto &overlap_region : it1->overlap) {
-	  uint64_t overlap_offset = Striper::get_file_offset(g_ceph_context, &(in2->get_inode()->layout),
-							     snap_set->objectid, overlap_region.first);
+          uint64_t overlap_offset = Striper::get_file_offset(g_ceph_context, &layout,
+                                                             snap_set->objectid, overlap_region.first);
 	  extent.erase(overlap_offset, overlap_region.second);
 	}
 
