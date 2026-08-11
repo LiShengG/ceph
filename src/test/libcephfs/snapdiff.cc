@@ -286,12 +286,6 @@ public:
     auto target_path = make_file_path(target);
     return ceph_symlink(cmount, target_path.c_str(), src_path.c_str());
   }
-  int link(const char* existing, const char* newname)
-  {
-    auto existing_path = make_file_path(existing);
-    auto new_path = make_file_path(newname);
-    return ceph_link(cmount, existing_path.c_str(), new_path.c_str());
-  }
   int setxattr(const char* relpath, const char* name, const char* value)
   {
     auto path = make_file_path(relpath);
