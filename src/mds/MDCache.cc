@@ -14658,6 +14658,24 @@ std::optional<InodeSnapshotView> inode_snapshot_view(CInode *in,
                            it->second.inode};
 }
 
+// In a multi-object layout where each object spans multiple stripe units,
+// a contiguous object range can map to disjoint file ranges.
+void add_file_extents(const file_layout_t& layout, uint64_t objectno,
+		      const interval_set<uint64_t>& object_extent,
+		      interval_set<uint64_t> *file_extents)
+{
+  file_layout_t mutable_layout = layout;
+  std::vector<std::pair<uint64_t, uint64_t>> mapped;
+  for (const auto& [off, len] : object_extent) {
+    mapped.clear();
+    Striper::extent_to_file(g_ceph_context, &mutable_layout,
+			    objectno, off, len, mapped);
+    for (const auto& [file_off, file_len] : mapped) {
+      file_extents->union_insert(file_off, file_len);
+    }
+  }
+}
+
 } // anonymous namespace
 
 struct C_ListSnapsAggregator : public MDSIOContext {
@@ -14847,9 +14865,8 @@ void MDCache::aggregate_snap_sets(const std::vector<std::unique_ptr<SnapSetConte
       auto it1 = find_clone(snapid1);
       auto it2 = find_clone(snapid2);
 
-      interval_set<uint64_t> extent;
-      uint64_t offset = Striper::get_file_offset(g_ceph_context, &layout,
-						 snap_set->objectid, 0);
+      // clone_info_t::size and ::overlap are in object coordinates.
+      interval_set<uint64_t> object_extent, unchanged;
 
       // No clone covers @snapid1 for one of two reasons: either the object
       // was never written after @snapid1 -- in which case the newest version
@@ -14863,9 +14880,11 @@ void MDCache::aggregate_snap_sets(const std::vector<std::unique_ptr<SnapSetConte
       if (it1 == clones.end() && snap_set->snaps.seq >= snapid1) {
 	auto sz = it2 == clones.end() ? clones.back().size : it2->size;
 	dout(10) << __func__ << ": objectid=" << snap_set->objectid << " does not exist in snap "
-		 << snapid1 << " (seq=" << snap_set->snaps.seq << "): [" << offset << "~" << sz
+		 << snapid1 << " (seq=" << snap_set->snaps.seq << "): object [0~" << sz
 		 << "]" << dendl;
-	extents.union_insert(offset, sz);
+	object_extent.clear();
+	object_extent.union_insert(0, sz);
+	add_file_extents(layout, snap_set->objectid, object_extent, &extents);
 	dout(20) << __func__ << ": (modified) extents=" << extents << dendl;
 	continue;
       }
@@ -14896,21 +14915,24 @@ void MDCache::aggregate_snap_sets(const std::vector<std::unique_ptr<SnapSetConte
 	  // TODO: report holes in blockdiff strucuter. that way,
 	  // caller can optimize and punch holes rather than writing
 	  // zeros.
-	  dout(10) << __func__ << ": hole: [" << offset << "~" << it1->size << "]" << dendl;
+	  dout(10) << __func__ << ": hole: object " << snap_set->objectid
+		   << " [0~" << it1->size << "]" << dendl;
 	  dout(10) << __func__ << ": adding whole extent - reader will read zeros" << dendl;
 	  sz = it1->size;
 	}
 
-	extent.clear();
-	extent.union_insert(offset, sz);
+	object_extent.clear();
+	object_extent.union_insert(0, sz);
+	unchanged.clear();
 	for (auto &overlap_region : it1->overlap) {
-          uint64_t overlap_offset = Striper::get_file_offset(g_ceph_context, &layout,
-                                                             snap_set->objectid, overlap_region.first);
-	  extent.erase(overlap_offset, overlap_region.second);
+	  unchanged.union_insert(overlap_region.first, overlap_region.second);
 	}
+	unchanged.intersection_of(object_extent);
+	object_extent.subtract(unchanged);
 
-	dout(20) << __func__ << ": (non overlapping) extent=" << extent << dendl;
-	extents.union_of(extent);
+	dout(20) << __func__ << ": (non overlapping) object extent="
+		 << object_extent << dendl;
+	add_file_extents(layout, snap_set->objectid, object_extent, &extents);
 	dout(20) << __func__ << ": (modified) extents=" << extents << dendl;
 	++it1;
       }

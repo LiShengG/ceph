@@ -2371,6 +2371,133 @@ TEST(LibCephFS, BlockDiffReversedSnapshots)
   ASSERT_EQ(0, test_mount.rmsnap("snap2"));
 }
 
+TEST(LibCephFS, BlockDiffStripedLayoutBoundaries)
+{
+  TestMount test_mount("BlockDiffStripedLayoutBoundaries");
+
+  constexpr uint64_t stripe_unit = 1024 * 1024;
+  constexpr uint64_t stripe_count = 4;
+  constexpr uint64_t object_size = 4 * 1024 * 1024;
+  constexpr uint64_t write_size = 4096;
+  const auto file_path = test_mount.make_file_path("fileA");
+  ASSERT_EQ(0, ceph_mknod(
+                 test_mount.get_cmount(), file_path.c_str(), 0666, 0));
+  ASSERT_EQ(0, test_mount.setxattr(
+                 "fileA", "ceph.file.layout",
+                 "stripe_unit=1048576 stripe_count=4 object_size=4194304"));
+  ASSERT_LE(0, test_mount.write_random("fileA", 8, object_size));
+  ASSERT_EQ(0, test_mount.sync());
+  ASSERT_EQ(0, test_mount.mksnap("snap1"));
+
+  // Cross a stripe-unit boundary, a complete stripe-cycle boundary, and the
+  // point where every object in the stripe set has consumed object_size.
+  const std::vector<cblock> changes{
+    {stripe_unit - write_size / 2, write_size},
+    {stripe_unit * stripe_count - write_size / 2, write_size},
+    {object_size * stripe_count - write_size / 2, write_size},
+  };
+  interval_set<uint64_t> expected;
+  for (const auto& change : changes) {
+    ASSERT_LE(0, test_mount.write_random(
+                   "fileA", 1, change.len, change.offset, false));
+    expected.union_insert(change.offset, change.len);
+  }
+  ASSERT_EQ(0, test_mount.sync());
+  ASSERT_EQ(0, test_mount.mksnap("snap2"));
+
+  interval_set<uint64_t> actual;
+  ASSERT_EQ(0, test_mount.for_each_file_blockdiff(
+                 "fileA", "snap1", "snap2", &actual));
+  ASSERT_EQ(expected, actual);
+
+  ASSERT_EQ(0, test_mount.purge_dir(""));
+  ASSERT_EQ(0, test_mount.rmsnap("snap1"));
+  ASSERT_EQ(0, test_mount.rmsnap("snap2"));
+}
+
+TEST(LibCephFS, BlockDiffStripedSpanningWrite)
+{
+  TestMount test_mount("BlockDiffStripedSpanningWrite");
+
+  constexpr uint64_t stripe_unit = 1024 * 1024;
+  constexpr uint64_t object_size = 4 * 1024 * 1024;
+  const auto file_path = test_mount.make_file_path("fileA");
+  ASSERT_EQ(0, ceph_mknod(
+                 test_mount.get_cmount(), file_path.c_str(), 0666, 0));
+  ASSERT_EQ(0, test_mount.setxattr(
+                 "fileA", "ceph.file.layout",
+                 "stripe_unit=1048576 stripe_count=4 object_size=4194304"));
+  ASSERT_LE(0, test_mount.write_random("fileA", 8, object_size));
+  ASSERT_EQ(0, test_mount.sync());
+  ASSERT_EQ(0, test_mount.mksnap("snap1"));
+
+  // Cover the last two stripe units of one row and all four units of the
+  // next. Objects 2 and 3 each contribute two disjoint file extents.
+  constexpr uint64_t write_offset = 2 * stripe_unit;
+  constexpr uint64_t write_length = 6 * stripe_unit;
+  ASSERT_LE(0, test_mount.write_random(
+                 "fileA", 1, write_length, write_offset, false));
+  ASSERT_EQ(0, test_mount.sync());
+  ASSERT_EQ(0, test_mount.mksnap("snap2"));
+
+  interval_set<uint64_t> expected;
+  interval_set<uint64_t> actual;
+  expected.union_insert(write_offset, write_length);
+  ASSERT_EQ(0, test_mount.for_each_file_blockdiff(
+                 "fileA", "snap1", "snap2", &actual));
+  ASSERT_EQ(expected, actual);
+
+  ASSERT_EQ(0, test_mount.purge_dir(""));
+  ASSERT_EQ(0, test_mount.rmsnap("snap1"));
+  ASSERT_EQ(0, test_mount.rmsnap("snap2"));
+}
+
+TEST(LibCephFS, BlockDiffStripedManyRowsPerObject)
+{
+  TestMount test_mount("BlockDiffStripedManyRowsPerObject");
+
+  constexpr uint64_t stripe_unit = 256 * 1024;
+  constexpr uint64_t stripe_count = 2;
+  constexpr uint64_t object_size = 4 * 1024 * 1024;
+  constexpr uint64_t row = stripe_unit * stripe_count;
+  constexpr uint64_t write_size = 4096;
+  const auto file_path = test_mount.make_file_path("fileA");
+  ASSERT_EQ(0, ceph_mknod(
+                 test_mount.get_cmount(), file_path.c_str(), 0666, 0));
+  ASSERT_EQ(0, test_mount.setxattr(
+                 "fileA", "ceph.file.layout",
+                 "stripe_unit=262144 stripe_count=2 object_size=4194304"));
+  ASSERT_LE(0, test_mount.write_random("fileA", 4, object_size));
+  ASSERT_EQ(0, test_mount.sync());
+  ASSERT_EQ(0, test_mount.mksnap("snap1"));
+
+  // One object spans sixteen stripe rows. Exercise three rows in object 0
+  // and one row in object 1.
+  const std::vector<cblock> changes{
+    {0, write_size},
+    {3 * row, write_size},
+    {7 * row, write_size},
+    {5 * row + stripe_unit, write_size},
+  };
+  interval_set<uint64_t> expected;
+  for (const auto& change : changes) {
+    ASSERT_LE(0, test_mount.write_random(
+                   "fileA", 1, change.len, change.offset, false));
+    expected.union_insert(change.offset, change.len);
+  }
+  ASSERT_EQ(0, test_mount.sync());
+  ASSERT_EQ(0, test_mount.mksnap("snap2"));
+
+  interval_set<uint64_t> actual;
+  ASSERT_EQ(0, test_mount.for_each_file_blockdiff(
+                 "fileA", "snap1", "snap2", &actual));
+  ASSERT_EQ(expected, actual);
+
+  ASSERT_EQ(0, test_mount.purge_dir(""));
+  ASSERT_EQ(0, test_mount.rmsnap("snap1"));
+  ASSERT_EQ(0, test_mount.rmsnap("snap2"));
+}
+
 TEST(LibCephFS, SnapDiffDeletionRecreation) {
 #ifdef _WIN32
   // Windows client is ~8x slower per file op; 1<<15 exceeds the test timeout
