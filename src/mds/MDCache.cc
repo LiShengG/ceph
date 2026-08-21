@@ -14771,7 +14771,11 @@ void MDCache::aggregate_snap_sets(const std::vector<std::unique_ptr<SnapSetConte
 	auto next_it = it1 + 1;
 	dout(20) << __func__ << ": [next cloneid: " << next_it->cloneid << " snaps: " << next_it->snaps
 		 << " overlap: " << next_it->overlap << "]" << dendl;
-	auto sz = next_it->size;
+	// Take the larger of the old and new clone sizes.  When the file is
+	// truncated *into* this object and then grown back, the discarded tail
+	// lies beyond next_it->size; using only the newer size would silently
+	// drop it from the reported diff.
+	auto sz = std::max(it1->size, next_it->size);
 	if (sz == 0) {
 	  // this object is a hole in the file.
 	  // TODO: report holes in blockdiff strucuter. that way,
