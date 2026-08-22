@@ -15,6 +15,7 @@
 
 #include <string_view>
 #include <algorithm>
+#include <thread>
 
 #include "include/types.h"
 
@@ -1513,8 +1514,13 @@ void CDir::mark_clean()
 // caller should hold auth pin of this
 void CDir::log_mark_dirty()
 {
-  if (is_dirty() || projected_version > get_version())
-    return; // noop if it is already dirty or will be dirty
+  // A commit may already have captured the current dirty version.  Purge
+  // work discovered afterwards needs a later version, or that commit will
+  // mark us clean without having included the new removals.  A pending
+  // projection (or a dirty version newer than the commit) already provides it.
+  if (projected_version > get_version() ||
+      (is_dirty() && get_version() > committing_version))
+    return;
 
   auto _fnode = allocate_fnode(*get_fnode());
   _fnode->version = pre_dirty();
@@ -1677,33 +1683,32 @@ class C_IO_Dir_OMAP_FetchedMore : public CDirIOContext {
   MDSContext *fin;
 public:
   const version_t omap_version;
-  bufferlist hdrbl;
   bool more = false;
-  map<string, bufferlist> omap;      ///< carry-over from before
-  map<string, bufferlist> omap_more; ///< new batch
+  map<string, bufferlist> omap;      ///< this batch only
   int ret;
+  /* Sampled here rather than in complete(): the ctor runs under mds_lock,
+   * whereas complete() runs on the finisher, and a get_val() there would take
+   * the config lock on every batch of every fetch just to read a dev knob
+   * that is zero in production. */
+  const std::chrono::milliseconds inject_delay =
+    g_conf().get_val<std::chrono::milliseconds>("mds_inject_dir_fetch_delay");
   C_IO_Dir_OMAP_FetchedMore(CDir *d, version_t v, MDSContext *f) :
     CDirIOContext(d), fin(f), omap_version(v), ret(0) { }
-  void finish(int r) {
-    if (omap_version < dir->get_committed_version()) {
-      omap.clear();
-      dir->_omap_fetch(nullptr, fin);
-      return;
+  void complete(int r) override {
+    // Delay before acquiring mds_lock so tests can trim the cache between
+    // decoded batches of a full fetch.
+    if (inject_delay > std::chrono::milliseconds::zero()) {
+      lgeneric_subdout(g_ceph_context, mds, 1)
+        << "C_IO_Dir_OMAP_FetchedMore injecting delay " << inject_delay.count()
+        << "ms" << dendl;
+      std::this_thread::sleep_for(inject_delay);
     }
-
-    // merge results
-    if (omap.empty()) {
-      omap.swap(omap_more);
-    } else {
-      omap.insert(omap_more.begin(), omap_more.end());
-    }
-    if (more) {
-      dir->_omap_fetch_more(omap_version, hdrbl, omap, fin);
-    } else {
-      dir->_omap_fetched(hdrbl, omap, true, {}, r);
-      if (fin)
-	fin->complete(r);
-    }
+    CDirIOContext::complete(r);
+  }
+  void finish(int r) override {
+    if (r >= 0)
+      r = ret;
+    dir->_omap_fetch_batch(omap_version, nullptr, omap, more, fin, r);
   }
   void print(ostream& out) const override {
     out << "dirfrag_fetch_more(" << dir->dirfrag() << ")";
@@ -1714,7 +1719,7 @@ class C_IO_Dir_OMAP_Fetched : public CDirIOContext {
   MDSContext *fin;
 public:
   const version_t omap_version;
-  bool complete = true;
+  bool full_fetch = true;
   std::set<string> keys;
   bufferlist hdrbl;
   bool more = false;
@@ -1722,10 +1727,26 @@ public:
   bufferlist btbl;
   int ret1, ret2, ret3;
 
+  /* See C_IO_Dir_OMAP_FetchedMore: sampled under mds_lock in the ctor, not
+   * on the finisher. */
+  const std::chrono::milliseconds inject_delay =
+    g_conf().get_val<std::chrono::milliseconds>("mds_inject_dir_fetch_delay");
+
   C_IO_Dir_OMAP_Fetched(CDir *d, MDSContext *f) :
     CDirIOContext(d), fin(f),
     omap_version(d->get_committing_version()),
     ret1(0), ret2(0), ret3(0) { }
+  void complete(int r) override {
+    // Testing hook: pause the finisher before acquiring mds_lock.  Tests can
+    // inspect the target fragment and queue a commit while the fetch reply
+    // is waiting to be decoded.
+    if (inject_delay > std::chrono::milliseconds::zero()) {
+      lgeneric_subdout(g_ceph_context, mds, 1) << "C_IO_Dir_OMAP_Fetched injecting delay "
+                                       << inject_delay.count() << "ms" << dendl;
+      std::this_thread::sleep_for(inject_delay);
+    }
+    CDirIOContext::complete(r);
+  }
   void finish(int r) override {
     // check the correctness of backtrace
     if (r >= 0 && ret3 != -ECANCELED)
@@ -1733,16 +1754,29 @@ public:
     if (r >= 0) r = ret1;
     if (r >= 0) r = ret2;
 
-    if (more) {
-      if (omap_version < dir->get_committed_version()) {
-	dir->_omap_fetch(nullptr, fin);
-      } else {
-	dir->_omap_fetch_more(omap_version, hdrbl, omap, fin);
-      }
+    if (full_fetch) {
+      // full fetch: may span several batches, hand over to the pipeline
+      dir->_omap_fetch_batch(omap_version, &hdrbl, omap, more, fin, r);
       return;
     }
 
-    dir->_omap_fetched(hdrbl, omap, complete, keys, r);
+    /* fetch_keys(): a single omap_get_vals_by_keys(), never batched, and
+     * several of them may be in flight at once -- so it keeps its state on
+     * the stack rather than in CDir::fetch_state. */
+    ceph_assert(!more);
+    CDir::fetch_state_t st;
+    st.omap_version = omap_version;
+    if (!dir->_omap_fetch_init(st, hdrbl, false)) {
+      // go_bad() completes WAIT_COMPLETE, but fetch_keys() may own a
+      // separate callback (notably the header-only fetch used by scrub).
+      // Do not access dir here: go_bad() can invoke waiters synchronously.
+      if (fin)
+        fin->complete(r < 0 ? r : -EIO);
+      return;
+    }
+    std::vector<string_snap_t> null_keys;
+    dir->_omap_decode_batch(st, omap, false, keys, null_keys);
+    dir->_omap_fetch_finish(st, false, null_keys, r);
     if (fin)
       fin->complete(r);
   }
@@ -1759,7 +1793,7 @@ void CDir::_omap_fetch(std::set<string> *keys, MDSContext *c)
   ObjectOperation rd;
   rd.omap_get_header(&fin->hdrbl, &fin->ret1);
   if (keys) {
-    fin->complete = false;
+    fin->full_fetch = false;
     fin->keys.swap(*keys);
     rd.omap_get_vals_by_keys(fin->keys, &fin->omap, &fin->ret2);
   } else {
@@ -1779,24 +1813,124 @@ void CDir::_omap_fetch(std::set<string> *keys, MDSContext *c)
 			     new C_OnFinisher(fin, mdcache->mds->finisher));
 }
 
-void CDir::_omap_fetch_more(version_t omap_version, bufferlist& hdrbl,
-			    map<string, bufferlist>& omap, MDSContext *c)
+void CDir::_omap_fetch_more(version_t omap_version, std::string_view start_after,
+			    MDSContext *c)
 {
   // we have more omap keys to fetch!
   object_t oid = get_ondisk_object();
   object_locator_t oloc(mdcache->mds->mdsmap->get_metadata_pool());
   auto fin = new C_IO_Dir_OMAP_FetchedMore(this, omap_version, c);
-  fin->hdrbl = std::move(hdrbl);
-  fin->omap.swap(omap);
   ObjectOperation rd;
-  rd.omap_get_vals(fin->omap.rbegin()->first,
+  rd.omap_get_vals(std::string(start_after),
 		   "", /* filter prefix */
 		   g_conf()->mds_dir_keys_per_op,
-		   &fin->omap_more,
+		   &fin->omap,
 		   &fin->more,
 		   &fin->ret);
   mdcache->mds->objecter->read(oid, oloc, rd, CEPH_NOSNAP, NULL, 0,
 			     new C_OnFinisher(fin, mdcache->mds->finisher));
+}
+
+/*
+ * One batch of a full dirfrag fetch has landed.
+ *
+ * The cursor for the next batch is the last *raw* key of this one, which is
+ * known the moment the reply lands -- it does not depend on decoding it.  So
+ * issue the next read first and decode this batch while that read is in
+ * flight.  Batches cannot be fetched in parallel (omap listing is a cursor,
+ * not an indexable range), but this at least overlaps the decode with the
+ * round trip, and keeps only one batch of encoded dentries in memory at a
+ * time instead of the whole fragment.
+ */
+void CDir::_omap_fetch_batch(version_t omap_version, bufferlist *hdrbl,
+			     map<string, bufferlist>& batch,
+			     bool more, MDSContext *fin, int r)
+{
+  ceph_assert(is_auth());
+  ceph_assert(!is_frozen());
+
+  if (hdrbl) {
+    // first batch: set up the state this fetch carries across batches
+    ceph_assert(!fetch_state);
+    /* Keep it off the CDir until it is known good: go_bad() runs the
+     * WAIT_COMPLETE contexts inline (finish_waiting() with a negative
+     * result calls finish_contexts()), so a failed init can re-enter here
+     * and must not find a half-built state installed. */
+    auto st_ = std::make_unique<fetch_state_t>();
+    st_->omap_version = omap_version;
+    st_->pipelined = g_conf().get_val<bool>("mds_dir_fetch_pipelined");
+    if (!_omap_fetch_init(*st_, *hdrbl, true))
+      return;			// go_bad() already cleaned up
+    fetch_state = std::move(st_);
+  }
+  ceph_assert(fetch_state);
+  fetch_state_t& st = *fetch_state;
+
+  if (r < 0)
+    more = false;		// let the finish path report it
+  if (batch.empty())
+    more = false;		// defensive: OSD said truncated but returned nothing
+
+  if (!st.pipelined) {
+    /* Kill switch: accumulate every batch and decode once at the end, which
+     * keeps the old "restart the whole fetch if the frag was committed under
+     * us" behaviour available. */
+    if (st.omap_version < get_committed_version()) {
+      dout(10) << __func__ << " dir was committed to v" << get_committed_version()
+	       << " while fetching at v" << st.omap_version << ", restarting" << dendl;
+      fetch_state.reset();
+      _omap_fetch(nullptr, fin);
+      return;
+    }
+    if (st.pending.empty())
+      st.pending.swap(batch);
+    else
+      st.pending.insert(batch.begin(), batch.end());
+    if (more) {
+      _omap_fetch_more(st.omap_version, st.pending.rbegin()->first, fin);
+      return;
+    }
+    std::vector<string_snap_t> null_keys;
+    auto pending = std::move(st.pending);
+    _omap_decode_batch(st, pending, true, {}, null_keys);
+    auto owned = std::move(fetch_state);
+    _omap_fetch_finish(*owned, true, null_keys, r);
+    if (fin)
+      fin->complete(r);
+    return;
+  }
+
+  /* The frag was committed while we were reading it.  The non-pipelined path
+   * throws everything away and starts over; here dentries from earlier
+   * batches are already in the cache and cannot be rolled back, so carry on
+   * instead.  That is safe because a dentry cannot be created or unlinked
+   * behind the cursor without its CDentry being in memory first (a miss on an
+   * incomplete dirfrag blocks on WAIT_COMPLETE), and _load_dentry() never
+   * overwrites an in-memory dentry with what it read from disk -- so anything
+   * this read is stale about is already correct in items(), and
+   * mark_complete() still holds. */
+  if (st.omap_version < get_committed_version() && !st.version_changed) {
+    st.version_changed = true;
+    dout(10) << __func__ << " dir was committed to v" << get_committed_version()
+	     << " while fetching at v" << st.omap_version << ", continuing" << dendl;
+  }
+
+  // 1) issue the next read before decoding: its cursor is just the last key
+  if (more) {
+    _omap_fetch_more(st.omap_version, batch.rbegin()->first, fin);
+  }
+
+  // 2) decode this batch while that read is on the wire
+  std::vector<string_snap_t> null_keys;
+  _omap_decode_batch(st, batch, true, {}, null_keys);
+
+  // 3) only the last batch finishes the fetch
+  if (!more) {
+    auto owned = std::move(fetch_state);
+    _omap_fetch_finish(*owned, true, null_keys, r);
+    if (fin)
+      fin->complete(r);
+  }
 }
 
 CDentry *CDir::_load_dentry(
@@ -2011,14 +2145,15 @@ CDentry *CDir::_load_dentry(
   return dn;
 }
 
-void CDir::_omap_fetched(bufferlist& hdrbl, map<string, bufferlist>& omap,
-			 bool complete, const std::set<string>& keys, int r)
+/*
+ * Consume the omap header of a fetch and prepare the state its batches are
+ * decoded against.  Runs once per fetch, on the first batch.
+ */
+bool CDir::_omap_fetch_init(fetch_state_t& st, bufferlist& hdrbl, bool complete)
 {
   LogChannelRef clog = mdcache->mds->clog;
-  dout(10) << "_fetched header " << hdrbl.length() << " bytes "
-	   << omap.size() << " keys for " << *this << dendl;
+  dout(10) << "_fetched header " << hdrbl.length() << " bytes for " << *this << dendl;
 
-  ceph_assert(r == 0 || r == -ENOENT || r == -ENODATA);
   ceph_assert(is_auth());
   ceph_assert(!is_frozen());
 
@@ -2029,7 +2164,7 @@ void CDir::_omap_fetched(bufferlist& hdrbl, map<string, bufferlist>& omap,
                      "files may be lost (" << get_trimmed_path() << ")";
 
     go_bad(complete);
-    return;
+    return false;
   }
 
   fnode_t got_fnode;
@@ -2043,14 +2178,14 @@ void CDir::_omap_fetched(bufferlist& hdrbl, map<string, bufferlist>& omap,
       clog->warn() << "Corrupt fnode header in " << dirfrag() << ": "
 		   << err.what() << " (" << get_trimmed_path() << ")";
       go_bad(complete);
-      return;
+      return false;
     }
     if (!p.end()) {
       clog->warn() << "header buffer of dir " << dirfrag() << " has "
 		  << hdrbl.length() - p.get_off() << " extra bytes ("
                   << get_trimmed_path() << ")";
       go_bad(complete);
-      return;
+      return false;
     }
   }
 
@@ -2060,32 +2195,52 @@ void CDir::_omap_fetched(bufferlist& hdrbl, map<string, bufferlist>& omap,
   // only if we are a fresh CDir* with no prior state.
   if (get_version() == 0) {
     set_fresh_fnode(allocate_fnode(got_fnode));
+    /* set_fresh_fnode() just moved committed_version from 0 up to the version
+     * this very read is of.  The fetch latched its omap_version before that,
+     * so re-latch it here: otherwise a cold fetch keeps comparing v0 against
+     * the version it just adopted and mistakes itself for a commit racing
+     * under it -- restarting the whole read in the buffered mode, and logging
+     * a bogus race in the pipelined one. */
+    st.omap_version = get_committing_version();
   }
-
-  list<CInode*> undef_inodes;
 
   // purge stale snaps?
-  bool force_dirty = false;
-  const set<snapid_t> *snaps = NULL;
   SnapRealm *realm = inode->find_snaprealm();
   if (fnode->snap_purged_thru < realm->get_last_destroyed()) {
-    snaps = &realm->get_snaps();
+    st.snaps = realm->get_snaps();
+    st.snap_purge_target = realm->get_last_destroyed();
     dout(10) << " snap_purged_thru " << fnode->snap_purged_thru
 	     << " < " << realm->get_last_destroyed()
-	     << ", snap purge based on " << *snaps << dendl;
-    if (get_num_snap_items() == 0) {
-      const_cast<snapid_t&>(fnode->snap_purged_thru) = realm->get_last_destroyed();
-      force_dirty = true;
-    }
+	     << ", snap purge based on " << st.snaps << dendl;
   }
+  st.no_snap_items_at_start = (get_num_snap_items() == 0);
 
+  st.rand_threshold = get_inode()->get_ephemeral_rand();
+  return true;
+}
 
-  MDSContext::vec finished;
-  std::vector<string_snap_t> null_keys;
+/*
+ * Load one batch of omap entries into the cache.  For a full fetch this is
+ * called once per batch, in ascending key order; @p st carries everything
+ * that accumulates across those calls.  For fetch_keys() it is called
+ * exactly once, and @p keys names the dentries that were asked for so that
+ * the ones the object did not have can be instantiated as negative.
+ */
+void CDir::_omap_decode_batch(fetch_state_t& st, map<string, bufferlist>& batch,
+			      bool complete, const std::set<string>& keys,
+			      std::vector<string_snap_t>& null_keys)
+{
+  dout(10) << "_fetched " << batch.size() << " keys for " << *this << dendl;
+
+  if (st.snap_purge_target)
+    st.snaps = inode->find_snaprealm()->get_snaps();
 
   auto k_it = keys.rbegin();
   auto w_it = waiting_on_dentry.rbegin();
-  std::string_view last_name = "";
+  MDSContext::vec& finished = st.finished;
+  /* Owned, not a view into @p batch: batch is destroyed when this batch's
+   * callback returns, but st outlives it. */
+  std::string& last_name = st.last_name;
 
   auto proc_waiters = [&](const string_snap_t& key) {
     bool touch = false;
@@ -2112,7 +2267,6 @@ void CDir::_omap_fetched(bufferlist& hdrbl, map<string, bufferlist>& omap,
   };
   auto proc_nulls_and_waiters = [&](const string& str_key, const string_snap_t& key) {
     bool touch = false;
-    int count = 0;
 
     while (k_it != keys.rend()) {
       int cmp = k_it->compare(str_key);
@@ -2128,20 +2282,26 @@ void CDir::_omap_fetched(bufferlist& hdrbl, map<string, bufferlist>& omap,
       dentry_key_t::decode_helper(*k_it, n_key.name, n_key.snapid);
       ceph_assert(n_key.snapid == CEPH_NOSNAP);
       proc_waiters(n_key);
-      last_name = std::string_view(k_it->c_str(), n_key.name.length());
+      last_name = k_it->substr(0, n_key.name.length());
       null_keys.emplace_back(std::move(n_key));
       ++k_it;
 
-      if (!(++count % mdcache->mds->heartbeat_reset_grace()))
+      if (!(++st.count % mdcache->mds->heartbeat_reset_grace()))
         mdcache->mds->heartbeat_reset();
     }
     return touch;
   };
 
-  int count = 0;
-  unsigned pos = omap.size() - 1;
-  double rand_threshold = get_inode()->get_ephemeral_rand();
-  for (auto p = omap.rbegin(); p != omap.rend(); ++p, --pos) {
+  /* Iterate the batch in reverse so that proc_waiters()/proc_nulls_and_waiters()
+   * can walk waiting_on_dentry (and keys) with a single reverse cursor.  Across
+   * batches the overall order is ascending, which proc_waiters() absorbs by
+   * re-seeking w_it whenever last_name < key.name. */
+  /* _load_dentry()'s `pos` is diagnostic only, but it lands in the damage
+   * record for a corrupt entry, so it has to name the entry's real position.
+   * The walk is descending, so count down from this batch's last index. */
+  unsigned idx = st.pos + batch.size();
+  for (auto p = batch.rbegin(); p != batch.rend(); ++p) {
+    --idx;
     string_snap_t key;
     dentry_key_t::decode_helper(p->first, key.name, key.snapid);
     bool touch = false;
@@ -2152,17 +2312,18 @@ void CDir::_omap_fetched(bufferlist& hdrbl, map<string, bufferlist>& omap,
       } else {
 	touch = proc_nulls_and_waiters(p->first, key);
       }
-      last_name = std::string_view(p->first.c_str(), key.name.length());
+      last_name = p->first.substr(0, key.name.length());
     }
 
-    if (!(++count % mdcache->mds->heartbeat_reset_grace()))
+    if (!(++st.count % mdcache->mds->heartbeat_reset_grace()))
       mdcache->mds->heartbeat_reset();
 
     CDentry *dn = nullptr;
     try {
       dn = _load_dentry(
-            p->first, key.name, key.snapid, p->second, pos, snaps,
-            rand_threshold, &force_dirty);
+            p->first, key.name, key.snapid, p->second, idx,
+            st.snap_purge_target ? &st.snaps : nullptr,
+            st.rand_threshold, &st.force_dirty);
     } catch (const buffer::error &err) {
       mdcache->mds->clog->warn() << "Corrupt dentry '" << key.name << "' in "
                                   "dir frag " << dirfrag() << ": "
@@ -2191,21 +2352,35 @@ void CDir::_omap_fetched(bufferlist& hdrbl, map<string, bufferlist>& omap,
 
     CDentry::linkage_t *dnl = dn->get_linkage();
     if (dnl->is_primary() && dnl->get_inode()->state_test(CInode::STATE_REJOINUNDEF))
-      undef_inodes.push_back(dnl->get_inode());
+      st.undef_inodes.push_back(dnl->get_inode());
   }
+  st.pos += batch.size();
 
-  if (complete) {
-    if (!waiting_on_dentry.empty()) {
-      for (auto &p : waiting_on_dentry) {
-	std::copy(p.second.begin(), p.second.end(), std::back_inserter(finished));
-	if (p.first.snapid == CEPH_NOSNAP)
-	  null_keys.emplace_back(p.first);
-      }
-      waiting_on_dentry.clear();
-      put(PIN_DNWAITER);
-    }
-  } else {
+  if (!complete) {
+    // fetch_keys(): drain the keys the object did not have
     proc_nulls_and_waiters("", string_snap_t());
+  }
+}
+
+/*
+ * All of the fetch's batches have been decoded: wake up whoever was waiting
+ * on it, mark the fragment complete and drop the auth pin fetch() took.
+ */
+void CDir::_omap_fetch_finish(fetch_state_t& st, bool complete,
+			      std::vector<string_snap_t>& null_keys, int r)
+{
+  ceph_assert(r == 0 || r == -ENOENT || r == -ENODATA);
+
+  MDSContext::vec& finished = st.finished;
+
+  if (complete && !waiting_on_dentry.empty()) {
+    for (auto &p : waiting_on_dentry) {
+      std::copy(p.second.begin(), p.second.end(), std::back_inserter(finished));
+      if (p.first.snapid == CEPH_NOSNAP)
+	null_keys.emplace_back(p.first);
+    }
+    waiting_on_dentry.clear();
+    put(PIN_DNWAITER);
   }
 
   if (!null_keys.empty()) {
@@ -2220,7 +2395,7 @@ void CDir::_omap_fetched(bufferlist& hdrbl, map<string, bufferlist>& omap,
       }
       mdcache->touch_dentry(dn);
 
-      if (!(++count % mdcache->mds->heartbeat_reset_grace(2)))
+      if (!(++st.count % mdcache->mds->heartbeat_reset_grace(2)))
         mdcache->mds->heartbeat_reset();
     }
   }
@@ -2235,19 +2410,34 @@ void CDir::_omap_fetched(bufferlist& hdrbl, map<string, bufferlist>& omap,
   }
 
   // open & force frags
-  while (!undef_inodes.empty()) {
-    CInode *in = undef_inodes.front();
+  while (!st.undef_inodes.empty()) {
+    CInode *in = st.undef_inodes.front();
 
-    undef_inodes.pop_front();
+    st.undef_inodes.pop_front();
     in->state_clear(CInode::STATE_REJOINUNDEF);
     mdcache->opened_undef_inode(in);
 
-    if (!(++count % mdcache->mds->heartbeat_reset_grace()))
+    if (!(++st.count % mdcache->mds->heartbeat_reset_grace()))
       mdcache->mds->heartbeat_reset();
   }
 
+  // Only a successful full scan can certify that every stale disk key has
+  // been examined.  fetch_keys() and a buffered fetch that restarts must not
+  // advance this watermark.  no_snap_items_at_start is sampled before the
+  // scan, not after: a snap dentry already cached when the fetch began is
+  // handed back by _load_dentry() untouched, so it would not have been
+  // purged -- but testing it afterwards would instead see the snap dentries
+  // the scan itself just loaded and never advance the watermark at all.
+  if (complete && r == 0 && st.no_snap_items_at_start &&
+      fnode->snap_purged_thru < st.snap_purge_target &&
+      !mdcache->is_readonly()) {
+    pending_snap_purge_target = std::max(pending_snap_purge_target,
+                                         st.snap_purge_target);
+    st.force_dirty = true;
+  }
+
   // dirty myself to remove stale snap dentries
-  if (force_dirty && !mdcache->is_readonly())
+  if (st.force_dirty && !mdcache->is_readonly())
     log_mark_dirty();
 
   auth_unpin(this);
@@ -2332,10 +2522,12 @@ void CDir::commit(version_t want, MDSContext *c, bool ignore_authpinnability, in
 
 class C_IO_Dir_Committed : public CDirIOContext {
   version_t version;
+  snapid_t snap_purged_thru;
 public:
-  C_IO_Dir_Committed(CDir *d, version_t v) : CDirIOContext(d), version(v) { }
+  C_IO_Dir_Committed(CDir *d, version_t v, snapid_t purged) :
+    CDirIOContext(d), version(v), snap_purged_thru(purged) { }
   void finish(int r) override {
-    dir->_committed(r, version);
+    dir->_committed(r, version, snap_purged_thru);
   }
   void print(ostream& out) const override {
     out << "dirfrag_committed(" << dir->dirfrag() << ")";
@@ -2344,10 +2536,14 @@ public:
 
 class C_IO_Dir_Commit_Ops : public Context {
 public:
-  C_IO_Dir_Commit_Ops(CDir* d, int pr, auto&& s, auto&& bl, auto&& r, auto&& stales)
+  C_IO_Dir_Commit_Ops(CDir* d, int pr, bufferlist&& h, snapid_t purged,
+                    auto&& s, auto&& bl,
+                    auto&& r, auto&& stales)
   :
     dir(d),
     op_prio(pr),
+    header(std::move(h)),
+    snap_purged_thru(purged),
     to_set(std::forward<decltype(s)>(s)),
     dfts(std::forward<decltype(bl)>(bl)),
     to_remove(std::forward<decltype(r)>(r)),
@@ -2356,10 +2552,24 @@ public:
     metapool = dir->mdcache->mds->get_metadata_pool();
     version = dir->get_version();
     is_new = dir->is_new();
+    /* Read under mds_lock (this ctor runs in _omap_commit); finish() runs on
+     * the finisher, where a get_val() per commit would take the config lock
+     * only to read a dev knob that is zero in production. */
+    inject_delay =
+      g_conf().get_val<std::chrono::milliseconds>("mds_inject_dir_commit_ops_delay");
   }
 
   void finish(int r) override {
-    dir->_omap_commit_ops(r, op_prio, metapool, version, is_new, to_set, dfts,
+    // Testing hook: let fetch decoding discover more stale keys after this
+    // commit captured its header and removal set, but before it submits them.
+    if (inject_delay > std::chrono::milliseconds::zero()) {
+      lgeneric_subdout(g_ceph_context, mds, 1)
+        << "C_IO_Dir_Commit_Ops injecting delay " << inject_delay.count()
+        << "ms" << dendl;
+      std::this_thread::sleep_for(inject_delay);
+    }
+    dir->_omap_commit_ops(r, op_prio, metapool, version, is_new, header,
+                          snap_purged_thru, to_set, dfts,
 			  to_remove, stale_items);
   }
 
@@ -2369,6 +2579,9 @@ private:
   int64_t metapool;
   version_t version;
   bool is_new;
+  std::chrono::milliseconds inject_delay{0};
+  bufferlist header;
+  snapid_t snap_purged_thru;
   vector<CDir::dentry_commit_item> to_set;
   bufferlist dfts;
   vector<string> to_remove;
@@ -2413,6 +2626,7 @@ void CDir::_encode_primary_inode_base(dentry_commit_item &item, bufferlist &dfts
 
 // This is not locked by mds_lock
 void CDir::_omap_commit_ops(int r, int op_prio, int64_t metapool, version_t version, bool _new,
+			    bufferlist &header, snapid_t snap_purged_thru,
 			    vector<dentry_commit_item> &to_set, bufferlist &dfts,
                             vector<string>& to_remove,
 			    mempool::mds_co::compact_set<mempool::mds_co::string> &stales)
@@ -2425,7 +2639,8 @@ void CDir::_omap_commit_ops(int r, int op_prio, int64_t metapool, version_t vers
   }
 
   C_GatherBuilder gather(g_ceph_context,
-                         new C_OnFinisher(new C_IO_Dir_Committed(this, version),
+                         new C_OnFinisher(new C_IO_Dir_Committed(this, version,
+                                                                 snap_purged_thru),
 			 mdcache->mds->finisher));
 
   SnapContext snapc;
@@ -2438,14 +2653,14 @@ void CDir::_omap_commit_ops(int r, int op_prio, int64_t metapool, version_t vers
   unsigned max_write_size = mdcache->max_dir_commit_size;
   unsigned write_size = 0;
 
-  auto commit_one = [&](bool header=false) {
+  auto commit_one = [&](bool with_header=false) {
     ObjectOperation op;
 
     /*
      * Shouldn't submit empty op to Rados, which could cause
      * the cephfs to become readonly.
      */
-    ceph_assert(header || !_set.empty() || !_rm.empty());
+    ceph_assert(with_header || !_set.empty() || !_rm.empty());
 
 
     // don't create new dirfrag blindly
@@ -2461,9 +2676,7 @@ void CDir::_omap_commit_ops(int r, int op_prio, int64_t metapool, version_t vers
      * the message containing the header off last, we cannot get our header
      * into an incorrect state.
      */
-    if (header) {
-      bufferlist header;
-      encode(*fnode, header);
+    if (with_header) {
       op.omap_set_header(header);
     }
 
@@ -2647,7 +2860,19 @@ void CDir::_omap_commit(int op_prio)
     }
   }
 
-  auto c = new C_IO_Dir_Commit_Ops(this, op_prio, std::move(to_set), std::move(dfts),
+  // Freeze the header under mds_lock together with this commit's removal
+  // set.  The finisher must not read a newer fnode whose purge watermark (or
+  // version) describes changes that this commit did not capture.
+  // Do not publish uncommitted purge progress in the live fnode: a later
+  // journal event could otherwise replay that progress without stale_items.
+  fnode_t committed_fnode = *fnode;
+  committed_fnode.snap_purged_thru = std::max(fnode->snap_purged_thru,
+                                              pending_snap_purge_target);
+  bufferlist header;
+  encode(committed_fnode, header);
+  auto c = new C_IO_Dir_Commit_Ops(this, op_prio, std::move(header),
+                                   committed_fnode.snap_purged_thru,
+                                   std::move(to_set), std::move(dfts),
                                    std::move(to_remove), std::move(stale_items));
   stale_items.clear(); /* in CDir */
   mdcache->mds->finisher->queue(c);
@@ -2755,7 +2980,7 @@ void CDir::_commit(version_t want, int op_prio)
  *
  * @param v version i just committed
  */
-void CDir::_committed(int r, version_t v)
+void CDir::_committed(int r, version_t v, snapid_t snap_purged_thru)
 {
   if (r < 0) {
     // the directory could be partly purged during MDS failover
@@ -2783,6 +3008,20 @@ void CDir::_committed(int r, version_t v)
   ceph_assert(v > committed_version);
   ceph_assert(v <= committing_version);
   committed_version = v;
+
+  // The header was written after all removals from this commit.  It is now
+  // safe for journal records to carry its purge progress.  Preserve any
+  // newer fnode version produced while the commit was in flight.
+  if (fnode->snap_purged_thru < snap_purged_thru) {
+    auto next_fnode = allocate_fnode(*fnode);
+    next_fnode->snap_purged_thru = snap_purged_thru;
+    reset_fnode(std::move(next_fnode));
+  }
+  // An outstanding projection was derived from the pre-commit fnode, so
+  // popping it will roll snap_purged_thru back.  Hold the pending target so
+  // the next commit re-publishes it rather than regressing the on-disk value.
+  if (pending_snap_purge_target <= snap_purged_thru && !is_projected())
+    pending_snap_purge_target = 0;
 
   // _all_ commits done?
   if (committing_version == committed_version) 

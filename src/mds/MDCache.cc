@@ -7121,6 +7121,19 @@ bool MDCache::trim_dentry(CDentry *dn, expiremap& expiremap)
 
   CDir *dir = dn->get_dir();
   ceph_assert(dir);
+
+  // A pipelined fetch has already advanced its omap cursor past the dentries
+  // decoded by earlier batches. Keep them until the fetch marks the dirfrag
+  // complete; trimming one now would lose it from the completed listing.
+  // The fetch's auth pin protects the dirfrag itself, not these dentries.
+  //
+  // Two callers ignore this return value (expire_recursive() and
+  // handle_dentry_unlink()), but neither can reach it: STATE_FETCHING is only
+  // ever set on an auth dirfrag, and both of those operate on replicas.
+  if (dir->state_test(CDir::STATE_FETCHING)) {
+    dout(12) << "trim_dentry keeping dentry in fetching dirfrag " << *dn << dendl;
+    return true;
+  }
   
   CDir *con = get_subtree_root(dir);
   if (con)

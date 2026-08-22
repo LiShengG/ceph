@@ -1,0 +1,14 @@
+overrides:
+  ceph:
+    log-ignorelist:
+      # test_dirfrag_fetch_damage removes or corrupts a dirfrag object on
+      # purpose, so scrub's header-only fetch reports the fragment damaged.
+      - object missing on disk
+      - Corrupt fnode header
+      - Metadata damage detected
+tasks:
+  - cephfs_test_runner:
+      modules:
+        - tasks.cephfs.test_dirfrag_fetch
+        - tasks.cephfs.test_dirfrag_fetch_damage
+        - tasks.cephfs.test_dirfrag_fetch_trim

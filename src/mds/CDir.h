@@ -20,6 +20,7 @@
 #include <iosfwd>
 #include <list>
 #include <map>
+#include <memory>
 #include <set>
 #include <string>
 #include <string_view>
@@ -665,9 +666,80 @@ protected:
   friend class C_IO_Dir_Committed;
   friend class C_IO_Dir_Commit_Ops;
 
+  /**
+   * State carried across the batches of a single dirfrag fetch.
+   *
+   * A full fetch of a large dirfrag needs several omap_get_vals() round
+   * trips (the OSD clamps each one to osd_max_omap_entries_per_request).
+   * Everything the decode loop accumulates lives here so that each batch
+   * can be decoded as it lands instead of being buffered until the last
+   * one arrives.
+   */
+  struct fetch_state_t {
+    /* The dirfrag version this read reflects, used to notice a commit landing
+     * under us.  Re-latched by _omap_fetch_init() when it adopts the on-disk
+     * fnode of a fresh CDir, since that moves committed_version itself. */
+    version_t omap_version = 0;
+    /* Latched on the first batch: flipping mds_dir_fetch_pipelined mid-fetch
+     * would otherwise strand the batches already accumulated in `pending`. */
+    bool pipelined = true;
+    bool version_changed = false;      ///< only used to log the transition once
+    bool force_dirty = false;
+    // Refresh the owned snapshot set for each batch: a snapshot created
+    // between reads may appear in a later batch.  The purge watermark stays
+    // bounded by the target captured at the start of the scan.
+    std::set<snapid_t> snaps;
+    snapid_t snap_purge_target = 0;
+    /* Whether the fragment held no snap dentries when the fetch began.  Only
+     * then does the scan pass every snap dentry through _load_dentry(), which
+     * is what moves stale ones into stale_items -- one that was already cached
+     * is returned untouched and never purged here, so the watermark would be
+     * certifying work that was not done.  This must be sampled at the start:
+     * after a scan it is false for any fragment that legitimately holds
+     * snapshots, which would stop the watermark from ever advancing. */
+    bool no_snap_items_at_start = false;
+    double rand_threshold = 0;
+    std::list<CInode*> undef_inodes;
+    /* MDSContext is only forward declared here, so spell out MDSContext::vec
+     * (a std::vector<MDSContext*>) rather than naming the nested alias. */
+    std::vector<MDSContext*> finished;
+    /* Must own its storage: the batch map it used to alias is destroyed
+     * when the callback for that batch returns. */
+    std::string last_name;
+    unsigned pos = 0;                  ///< index of this batch's first entry
+    int count = 0;                     ///< heartbeat_reset() throttle, across batches
+    /* Only used when mds_dir_fetch_pipelined is disabled: batches are
+     * accumulated here and decoded in one go, as they used to be. */
+    std::map<std::string, ceph::buffer::list> pending;
+  };
+  /* Only ever used by the full-fetch path, which is serialised by
+   * STATE_FETCHING.  fetch_keys() may have several reads in flight at
+   * once, so that path keeps its state on the stack instead. */
+  std::unique_ptr<fetch_state_t> fetch_state;
+
   void _omap_fetch(std::set<std::string> *keys, MDSContext *fin=nullptr);
-  void _omap_fetch_more(version_t omap_version, bufferlist& hdrbl,
-			std::map<std::string, bufferlist>& omap, MDSContext *fin);
+  void _omap_fetch_more(version_t omap_version, std::string_view start_after,
+			MDSContext *fin);
+  /**
+   * Handle one batch of a full fetch: issue the read for the next batch
+   * first (its start_after only depends on the raw keys, not on the
+   * decode), then decode this one while that read is in flight.
+   *
+   * @param hdrbl the omap header, non-null on the first batch only
+   */
+  void _omap_fetch_batch(version_t omap_version, ceph::buffer::list *hdrbl,
+			 std::map<std::string, ceph::buffer::list>& batch,
+			 bool more, MDSContext *fin, int r);
+  /// Consume the omap header and set up @p st.  False if the frag went bad.
+  bool _omap_fetch_init(fetch_state_t& st, ceph::buffer::list& hdrbl, bool complete);
+  /// Load one batch of omap entries into the cache.
+  void _omap_decode_batch(fetch_state_t& st,
+			  std::map<std::string, ceph::buffer::list>& batch,
+			  bool complete, const std::set<std::string>& keys,
+			  std::vector<string_snap_t>& null_keys);
+  /// Wake waiters, mark complete and drop the fetch's auth pin.
+  void _omap_fetch_finish(fetch_state_t& st, bool complete,
+			  std::vector<string_snap_t>& null_keys, int r);
   CDentry *_load_dentry(
       std::string_view key,
       std::string_view dname,
@@ -683,12 +755,10 @@ protected:
    */
   void go_bad(bool complete);
 
-  void _omap_fetched(ceph::buffer::list& hdrbl, std::map<std::string, ceph::buffer::list>& omap,
-		     bool complete, const std::set<std::string>& keys, int r);
-
   // -- commit --
   void _commit(version_t want, int op_prio);
   void _omap_commit_ops(int r, int op_prio, int64_t metapool, version_t version, bool _new,
+			bufferlist &header, snapid_t snap_purged_thru,
 			std::vector<dentry_commit_item> &to_set, bufferlist &dfts,
 			std::vector<std::string> &to_remove,
 			mempool::mds_co::compact_set<mempool::mds_co::string> &_stale);
@@ -697,7 +767,7 @@ protected:
   void _omap_commit(int op_prio);
   void _parse_dentry(CDentry *dn, dentry_commit_item &item,
                      const std::set<snapid_t> *snaps, bufferlist &bl);
-  void _committed(int r, version_t v);
+  void _committed(int r, version_t v, snapid_t snap_purged_thru);
 
   static fnode_const_ptr empty_fnode;
   // fnode is a pointer to constant fnode_t, the constant fnode_t can be shared
@@ -726,6 +796,9 @@ protected:
   version_t committed_version = 0;
 
   mempool::mds_co::compact_set<mempool::mds_co::string> stale_items;
+  // A completed fetch can certify a purge before its removals reach disk.
+  // Keep that progress out of fnode (and hence journal records) until acked.
+  snapid_t pending_snap_purge_target = 0;
 
   // lock nesting, freeze
   static int num_frozen_trees;
