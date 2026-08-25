@@ -1719,13 +1719,42 @@ inline std::enable_if_t<traits::supported && traits::need_contiguous> decode(
 {
   if (p.end())
     throw ceph::buffer::end_of_buffer();
-  // ensure we get a contigous buffer... until the end of the
-  // ceph::buffer::list.  we don't really know how much we'll need here,
-  // unfortunately.  hopefully it is already contiguous and we're just
-  // bumping the raw ref and initializing the ptr tmp fields.
+  const auto remaining = p.get_bl().length() - p.get_off();
+
+  // We need a contiguous buffer but have no idea how many bytes this
+  // object occupies, so the only always-correct answer is "everything
+  // that is left".  That is free when the remainder happens to live in a
+  // single bufferptr -- copy_shallow() just bumps the raw's refcount --
+  // but otherwise it linearizes the whole tail.  Paying that once per
+  // object turns decoding n objects out of one list into O(n^2).
+  //
+  // So try the contiguous run the iterator is already sitting in first.
+  // Whenever the object fits inside it, which is the overwhelmingly
+  // common case, we get the refcount-bump path.  When it does not, the
+  // short buffer makes the decode raise end_of_buffer and we fall back
+  // to linearizing the tail below -- exactly what we used to do
+  // unconditionally.  Note this relies on denc decoders overwriting
+  // their target rather than appending to it, which is true throughout.
+  const char *dummy;
+  auto probe = p;
+  const size_t run = probe.get_ptr_and_advance(remaining, &dummy);
+  if (run > 0 && run < remaining) {
+    ceph::buffer::ptr tmp;
+    auto t = p;
+    t.copy_shallow(run, tmp);
+    auto cp = std::cbegin(tmp);
+    try {
+      traits::decode(o, cp);
+      p += cp.get_offset();
+      return;
+    } catch (const ceph::buffer::end_of_buffer&) {
+      // the object straddles the end of this bufferptr
+    }
+  }
+
   ceph::buffer::ptr tmp;
   auto t = p;
-  t.copy_shallow(p.get_bl().length() - p.get_off(), tmp);
+  t.copy_shallow(remaining, tmp);
   auto cp = std::cbegin(tmp);
   traits::decode(o, cp);
   p += cp.get_offset();
