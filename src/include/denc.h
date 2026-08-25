@@ -25,6 +25,7 @@
 #ifndef _ENC_DEC_H
 #define _ENC_DEC_H
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cstring>
@@ -1007,7 +1008,7 @@ namespace _denc {
 			      ceph::buffer::ptr::const_iterator& p,
 			      uint64_t f=0) {
       s.clear();
-      Details::reserve(s, num);
+      Details::reserve(s, std::min<size_t>(num, p.get_end() - p.get_pos()));
       while (num--) {
 	T t;
 	denc(t, p, f);
@@ -1019,7 +1020,7 @@ namespace _denc {
     decode_nohead(size_t num, container& s,
 		  ceph::buffer::list::const_iterator& p) {
       s.clear();
-      Details::reserve(s, num);
+      Details::reserve(s, std::min<size_t>(num, p.get_remaining()));
       while (num--) {
 	T t;
 	denc(t, p);
@@ -1028,19 +1029,16 @@ namespace _denc {
     }
   };
 
+  // Note: this used to probe denc_traits<T> -- rather than T itself --
+  // for a member called `reserve`, and did so with the signature of a
+  // free function returning the container.  It therefore answered false
+  // for every container, and decode_nohead() silently skipped the
+  // reserve() call it is supposed to make.
   template<typename T>
-  class container_has_reserve {
-    template<typename U, U> struct SFINAE_match;
-    template<typename U>
-    static std::true_type test(SFINAE_match<T(*)(typename T::size_type),
-			       &U::reserve>*);
-
-    template<typename U>
-    static std::false_type test(...);
-
-  public:
-    static constexpr bool value = decltype(
-      test<denc_traits<T>>(0))::value;
+  struct container_has_reserve {
+    static constexpr bool value = requires (T& t, typename T::size_type n) {
+      t.reserve(n);
+    };
   };
   template<typename T>
   inline constexpr bool container_has_reserve_v =
