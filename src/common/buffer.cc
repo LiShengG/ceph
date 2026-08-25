@@ -1383,15 +1383,21 @@ static ceph::spinlock debug_lock;
   buffer::list::reserve_t buffer::list::obtain_contiguous_space(
     const unsigned len)
   {
-    // note: if len < the normal append_buffer size it *might*
-    // be better to allocate a normal-sized append_buffer and
-    // use part of it.  however, that optimizes for the case of
-    // old-style types including new-style types.  and in most
-    // such cases, this won't be the very first thing encoded to
-    // the list, so append_buffer will already be allocated.
-    // OTOH if everything is new-style, we *should* allocate
-    // only what we need and conserve memory.
+    // For a small request, grab a normal-sized append_buffer and hand out
+    // a slice of it, exactly like append() does.  Allocating precisely
+    // `len` conserves memory for a single large object, but when a list
+    // is fed only by new-style (denc) encoders it never acquires an
+    // append_buffer at all: every object lands in its own bufferptr, so
+    // the list ends up with one segment per object.  That wrecks anything
+    // that later walks the list -- notably the decode bridge, whose
+    // copy_shallow() then has to linearize the remaining bytes for every
+    // single object.  Above the append_buffer size the old behaviour is
+    // still the right one: allocate exactly what was asked for.
     if (unlikely(get_append_buffer_unused_tail_length() < len)) {
+      if (len < CEPH_BUFFER_APPEND_SIZE) {
+	auto& new_back = refill_append_space(len);
+	return { new_back.end_c_str(), &new_back._len, &_len };
+      }
       auto new_back = \
 	buffer::ptr_node::create(buffer::create(len)).release();
       new_back->set_length(0);   // unused, so far.
