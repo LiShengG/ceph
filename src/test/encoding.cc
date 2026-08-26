@@ -543,3 +543,43 @@ TEST(small_encoding, lba) {
   }
 
 }
+
+// ---------------------------------------------------------------------------
+// encode(std::vector<uint8_t>) must take its argument by const reference.
+//
+// The overload below appends the whole vector in one go.  A non-const
+// parameter is simply not viable for a const argument, so a const vector would
+// quietly fall through to the generic denc container path and be copied one
+// byte at a time -- same bytes on the wire, several times the cost.
+//
+// Taking the address with an exact 2-parameter function type only resolves if
+// the non-template const overload exists; the denc bridge template has a third
+// (defaulted) `features` parameter and cannot match.  A regression here is a
+// build failure rather than a test failure, which is the point.
+// ---------------------------------------------------------------------------
+using bulk_u8_vector_encode_t =
+  void (*)(const std::vector<uint8_t>&, ceph::bufferlist&);
+static_assert(
+  std::is_same_v<bulk_u8_vector_encode_t,
+                 decltype(static_cast<bulk_u8_vector_encode_t>(&ceph::encode))>,
+  "encode(std::vector<uint8_t>) must take a const reference");
+
+TEST(EncodingRoundTrip, ConstVectorUint8MatchesNonConst) {
+  std::vector<uint8_t> v(64 * 1024);
+  for (size_t i = 0; i < v.size(); ++i) {
+    v[i] = static_cast<uint8_t>(i * 31);
+  }
+  const std::vector<uint8_t>& cv = v;
+
+  bufferlist from_mutable, from_const;
+  encode(v, from_mutable);
+  encode(cv, from_const);
+
+  ASSERT_EQ(from_mutable.length(), from_const.length());
+  ASSERT_TRUE(from_mutable.contents_equal(from_const));
+
+  std::vector<uint8_t> out;
+  auto p = from_const.cbegin();
+  decode(out, p);
+  ASSERT_EQ(v, out);
+}

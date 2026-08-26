@@ -26,6 +26,7 @@
 #include "gtest/gtest.h"
 
 #include "include/denc.h"
+#include "include/interval_set.h"
 
 #include <boost/container/flat_map.hpp>
 #include <boost/container/flat_set.hpp>
@@ -800,4 +801,197 @@ TEST(denc, compat_disallows)
   v1.a = 111; v1.b = 111;
   auto bpi = bl.front().begin();
   ASSERT_ANY_THROW(denc(v1,bpi));
+}
+
+// ---------------------------------------------------------------------------
+// denc_traits<> flag regressions
+//
+// `bounded` and `need_contiguous` are pure performance switches.  Getting
+// either wrong still encodes and decodes correctly and still produces
+// byte-identical output, so nothing except an explicit assertion catches a
+// regression:
+//
+//   bounded == false        container bound_encode() degrades from a single
+//                           O(1) size computation to an O(n) walk over every
+//                           element (see _denc::container_base::bound_encode).
+//
+//   need_contiguous == true decode() from a bufferlist linearizes the whole
+//                           remaining tail into one buffer before it can start
+//                           (see the two ceph::decode() overloads in denc.h)
+//                           instead of walking the segments in place.
+// ---------------------------------------------------------------------------
+
+// Map-like containers have a value_type of std::pair<const K, V>.  If
+// denc_traits<std::pair<A, B>> derives its flags from denc_traits<A> without
+// stripping that const, A resolves to the unspecialized primary template and
+// drags bounded/need_contiguous to their pessimistic values for every map.
+static_assert(denc_traits<std::pair<const uint64_t, uint64_t>>::supported);
+static_assert(denc_traits<std::pair<const uint64_t, uint64_t>>::bounded);
+static_assert(!denc_traits<std::pair<const uint64_t, uint64_t>>::need_contiguous);
+static_assert(denc_traits<std::pair<const uint64_t, uint64_t>>::bounded ==
+              denc_traits<std::pair<uint64_t, uint64_t>>::bounded);
+static_assert(denc_traits<std::pair<const uint64_t, uint64_t>>::need_contiguous ==
+              denc_traits<std::pair<uint64_t, uint64_t>>::need_contiguous);
+static_assert(std::is_same_v<std::map<uint64_t, uint64_t>::value_type,
+                             std::pair<const uint64_t, uint64_t>>,
+              "the assertions above only mean something while this holds");
+
+// ... which is what the map itself, and anything built on top of it, inherits.
+static_assert(!denc_traits<std::map<uint64_t, uint64_t>>::need_contiguous);
+static_assert(!denc_traits<boost::container::flat_map<uint64_t, uint64_t>>::need_contiguous);
+static_assert(!denc_traits<std::map<std::string, uint64_t>>::need_contiguous);
+static_assert(!denc_traits<std::vector<std::map<uint64_t, uint64_t>>>::need_contiguous);
+static_assert(!denc_traits<std::map<uint64_t, std::map<uint64_t, uint64_t>>>::need_contiguous);
+
+// A map of a fixed-size element type must stay eligible for the O(1) bound.
+static_assert(denc_traits<std::map<uint32_t, uint64_t>>::traits::bounded);
+
+// interval_set<> hand-writes its traits.  Its need_contiguous must be derived
+// from the underlying map; denc_traits<> takes one type plus a SFINAE slot,
+// so handing it a second real type only ever matches the primary template.
+static_assert(denc_traits<interval_set<uint64_t>>::supported);
+static_assert(!denc_traits<interval_set<uint64_t>>::need_contiguous);
+static_assert(denc_traits<interval_set<uint64_t>>::need_contiguous ==
+              denc_traits<std::map<uint64_t, uint64_t>>::need_contiguous);
+
+namespace {
+
+// _denc::has_legacy_denc<T> drives need_contiguous for WRITE_CLASS_DENC types.
+// It only matches a public, void-returning decode() taking exactly
+// ceph::buffer::list::const_iterator&.  Every near miss -- a non-const
+// iterator, a non-void return, a private declaration -- still compiles and
+// still decodes, it just silently reinstates the linearizing path.
+struct legacy_denc_probe_t {
+  uint32_t v = 0;
+  void bound_encode(size_t& p) const { p += sizeof(v); }
+  void encode(ceph::buffer::list::contiguous_appender& p) const { denc(v, p); }
+  void decode(ceph::buffer::ptr::const_iterator& p) { denc(v, p); }
+  void decode(ceph::buffer::list::const_iterator& p) { ceph::decode(v, p); }
+};
+
+// The same type without the bufferlist overload: need_contiguous is expected
+// to be true here, which is what makes the assertion above meaningful.
+struct contiguous_only_probe_t {
+  uint32_t v = 0;
+  void bound_encode(size_t& p) const { p += sizeof(v); }
+  void encode(ceph::buffer::list::contiguous_appender& p) const { denc(v, p); }
+  void decode(ceph::buffer::ptr::const_iterator& p) { denc(v, p); }
+};
+
+} // anonymous namespace
+
+WRITE_CLASS_DENC(legacy_denc_probe_t)
+WRITE_CLASS_DENC(contiguous_only_probe_t)
+
+static_assert(_denc::has_legacy_denc<legacy_denc_probe_t>::value,
+              "canonical decode(bufferlist::const_iterator&) must be detected");
+static_assert(!denc_traits<legacy_denc_probe_t>::need_contiguous);
+static_assert(!_denc::has_legacy_denc<contiguous_only_probe_t>::value);
+static_assert(denc_traits<contiguous_only_probe_t>::need_contiguous);
+
+namespace {
+
+// Fixed-size element whose bound_encode() is observable, so we can tell the
+// O(1) and the O(n) bound_encode paths apart without timing anything.
+int g_counted_bound_encode_calls = 0;
+
+struct counted_bounded_t {
+  uint64_t v = 0;
+  void bound_encode(size_t& p) const {
+    ++g_counted_bound_encode_calls;
+    p += sizeof(v);
+  }
+  void encode(ceph::buffer::list::contiguous_appender& p) const { denc(v, p); }
+  void decode(ceph::buffer::ptr::const_iterator& p) { denc(v, p); }
+  bool operator==(const counted_bounded_t&) const = default;
+};
+
+} // anonymous namespace
+
+WRITE_CLASS_DENC_BOUNDED(counted_bounded_t)
+
+static_assert(denc_traits<std::map<uint64_t, counted_bounded_t>>::traits::bounded);
+
+TEST(denc, map_bound_encode_is_constant_time)
+{
+  std::map<uint64_t, counted_bounded_t> m;
+  for (uint64_t i = 0; i < 1000; ++i) {
+    m[i] = counted_bounded_t{i};
+  }
+
+  g_counted_bound_encode_calls = 0;
+  size_t bound = 0;
+  denc(m, bound);
+
+  // One probe element, scaled by the element count -- not one call per element.
+  EXPECT_EQ(1, g_counted_bound_encode_calls);
+  // 4 bytes of count + 1000 * (8 byte key + 8 byte value).
+  EXPECT_EQ(sizeof(uint32_t) + m.size() * 2 * sizeof(uint64_t), bound);
+
+  // The bound must still cover what encode() actually writes.
+  bufferlist bl;
+  ceph::encode(m, bl);
+  EXPECT_LE(bl.length(), bound);
+}
+
+namespace {
+
+// Re-encode `bl` as one bufferptr per byte, then append `tail_bytes` of
+// padding: the shape that makes a linearizing decode expensive, and the shape
+// an OSD message payload actually has.
+bufferlist fragment_with_tail(const bufferlist& bl, size_t tail_bytes)
+{
+  bufferlist out;
+  for (auto it = bl.begin(); !it.end(); ) {
+    char c = *it;
+    ++it;
+    out.append(buffer::copy(&c, 1));
+  }
+  while (tail_bytes) {
+    const size_t chunk = std::min<size_t>(tail_bytes, 4096);
+    out.append(buffer::create(chunk));
+    tail_bytes -= chunk;
+  }
+  return out;
+}
+
+} // anonymous namespace
+
+TEST(denc, decode_map_from_fragmented_bufferlist)
+{
+  std::map<uint64_t, uint64_t> m;
+  for (uint64_t i = 0; i < 64; ++i) {
+    m[i * 7 + 1] = i * i + 3;
+  }
+
+  bufferlist bl;
+  ceph::encode(m, bl);
+  const bufferlist frag = fragment_with_tail(bl, 64 * 1024);
+  ASSERT_GT(frag.get_num_buffers(), 1u);
+
+  std::map<uint64_t, uint64_t> out;
+  auto p = frag.cbegin();
+  ceph::decode(out, p);
+  EXPECT_EQ(m, out);
+  EXPECT_EQ(bl.length(), p.get_off());
+}
+
+TEST(denc, decode_interval_set_from_fragmented_bufferlist)
+{
+  interval_set<uint64_t> s;
+  for (uint64_t i = 0; i < 32; ++i) {
+    s.insert(i * 8192, 4096);
+  }
+
+  bufferlist bl;
+  ceph::encode(s, bl);
+  const bufferlist frag = fragment_with_tail(bl, 64 * 1024);
+  ASSERT_GT(frag.get_num_buffers(), 1u);
+
+  interval_set<uint64_t> out;
+  auto p = frag.cbegin();
+  ceph::decode(out, p);
+  EXPECT_EQ(s, out);
+  EXPECT_EQ(s.size(), out.size());
+  EXPECT_EQ(bl.length(), p.get_off());
 }

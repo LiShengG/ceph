@@ -437,7 +437,7 @@ class interval_set {
       _size += p.second;
     }
   }
-  void decode(ceph::buffer::list::iterator& p) {
+  void decode(ceph::buffer::list::const_iterator& p) {
     denc(m, p);
     _size = 0;
     for (const auto& p : m) {
@@ -978,7 +978,10 @@ public:
   static constexpr bool supported = true;
   static constexpr bool bounded = false;
   static constexpr bool featured = false;
-  static constexpr bool need_contiguous = denc_traits<T, C<T,T>>::need_contiguous;
+  // denc_traits<> takes a single type plus a SFINAE slot that must stay void;
+  // passing the map as the second argument would only ever match the
+  // unspecialized primary template and pin need_contiguous to true.
+  static constexpr bool need_contiguous = denc_traits<C<T,T>>::need_contiguous;
   static void bound_encode(const container_t& v, size_t& p) {
     v.bound_encode(p);
   }
@@ -991,7 +994,7 @@ public:
   }
   template<typename U=T>
     static typename std::enable_if<sizeof(U) && !need_contiguous>::type
-  decode(container_t& v, ceph::buffer::list::iterator& p) {
+  decode(container_t& v, ceph::buffer::list::const_iterator& p) {
     v.decode(p);
   }
   static void encode_nohead(const container_t& v,
