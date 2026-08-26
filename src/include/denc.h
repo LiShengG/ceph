@@ -249,7 +249,13 @@ template<typename T> int DencDumper<T>::i = 0;
     rebuild a contigous one if the decoded ceph::buffer::list is segmented. If you are
     concerned about the cost, you might want to define yet another method:
 
-    void decode(ceph::buffer::list::iterator &p);
+    void decode(ceph::buffer::list::const_iterator &p);
+
+    The signature must match exactly: the detector (_denc::has_legacy_denc)
+    looks for a public, void-returning decode() taking
+    ceph::buffer::list::const_iterator&.  A near-miss (non-const iterator,
+    non-void return, private access) still compiles, but silently leaves
+    need_contiguous=true and the linearizing decode path in place.
 
   - These can be defined either explicitly (as above), or can be "magically"
   defined all in one go using the DENC macro and DENC_{START,FINISH} helpers
@@ -874,7 +880,12 @@ template<typename A, typename B>
 struct denc_traits<
   std::pair<A, B>,
   std::enable_if_t<denc_supported<std::remove_const_t<A>> && denc_supported<B>>> {
-  typedef denc_traits<A> a_traits;
+  // NOTE: strip the const that map-like containers put on the key half of
+  // their value_type (std::pair<const K, V>).  The enable_if above already
+  // does this; forgetting it here would silently resolve to the unspecialized
+  // denc_traits<> primary template, leaving bounded=false and
+  // need_contiguous=true for every std::map/flat_map.
+  typedef denc_traits<std::remove_const_t<A>> a_traits;
   typedef denc_traits<B> b_traits;
 
   static constexpr bool supported = true;

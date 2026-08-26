@@ -250,7 +250,10 @@ inline void encode(const char *s, bufferlist& bl)
 }
 
 // opaque byte vectors
-inline void encode(std::vector<uint8_t>& v, bufferlist& bl)
+// NOTE: keep this taking a const reference.  A non-const parameter is not
+// viable for a const argument, which then falls through to the generic denc
+// container path and copies the vector one byte at a time.
+inline void encode(const std::vector<uint8_t>& v, bufferlist& bl)
 {
   uint32_t len = v.size();
   encode(len, bl);
