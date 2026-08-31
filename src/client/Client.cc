@@ -7969,8 +7969,14 @@ int Client::path_walk(InodeRef dirinode, const filepath& origpath,
   int symlinks = 0;
   unsigned i = 0;
 
-  if (trimmed_path == "") {
-    std::string trimmed_path = path.get_trimmed_path();
+  /*
+   * trimmed_path only feeds the two ldout()s below, and building it copies
+   * the whole path string.  Skip it unless someone is actually listening.
+   * (This used to declare a shadowing local, so the assignment was thrown
+   * away and both messages printed an empty path.)
+   */
+  if (trimmed_path.empty() && ldlog_p1(cct, ceph_subsys_client, 10)) {
+    trimmed_path = path.get_trimmed_path();
   }
 
   ldout(cct, 10) << __func__ << ": cur=" << *diri << " path=" << binstrprint(trimmed_path) << dendl;
