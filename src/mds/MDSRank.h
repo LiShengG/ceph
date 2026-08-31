@@ -105,6 +105,15 @@ enum {
   l_mdss_handle_client_caps_dirty,
   l_mdss_handle_client_cap_release,
   l_mdss_process_request_cap_release,
+  l_mds_dir_fetch_complete,
+  l_mds_dir_fetch_latency,
+  l_mds_dir_fetch_decode_latency,
+  l_mds_dir_fetch_batch_latency,
+  l_mds_dir_fetch_batches,
+  l_mds_dir_fetch_omap_bytes,
+  l_mds_dir_fetch_peak_omap_bytes,
+  l_mds_dir_fetch_decode_errors_after_next_read,
+  l_mds_dir_fetch_version_changed,
   l_mds_last,
 };
 

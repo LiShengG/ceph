@@ -22,8 +22,10 @@
 #include <set>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "common/bloom_filter.hpp"
+#include "common/ceph_time.h"
 #include "common/config.h"
 #include "include/buffer_fwd.h"
 #include "include/counter.h"
@@ -650,9 +652,45 @@ protected:
   friend class C_IO_Dir_Committed;
   friend class C_IO_Dir_Commit_Ops;
 
+  /** State carried across all batches of one full dirfrag fetch. */
+  struct fetch_state_t {
+    version_t omap_version = 0;
+    ceph::mono_time started = ceph::mono_clock::zero();
+    ceph::timespan decode_latency = ceph::timespan::zero();
+    uint64_t batches = 0;
+    uint64_t omap_bytes = 0;
+    uint64_t peak_omap_bytes = 0;
+    bool pipelined = true;
+    bool version_changed = false;
+    bool force_dirty = false;
+    bool filter_snaps = false;
+    bool advance_snap_purged_thru = false;
+    snapid_t snap_purged_thru_target = 0;
+    std::set<snapid_t> snaps;
+    double rand_threshold = 0;
+    std::list<CInode*> undef_inodes;
+    unsigned pos = 0;
+    int count = 0;
+    std::string cursor;
+    std::map<std::string, ceph::buffer::list> pending;
+  };
+  std::unique_ptr<fetch_state_t> fetch_state;
+
   void _omap_fetch(MDSContext *fin, const std::set<dentry_key_t>& keys);
-  void _omap_fetch_more(version_t omap_version, bufferlist& hdrbl,
-			map<string, bufferlist>& omap, MDSContext *fin);
+  /// Submit the next read, returning false when a test delay deferred it.
+  bool _omap_fetch_more(version_t omap_version, std::string_view start_after,
+			 MDSContext *fin);
+  void _omap_fetch_batch(version_t omap_version, ceph::buffer::list *hdrbl,
+			 std::map<std::string, ceph::buffer::list>& batch,
+			 bool more, MDSContext *fin, int r,
+			 ceph::mono_time request_started,
+			 ceph::timespan request_latency);
+  bool _omap_fetch_init(fetch_state_t& st, ceph::buffer::list& hdrbl,
+			bool complete);
+  void _omap_decode_batch(fetch_state_t& st,
+			  std::map<std::string, ceph::buffer::list>& batch,
+			  bool complete, bool next_read_issued = false);
+  void _omap_fetch_finish(fetch_state_t& st, bool complete, int r);
   CDentry *_load_dentry(
       std::string_view key,
       std::string_view dname,
@@ -667,9 +705,6 @@ protected:
    * Go bad due to a damaged header (register with damagetable and go BADFRAG)
    */
   void go_bad(bool complete);
-
-  void _omap_fetched(ceph::buffer::list& hdrbl, std::map<std::string, ceph::buffer::list>& omap,
-		     bool complete, int r);
 
   // -- commit --
   void _commit(version_t want, int op_prio);

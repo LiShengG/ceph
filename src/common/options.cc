@@ -8374,6 +8374,49 @@ std::vector<Option> get_mds_options() {
     .set_default(16384)
     .set_description("number of directory entries to read in one RADOS operation"),
 
+    Option("mds_dir_fetch_pipelined", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
+    .set_default(true)
+    .set_description("issue the next batch of a directory fetch before decoding the current one")
+    .set_long_description("Fetching a large dirfrag takes several omap reads. With this enabled "
+                          "the MDS overlaps decoding each batch with the next read and retains "
+                          "only one encoded batch. Disable it to restore buffered fetching.")
+    .set_flag(Option::FLAG_RUNTIME),
+
+    Option("mds_inject_dir_fetch_error_after_batches", Option::TYPE_INT,
+           Option::LEVEL_DEV)
+    .set_default(0)
+    .set_description("fail a full dirfrag fetch with -EIO after this many batches")
+    .set_long_description("For testing only. When non-zero, the Nth batch of a full "
+                          "dirfrag fetch is treated as if the OSD returned -EIO. Zero "
+                          "disables the injection.")
+    .add_see_also("mds_dir_fetch_pipelined")
+    .set_flag(Option::FLAG_RUNTIME),
+
+    Option("mds_inject_dir_fetch_mark_dirty_after_batches", Option::TYPE_INT,
+           Option::LEVEL_DEV)
+    .set_default(0)
+    .set_description("mark a dirfrag dirty after this many fetch batches")
+    .set_long_description("For testing only. When non-zero, the Nth batch of a full "
+                          "dirfrag fetch marks the fragment dirty so a journal flush "
+                          "can produce a real concurrent committed-version change. "
+                          "Zero disables the injection.")
+    .add_see_also("mds_dir_fetch_pipelined")
+    .set_flag(Option::FLAG_RUNTIME),
+
+    // v16's runtime parser represents TYPE_MILLISECS updates as uint64_t,
+    // while the typed getter expects std::chrono::milliseconds.  Keep this
+    // dev-only injection as an explicitly millisecond-valued uint option so
+    // live config updates cannot leave a mismatched variant.
+    Option("mds_inject_dir_fetch_batch_delay", Option::TYPE_UINT,
+           Option::LEVEL_DEV)
+    .set_default(0)
+    .set_description("delay each subsequent dirfrag fetch batch")
+    .set_long_description("For testing only. When non-zero, the MDS waits this many "
+                          "milliseconds before issuing the next batch of a full dirfrag "
+                          "fetch. Zero disables the delay.")
+    .add_see_also("mds_dir_fetch_pipelined")
+    .set_flag(Option::FLAG_RUNTIME),
+
     Option("mds_decay_halflife", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
     .set_default(5)
     .set_description("rate of decay for temperature counters on each directory for balancing"),

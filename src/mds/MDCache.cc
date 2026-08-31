@@ -6872,6 +6872,12 @@ bool MDCache::trim_dentry(CDentry *dn, expiremap& expiremap)
 
   CDir *dir = dn->get_dir();
   ceph_assert(dir);
+
+  // A full dirfrag fetch may decode OMAP entries a batch at a time.  Once a
+  // batch advances the OMAP cursor, trimming one of its dentries would make
+  // that entry permanently absent when the fetch marks the dir complete.
+  if (dir->state_test(CDir::STATE_FETCHING))
+    return true;
   
   CDir *con = get_subtree_root(dir);
   if (con)

@@ -3405,6 +3405,33 @@ void MDSRank::create_logger()
     mds_plb.add_u64(l_mds_root_rbytes, "root_rbytes", "root inode rbytes");
     mds_plb.add_u64(l_mds_root_rsnaps, "root_rsnaps", "root inode rsnaps");
     mds_plb.add_u64_counter(l_mds_dir_fetch, "dir_fetch", "Directory fetch");
+    mds_plb.add_u64_counter(l_mds_dir_fetch_complete,
+			    "dir_fetch_complete", "Fetch complete dirfrag");
+    mds_plb.add_time_avg(l_mds_dir_fetch_latency, "dir_fetch_latency",
+			 "Full dirfrag fetch latency");
+    mds_plb.add_time_avg(l_mds_dir_fetch_decode_latency,
+			 "dir_fetch_decode_latency",
+			 "Time spent decoding batches in full dirfrag fetches");
+    mds_plb.add_time_avg(l_mds_dir_fetch_batch_latency,
+			 "dir_fetch_batch_latency",
+			 "Latency of dirfrag OMAP batch reads");
+    mds_plb.add_u64_counter(l_mds_dir_fetch_batches, "dir_fetch_batches",
+			    "OMAP batches read by full dirfrag fetches");
+    mds_plb.add_u64_counter(
+	l_mds_dir_fetch_omap_bytes, "dir_fetch_omap_bytes",
+	"Encoded OMAP key and value bytes read by full dirfrag fetches",
+	NULL, PerfCountersBuilder::PRIO_USEFUL, UNIT_BYTES);
+    mds_plb.add_u64_counter(
+	l_mds_dir_fetch_peak_omap_bytes, "dir_fetch_peak_omap_bytes",
+	"Peak encoded OMAP key and value bytes retained per full dirfrag fetch",
+	NULL, PerfCountersBuilder::PRIO_USEFUL, UNIT_BYTES);
+    mds_plb.add_u64_counter(
+	l_mds_dir_fetch_version_changed, "dir_fetch_version_changed",
+	"Pipelined dirfrag fetches that observed a concurrent commit");
+    mds_plb.add_u64_counter(
+	l_mds_dir_fetch_decode_errors_after_next_read,
+	"dir_fetch_decode_errors_after_next_read",
+	"Dentry decode errors observed after the next OMAP read was issued");
     mds_plb.add_u64_counter(l_mds_dir_commit, "dir_commit", "Directory commit");
     mds_plb.add_u64_counter(l_mds_dir_split, "dir_split", "Directory split");
     mds_plb.add_u64_counter(l_mds_dir_merge, "dir_merge", "Directory merge");
