@@ -10030,7 +10030,7 @@ int Client::readdir_r_cb(dir_result_t* d,
   unsigned flags,
   bool getref)
 {
-  auto fill_readdir_cb = [](dir_result_t* dirp,
+  auto fill_readdir_cb = [this](dir_result_t* dirp,
 			    MetaRequest* req,
 			    InodeRef& diri,
 			    frag_t fg) {
@@ -10040,6 +10040,16 @@ int Client::readdir_r_cb(dir_result_t* d,
     req->set_inode(diri.get());
     req->head.args.readdir.frag = fg;
     req->head.args.readdir.flags = CEPH_READDIR_REPLY_BITFLAGS;
+    /*
+     * Left at zero the MDS picks the chunk size for us (its own
+     * 512KB-ish byte budget), and a client walking a big directory has no
+     * way to trade round trips against reply size.  Both are per round
+     * trip, not per entry, so reading the config here is free.
+     */
+    req->head.args.readdir.max_entries = (uint32_t)
+      cct->_conf.get_val<uint64_t>("client_readdir_max_entries");
+    req->head.args.readdir.max_bytes = (uint32_t)(uint64_t)
+      cct->_conf.get_val<Option::size_t>("client_readdir_max_bytes");
     if (dirp->last_name.length()) {
       req->path2.set_path(dirp->last_name);
     } else if (dirp->hash_order()) {

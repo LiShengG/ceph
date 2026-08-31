@@ -328,6 +328,30 @@ options:
   flags:
   - startup
   with_legacy: true
+- name: client_readdir_max_entries
+  type: uint
+  level: advanced
+  desc: Maximum number of dentries to ask the MDS for in one readdir reply
+  long_desc: Zero lets the MDS decide, which in practice means it fills the reply
+    up to its own byte budget. Raising this trades a larger reply for fewer round
+    trips when walking large directories.
+  default: 0
+  services:
+  - mds_client
+  flags:
+  - runtime
+- name: client_readdir_max_bytes
+  type: size
+  level: advanced
+  desc: Maximum size of a single readdir reply to ask the MDS for
+  long_desc: Zero lets the MDS decide (it uses roughly 512KB plus the maximum xattr
+    size). Raising this reduces the number of round trips needed to walk a large
+    directory at the cost of larger replies.
+  default: 0
+  services:
+  - mds_client
+  flags:
+  - runtime
 - name: client_force_lazyio
   type: bool
   level: advanced
