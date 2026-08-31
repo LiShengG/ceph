@@ -12149,6 +12149,13 @@ int Client::write(int fd, const char *buf, loff_t size, loff_t offset)
   tout(cct) << size << std::endl;
   tout(cct) << offset << std::endl;
 
+  /* We can't return bytes written larger than INT_MAX. */
+  size = std::min(size, (loff_t)INT_MAX);
+
+  /* copy the payload in before taking client_lock; see _gather_iovec() */
+  bufferlist bl;
+  bl.append(buf, size);
+
   std::scoped_lock lock(client_lock);
   Fh *fh = get_filehandle(fd);
   if (!fh)
@@ -12157,20 +12164,11 @@ int Client::write(int fd, const char *buf, loff_t size, loff_t offset)
   if (fh->flags & O_PATH)
     return -EBADF;
 #endif
-#if defined(__linux__)
-  /* We can't return bytes written larger than INT_MAX, clamp size to
-   * that or FSCRYPT_MAXIO_SIZE*/
-  Inode *in = fh->inode.get();
-  if (in->is_fscrypt_enabled()) {
-    size = std::min(size, (loff_t)FSCRYPT_MAXIO_SIZE);
-  } else {
-    size = std::min(size, (loff_t)INT_MAX);
+  size_t clamp = _io_size_clamp(fh);
+  if (size > 0 && (size_t)size > clamp) {
+    bl.splice(clamp, (size_t)size - clamp);
+    size = (loff_t)clamp;
   }
-#else
-  size = std::min(size, (loff_t)INT_MAX);
-#endif
-  bufferlist bl;
-  bl.append(buf, size);
   int r = _write(fh, offset, size, std::move(bl));
   ldout(cct, 3) << "write(" << fd << ", \"...\", " << size << ", " << offset << ") = " << r << dendl;
   return r;
@@ -12181,11 +12179,53 @@ int Client::pwritev(int fd, const struct iovec *iov, int iovcnt, int64_t offset)
   return _preadv_pwritev(fd, iov, iovcnt, offset, true);
 }
 
+size_t Client::_io_size_clamp(Fh *fh)
+{
+#if defined(__linux__)
+  /* We can't return bytes written larger than INT_MAX, clamp size to
+   * that or FSCRYPT_MAXIO_SIZE*/
+  if (fh->inode->is_fscrypt_enabled())
+    return (size_t)FSCRYPT_MAXIO_SIZE;
+#endif
+  return (size_t)INT_MAX;
+}
+
+/*
+ * Gather a write payload out of the caller's iovec.
+ *
+ * This takes no lock, and the callers run it *before* they acquire
+ * client_lock.  client_lock protects the buffer cache as well as the client,
+ * so copying a multi-megabyte write in while holding it stalls every other
+ * thread in the client for the duration of the memcpy; the read side already
+ * copies out with the lock dropped, see _preadv_pwritev_locked() below.
+ *
+ * The fscrypt bound needs the inode, which the callers cannot look at from
+ * outside the lock, so they clamp to INT_MAX here and the payload is trimmed
+ * to the real bound once the Fh is in hand.
+ */
+size_t Client::_gather_iovec(const struct iovec *iov, int iovcnt, size_t clamp,
+                             bufferlist& bl)
+{
+  size_t total = 0;
+  for (int i = 0; i < iovcnt; i++) {
+    if (iov[i].iov_len == 0)
+      continue;
+    if (total + iov[i].iov_len >= clamp) {
+      bl.append((const char *)iov[i].iov_base, clamp - total);
+      return clamp;
+    }
+    bl.append((const char *)iov[i].iov_base, iov[i].iov_len);
+    total += iov[i].iov_len;
+  }
+  return total;
+}
+
 int64_t Client::_preadv_pwritev_locked(Fh *fh, const struct iovec *iov,
                                        int iovcnt, int64_t offset,
                                        bool write, bool clamp_to_int,
                                        Context *onfinish, bufferlist *blp,
-                                       bool do_fsync, bool syncdataonly)
+                                       bool do_fsync, bool syncdataonly,
+                                       bufferlist *prepared)
 {
     ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
 
@@ -12196,46 +12236,38 @@ int64_t Client::_preadv_pwritev_locked(Fh *fh, const struct iovec *iov,
     if(iovcnt < 0) {
       return -EINVAL;
     }
-    size_t totallen = 0;
-    for (int i = 0; i < iovcnt; i++) {
-        totallen += iov[i].iov_len;
-    }
 
     /*
      * Some of the API functions take 64-bit size values, but only return
      * 32-bit signed integers. Clamp the I/O sizes in those functions so that
      * we don't do I/Os larger than the values we can return.
      */
+    size_t clamp = std::numeric_limits<size_t>::max();
+    if (clamp_to_int)
+      clamp = _io_size_clamp(fh);
+
+    size_t totallen = 0;
     bufferlist data;
-    if (clamp_to_int) {
-#if defined(__linux__)
-  /* We can't return bytes written larger than INT_MAX, clamp size to
-   * that or FSCRYPT_MAXIO_SIZE*/
-      Inode *in = fh->inode.get();
-      if (in->is_fscrypt_enabled()) {
-        totallen = std::min(totallen, (size_t)FSCRYPT_MAXIO_SIZE);
-      } else {
-        totallen = std::min(totallen, (size_t)INT_MAX);
+    if (write && prepared) {
+      /*
+       * The payload was already copied in by the caller, before it took
+       * client_lock.  The caller could not look at the inode to size the
+       * fscrypt bound, so apply the clamp here; for anything but a
+       * ~2GB write to an fscrypt file this is a no-op.
+       */
+      data = std::move(*prepared);
+      totallen = data.length();
+      if (totallen > clamp) {
+        data.splice(clamp, totallen - clamp);
+        totallen = clamp;
       }
-#else
-      totallen = std::min(totallen, (size_t)INT_MAX);
-#endif
-      size_t total_appended = 0;
-      for (int i = 0; i < iovcnt; i++) {
-        if (iov[i].iov_len > 0) {
-          if (total_appended + iov[i].iov_len >= totallen) {
-            data.append((const char *)iov[i].iov_base, totallen - total_appended);
-            break;
-          } else {
-            data.append((const char *)iov[i].iov_base, iov[i].iov_len);
-            total_appended += iov[i].iov_len;
-          }
-        }
-      }
+    } else if (write) {
+      totallen = _gather_iovec(iov, iovcnt, clamp, data);
     } else {
       for (int i = 0; i < iovcnt; i++) {
-        data.append((const char *)iov[i].iov_base, iov[i].iov_len);
+        totallen += iov[i].iov_len;
       }
+      totallen = std::min(totallen, clamp);
     }
 
     if (write) {
@@ -12269,12 +12301,18 @@ int Client::_preadv_pwritev(int fd, const struct iovec *iov, int iovcnt,
     tout(cct) << fd << std::endl;
     tout(cct) << offset << std::endl;
 
+    /* copy the payload in before taking client_lock; see _gather_iovec() */
+    bufferlist data;
+    if (write)
+      _gather_iovec(iov, iovcnt, (size_t)INT_MAX, data);
+
     std::scoped_lock cl(client_lock);
     Fh *fh = get_filehandle(fd);
     if (!fh)
       return -EBADF;
     return _preadv_pwritev_locked(fh, iov, iovcnt, offset, write, true,
-                                  onfinish, blp);
+                                  onfinish, blp, false, false,
+                                  write ? &data : nullptr);
 }
 
 int64_t Client::_write_success(Fh *f, utime_t start, uint64_t fpos,
@@ -17364,22 +17402,22 @@ int Client::ll_write(Fh *fh, loff_t off, loff_t len, const char *data)
     return -ENOTCONN;
   }
 
-#if defined(__linux__)
-  /* We can't return bytes written larger than INT_MAX, clamp size to
-   * that or FSCRYPT_MAXIO_SIZE*/
-  Inode *in = fh->inode.get();
-  if (in->is_fscrypt_enabled()) {
-    len = std::min(len, (loff_t)FSCRYPT_MAXIO_SIZE);
-  } else {
-    len = std::min(len, (loff_t)INT_MAX);
-  }
-#else
+  /* We can't return bytes written larger than INT_MAX. */
   len = std::min(len, (loff_t)INT_MAX);
-#endif
+
+  /* copy the payload in before taking client_lock; see _gather_iovec() */
+  bufferlist bl;
+  bl.append(data, len);
+
   std::scoped_lock lock(client_lock);
   if (fh == NULL || !_ll_fh_exists(fh)) {
     ldout(cct, 3) << "(fh)" << fh << " is invalid" << dendl;
     return -EBADF;
+  }
+  size_t clamp = _io_size_clamp(fh);
+  if (len > 0 && (size_t)len > clamp) {
+    bl.splice(clamp, (size_t)len - clamp);
+    len = (loff_t)clamp;
   }
 
   ldout(cct, 3) << "ll_write " << fh << " " << fh->inode->ino << " " << off <<
@@ -17389,8 +17427,6 @@ int Client::ll_write(Fh *fh, loff_t off, loff_t len, const char *data)
   tout(cct) << off << std::endl;
   tout(cct) << len << std::endl;
 
-  bufferlist bl;
-  bl.append(data, len);
   int r = _write(fh, off, len, std::move(bl));
   ldout(cct, 3) << "ll_write " << fh << " " << off << "~" << len << " = " << r
 		<< dendl;
@@ -17404,12 +17440,17 @@ int64_t Client::ll_writev(struct Fh *fh, const struct iovec *iov, int iovcnt, in
     return -ENOTCONN;
   }
 
+  /* copy the payload in before taking client_lock; see _gather_iovec() */
+  bufferlist data;
+  _gather_iovec(iov, iovcnt, (size_t)INT_MAX, data);
+
   std::scoped_lock cl(client_lock);
   if (fh == NULL || !_ll_fh_exists(fh)) {
     ldout(cct, 3) << "(fh)" << fh << " is invalid" << dendl;
     return -EBADF;
   }
-  return _preadv_pwritev_locked(fh, iov, iovcnt, off, true, true);
+  return _preadv_pwritev_locked(fh, iov, iovcnt, off, true, true, nullptr,
+                                nullptr, false, false, &data);
 }
 
 int64_t Client::ll_readv(struct Fh *fh, const struct iovec *iov, int iovcnt, int64_t off)
@@ -17447,6 +17488,12 @@ int64_t Client::ll_preadv_pwritev(struct Fh *fh, const struct iovec *iov,
     }
 
     retval = 0;
+
+    /* copy the payload in before taking client_lock; see _gather_iovec() */
+    bufferlist data;
+    if (write)
+      _gather_iovec(iov, iovcnt, (size_t)INT_MAX, data);
+
     std::unique_lock cl(client_lock);
 
     if(fh == NULL || !_ll_fh_exists(fh)) {
@@ -17465,7 +17512,8 @@ int64_t Client::ll_preadv_pwritev(struct Fh *fh, const struct iovec *iov,
     }
 
     retval = _preadv_pwritev_locked(fh, iov, iovcnt, offset, write, true,
-                                    onfinish, bl, do_fsync, syncdataonly);
+                                    onfinish, bl, do_fsync, syncdataonly,
+                                    write ? &data : nullptr);
     /* There are two scenarios with each having two cases to handle here
     1) async io
       1.a) r == 0:

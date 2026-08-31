@@ -2152,12 +2152,29 @@ private:
   int64_t _write(Fh *fh, int64_t offset, uint64_t size, bufferlist bl,
           Context *onfinish = nullptr, bool do_fsync = false,
           bool syncdataonly = false);
+  /*
+   * Largest I/O we can do in one call on this file: our return values are
+   * 32-bit signed, and fscrypt additionally wants a block-aligned bound.
+   */
+  static size_t _io_size_clamp(Fh *fh);
+  /*
+   * Copy an iovec into a bufferlist, stopping at 'clamp' bytes; returns how
+   * much was gathered.  Deliberately takes no lock -- callers run it before
+   * they acquire client_lock; see the definition for why.
+   */
+  static size_t _gather_iovec(const struct iovec *iov, int iovcnt,
+                              size_t clamp, bufferlist& bl);
+  /*
+   * 'prepared', when set on a write, holds the payload the caller already
+   * gathered outside client_lock; it is consumed instead of copying here.
+   */
   int64_t _preadv_pwritev_locked(Fh *fh, const struct iovec *iov,
                                  int iovcnt, int64_t offset,
                                  bool write, bool clamp_to_int,
                                  Context *onfinish = nullptr,
                                  bufferlist *blp = nullptr,
-                                 bool do_fsync = false, bool syncdataonly = false);
+                                 bool do_fsync = false, bool syncdataonly = false,
+                                 bufferlist *prepared = nullptr);
   int _preadv_pwritev(int fd, const struct iovec *iov, int iovcnt,
                       int64_t offset, bool write, Context *onfinish = nullptr,
                       bufferlist *blp = nullptr);
