@@ -332,6 +332,30 @@ TEST(LibCephFS, OpenLayout) {
   ceph_shutdown(cmount);
 }
 
+struct readdir_cb_state {
+  std::vector<std::string> names;
+  std::vector<struct Inode *> refs;
+  int inodes = 0;
+  int stop_after = -1;
+};
+
+static int readdir_cb_collect(void *priv, struct dirent *de,
+			      struct ceph_statx *stx, off_t off,
+			      struct Inode *in)
+{
+  readdir_cb_state *s = static_cast<readdir_cb_state *>(priv);
+
+  if (s->stop_after >= 0 && (int)s->names.size() >= s->stop_after)
+    return -EIO;
+
+  s->names.push_back(de->d_name);
+  if (in) {
+    s->inodes++;
+    s->refs.push_back(in);
+  }
+  return 0;
+}
+
 TEST(LibCephFS, DirLs) {
 
   pid_t mypid = getpid();
@@ -522,6 +546,42 @@ TEST(LibCephFS, DirLs) {
     //ASSERT_EQ(st.st_mode, (mode_t)0666);
   }
   ASSERT_EQ(found, entries);
+
+  // test readdirplus_cb: same listing, one call for the whole directory
+  ceph_rewinddir(cmount, ls_dir);
+
+  readdir_cb_state cbs;
+  ASSERT_EQ(ceph_readdirplus_cb(cmount, ls_dir, readdir_cb_collect, &cbs,
+				CEPH_STATX_SIZE, AT_STATX_DONT_SYNC, 0), 0);
+  ASSERT_EQ(cbs.names.size(), entries.size() + 2);
+  ASSERT_EQ(cbs.names[0], ".");
+  ASSERT_EQ(cbs.names[1], "..");
+  ASSERT_EQ(std::vector<std::string>(cbs.names.begin() + 2, cbs.names.end()),
+	    entries);
+  ASSERT_EQ(cbs.inodes, 0);  // getref was 0
+
+  // and again asking for a reference on each inode
+  ceph_rewinddir(cmount, ls_dir);
+
+  readdir_cb_state cbs_ref;
+  ASSERT_EQ(ceph_readdirplus_cb(cmount, ls_dir, readdir_cb_collect, &cbs_ref,
+				CEPH_STATX_SIZE, AT_STATX_DONT_SYNC, 1), 0);
+  ASSERT_EQ(cbs_ref.names, cbs.names);
+  ASSERT_EQ(cbs_ref.inodes, (int)cbs_ref.names.size());
+  for (auto in : cbs_ref.refs)
+    ceph_ll_put(cmount, in);
+
+  // a callback that gives up part way stops the walk and its error comes back
+  ceph_rewinddir(cmount, ls_dir);
+
+  readdir_cb_state cbs_stop;
+  cbs_stop.stop_after = 3;
+  ASSERT_EQ(ceph_readdirplus_cb(cmount, ls_dir, readdir_cb_collect, &cbs_stop,
+				0, AT_STATX_DONT_SYNC, 0), -EIO);
+  ASSERT_EQ(cbs_stop.names.size(), 3u);
+
+  ASSERT_EQ(-EINVAL, ceph_readdirplus_cb(cmount, ls_dir, NULL, NULL, 0,
+					 AT_STATX_DONT_SYNC, 0));
 
   ASSERT_EQ(ceph_closedir(cmount, ls_dir), 0);
 

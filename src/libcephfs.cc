@@ -749,6 +749,21 @@ extern "C" int ceph_readdirplus_r(struct ceph_mount_info *cmount, struct ceph_di
   return cmount->get_client()->readdirplus_r(reinterpret_cast<dir_result_t*>(dirp), de, stx, want, flags, out);
 }
 
+extern "C" int ceph_readdirplus_cb(struct ceph_mount_info *cmount,
+				   struct ceph_dir_result *dirp,
+				   ceph_readdir_cb_t cb, void *priv,
+				   unsigned want, unsigned flags, int getref)
+{
+  if (!cmount->is_mounted())
+    return -ENOTCONN;
+  if (!cb)
+    return -EINVAL;
+  if (flags & ~CEPH_REQ_FLAG_MASK)
+    return -EINVAL;
+  return cmount->get_client()->readdir_r_cb(reinterpret_cast<dir_result_t*>(dirp),
+					    cb, priv, want, flags, getref);
+}
+
 extern "C" int ceph_file_blockdiff_init(struct ceph_mount_info* cmount,
 					const char* root_path,
 					const char* rel_path,

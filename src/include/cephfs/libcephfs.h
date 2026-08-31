@@ -41,8 +41,8 @@ extern "C" {
 #endif
 
 #define LIBCEPHFS_VER_MAJOR 11
-#define LIBCEPHFS_VER_MINOR 0
-#define LIBCEPHFS_VER_EXTRA 1
+#define LIBCEPHFS_VER_MINOR 1
+#define LIBCEPHFS_VER_EXTRA 0
 
 #define LIBCEPHFS_VERSION(maj, min, extra) ((maj << 16) + (min << 8) + extra)
 #define LIBCEPHFS_VERSION_CODE LIBCEPHFS_VERSION(LIBCEPHFS_VER_MAJOR, LIBCEPHFS_VER_MINOR, LIBCEPHFS_VER_EXTRA)
@@ -644,6 +644,49 @@ int ceph_readdir_r(struct ceph_mount_info *cmount, struct ceph_dir_result *dirp,
  */
 int ceph_readdirplus_r(struct ceph_mount_info *cmount, struct ceph_dir_result *dirp, struct dirent *de,
 		       struct ceph_statx *stx, unsigned want, unsigned flags, struct Inode **out);
+
+/**
+ * Callback invoked by ceph_readdirplus_cb() for one directory entry.
+ *
+ * @param priv the opaque pointer handed to ceph_readdirplus_cb.
+ * @param de the directory entry.
+ * @param stx the stats of the file/directory of the entry.
+ * @param off the offset of the *next* entry, i.e. what a later ceph_seekdir
+ *        needs in order to resume just after this one.
+ * @param in NULL unless getref was set, otherwise the entry's inode with a
+ *        reference taken on it, which the caller must release with
+ *        ceph_ll_put().
+ * @returns 0 or more to continue the listing, negative to stop it.  The
+ *          negative value is passed back out of ceph_readdirplus_cb.
+ */
+typedef int (*ceph_readdir_cb_t)(void *priv, struct dirent *de,
+				 struct ceph_statx *stx, off_t off,
+				 struct Inode *in);
+
+/**
+ * Read a whole chunk of a directory in one call, invoking cb per entry.
+ *
+ * ceph_readdirplus_r() returns a single entry per call, and each of those
+ * calls takes the client lock, re-finds the position in the cached chunk and
+ * stats the entry.  For a caller that is walking a directory anyway -- an NFS
+ * or SMB server filling a large READDIR response -- this entry point does the
+ * same work once for the whole chunk instead of once per name.
+ *
+ * @param cmount the ceph mount handle to use.
+ * @param dirp the directory stream pointer from ceph_opendir.
+ * @param cb callback invoked for each entry; see ceph_readdir_cb_t.
+ * @param priv opaque pointer passed through to cb.
+ * @param want mask showing desired inode attrs for returned entries.
+ * @param flags bitmask of flags to use when filling out attributes.
+ * @param getref if non-zero, take a reference on each entry's inode and hand
+ *        it to cb, which makes the caller responsible for ceph_ll_put().
+ * @returns 0 once the end of the directory is reached, or the negative value
+ *          cb stopped with, or a negative error code on failure.
+ */
+int ceph_readdirplus_cb(struct ceph_mount_info *cmount,
+			struct ceph_dir_result *dirp,
+			ceph_readdir_cb_t cb, void *priv,
+			unsigned want, unsigned flags, int getref);
 
 struct ceph_snapdiff_info
 {
