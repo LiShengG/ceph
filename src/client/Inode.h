@@ -4,6 +4,7 @@
 #ifndef CEPH_CLIENT_INODE_H
 #define CEPH_CLIENT_INODE_H
 
+#include <atomic>
 #include <numeric>
 
 #include "include/compat.h"
@@ -285,6 +286,17 @@ struct Inode : RefCountedObject {
   void make_short_path(filepath& p);
   bool make_path_string(std::string& s);
   void make_nosnap_relative_path(filepath& p);
+
+  // Deferred release bookkeeping, owned by Client::put_inode() and
+  // Client::delay_put_inodes().  intrusive_ptr_release() can fire from any
+  // thread and must not take client_lock, so the drop is only counted here
+  // and applied later, under the lock.  'delay_ref' is the number of drops
+  // owed; while 'delay_queued' is set this inode is linked into
+  // Client::delay_i_head through 'delay_next'.  A non-zero 'delay_ref' keeps
+  // nref elevated, so an inode waiting here cannot be freed underneath us.
+  std::atomic<uint32_t> delay_ref{0};
+  std::atomic<bool> delay_queued{false};
+  Inode *delay_next = nullptr;
 
   // The ref count. 1 for each dentry, fh, inode_map,
   // cwd that links to me.

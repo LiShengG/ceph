@@ -2391,8 +2391,10 @@ private:
   uint64_t total_write_ops = 0;
   uint64_t total_write_size = 0;
 
-  ceph::spinlock delay_i_lock;
-  std::map<Inode*,int> delay_i_release;
+  // Head of the multi-producer/single-consumer stack of inodes with drops
+  // owed; see Inode::delay_ref.  Producers are any thread dropping an
+  // InodeRef, the sole consumer is delay_put_inodes() under client_lock.
+  std::atomic<Inode*> delay_i_head{nullptr};
 
   uint64_t nr_metadata_request = 0;
   uint64_t nr_read_request = 0;

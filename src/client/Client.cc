@@ -3703,17 +3703,25 @@ void Client::delay_put_inodes(bool wakeup)
 {
   ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
 
-  std::map<Inode*,int> release;
-  {
-    std::scoped_lock dl(delay_i_lock);
-    release.swap(delay_i_release);
-  }
-
-  if (release.empty())
+  Inode *in = delay_i_head.exchange(nullptr);
+  if (!in)
     return;
 
-  for (auto &[in, cnt] : release)
-    _put_inode(in, cnt);
+  while (in) {
+    /*
+     * Order matters: take the link and clear the queued flag *before*
+     * consuming the count.  An inode we have not reached yet still has
+     * delay_queued set, so no producer will touch its delay_next while we
+     * are walking; and a producer that increments after we clear the flag
+     * re-pushes the inode instead of having its drop stranded here.
+     */
+    Inode *next = in->delay_next;
+    in->delay_queued.store(false);
+    uint32_t n = in->delay_ref.exchange(0);
+    if (n)
+      _put_inode(in, n);
+    in = next;
+  }
 
   if (wakeup)
     mount_cond.notify_all();
@@ -3723,8 +3731,19 @@ void Client::put_inode(Inode *in, int n)
 {
   ldout(cct, 20) << __func__ << " on " << *in << " n = " << n << dendl;
 
-  std::scoped_lock dl(delay_i_lock);
-  delay_i_release[in] += n;
+  /*
+   * Called from intrusive_ptr_release(), i.e. on every InodeRef drop
+   * anywhere in the client.  Keep it off any lock: count the drop on the
+   * inode itself and, if it is not already queued, push it onto the stack
+   * delay_put_inodes() drains.  Only the thread that wins the flag writes
+   * delay_next, so the push is a plain CAS loop.
+   */
+  in->delay_ref.fetch_add(n);
+  if (!in->delay_queued.exchange(true)) {
+    in->delay_next = delay_i_head.load();
+    while (!delay_i_head.compare_exchange_weak(in->delay_next, in))
+      ;
+  }
 }
 
 void Client::close_dir(Dir *dir)
