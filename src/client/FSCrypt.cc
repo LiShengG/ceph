@@ -891,6 +891,43 @@ int FSCryptFNameDenc::get_decrypted_symlink(const std::string& b64enc, std::stri
   return r;
 }
 
+/*
+ * Hand back 'len' contiguous ciphertext bytes at offset 'off' of 'bl'.
+ *
+ * The decryption loop below indexes the ciphertext by absolute offset, and
+ * used to get that from bufferlist::c_str(), which linearizes the whole
+ * list: a full extra allocation plus memcpy of the read, on every read of
+ * an encrypted file.  A read assembled from OSD replies is a handful of
+ * large segments, so a single fscrypt block almost always lands inside one
+ * of them; only fall back to gathering when it does not.  A window running
+ * off the end of the data is zero filled, which is what the caller wants
+ * for a sparse tail and is in any case better defined than the over-read
+ * past the end of the linearized buffer that used to happen there.
+ */
+static const char *fscrypt_ciphertext_at(bufferlist& bl, uint64_t off,
+                                         uint64_t len,
+                                         std::vector<char>& scratch)
+{
+  uint64_t avail = (off < bl.length()) ? bl.length() - off : 0;
+
+  if (avail >= len) {
+    auto it = bl.begin(off);
+    const char *p = nullptr;
+    if (it.get_ptr_and_advance(len, &p) >= len)
+      return p;
+  }
+
+  if (scratch.size() < len)
+    scratch.resize(len);
+  if (avail) {
+    auto it = bl.begin(off);
+    it.copy(std::min(avail, len), scratch.data());
+  }
+  if (avail < len)
+    memset(scratch.data() + avail, 0, len - avail);
+  return scratch.data();
+}
+
 int FSCryptFDataDenc::decrypt_bl(uint64_t off, uint64_t len, uint64_t pos, const std::vector<Segment>& holes, bufferlist *bl)
 {
   auto data_len = bl->length();
@@ -908,6 +945,9 @@ int FSCryptFDataDenc::decrypt_bl(uint64_t off, uint64_t len, uint64_t pos, const
   uint64_t start_block_off = block_off;
 
   auto hiter = holes.begin();
+
+  /* only used when a block window straddles two segments; see above */
+  std::vector<char> scratch;
 
   while (pos < target_end) {
     bool has_hole = false;
@@ -946,8 +986,10 @@ int FSCryptFDataDenc::decrypt_bl(uint64_t off, uint64_t len, uint64_t pos, const
     }
 
     uint64_t needed_pos = (pos > off ? pos : off);
-    void *data_pos = bl->c_str() + needed_pos - start_block_off;
-    if (!has_hole && *(uint64_t *)data_pos == 0) {
+    const char *data_pos = fscrypt_ciphertext_at(*bl,
+                                                 needed_pos - start_block_off,
+                                                 sizeof(uint64_t), scratch);
+    if (!has_hole && *(const uint64_t *)data_pos == 0) {
       has_hole = true;
     }
 
@@ -968,8 +1010,8 @@ int FSCryptFDataDenc::decrypt_bl(uint64_t off, uint64_t len, uint64_t pos, const
       chunk.append_hole(chunk_len);
 
       uint64_t bl_off = pos - start_block_off;
-      r = decrypt(bl->c_str() + bl_off, chunk_len,
-                  chunk.c_str(), chunk_len);
+      r = decrypt(fscrypt_ciphertext_at(*bl, bl_off, chunk_len, scratch),
+                  chunk_len, chunk.c_str(), chunk_len);
       if (r < 0) {
         return r;
       }
