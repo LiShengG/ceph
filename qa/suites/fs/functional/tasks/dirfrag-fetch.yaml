@@ -1,0 +1,14 @@
+overrides:
+  ceph:
+    log-ignorelist:
+      # Tests that corrupt on-disk dentries or inject read errors mark the
+      # dirfrag damaged on purpose; the health warning (MDS_DAMAGE) is already
+      # ignorelisted globally by the functional overrides, these are the
+      # per-message clog strings those paths emit.
+      - error reading dir
+      - Corrupt dentry
+      - Metadata damage detected
+tasks:
+  - cephfs_test_runner:
+      modules:
+        - tasks.cephfs.test_dirfrag_fetch
