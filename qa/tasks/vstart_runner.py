@@ -149,6 +149,15 @@ except ImportError:
 # Must import after teuthology because of gevent monkey patching
 import subprocess
 
+# teuthology deliberately leaves subprocess unpatched, but gevent >= 25.8
+# patches os.close() to defer closing pipe descriptors through its event loop.
+# The stdlib Popen constructor closes its exec-error pipe synchronously and
+# then immediately waits for EOF.  With the deferred close this deadlocks in
+# Popen before even a trivial command such as `ip netns list` can start.  Keep
+# the stdlib subprocess implementation paired with the stdlib close primitive.
+from gevent import monkey as gevent_monkey
+os.close = gevent_monkey.get_original('os', 'close')
+
 if os.path.exists("./CMakeCache.txt"):
     # Running in build dir of a cmake build
     BIN_PREFIX = "./bin/"
@@ -738,12 +747,15 @@ class LocalKernelMount(KernelMount):
         if self.using_namespace:
             super(type(self), self).cleanup_netns()
 
-    def _run_python(self, pyscript, py_version='python'):
+    def _run_python(self, pyscript, py_version='python3', sudo=False):
         """
         Override this to remove the daemon-helper prefix that is used otherwise
         to make the process killable.
         """
-        return self.client_remote.run(args=[py_version, '-c', pyscript],
+        args = [py_version, '-c', pyscript]
+        if sudo:
+            args.insert(0, 'sudo')
+        return self.client_remote.run(args=args,
                                       wait=False, stdout=StringIO())
 
 class LocalFuseMount(FuseMount):
@@ -930,18 +942,24 @@ class LocalFuseMount(FuseMount):
         if self.using_namespace:
             super(type(self), self).cleanup_netns()
 
-    def _run_python(self, pyscript, py_version='python'):
+    def _run_python(self, pyscript, py_version='python3', sudo=False):
         """
         Override this to remove the daemon-helper prefix that is used otherwise
         to make the process killable.
         """
-        return self.client_remote.run(args=[py_version, '-c', pyscript],
+        args = [py_version, '-c', pyscript]
+        if sudo:
+            args.insert(0, 'sudo')
+        return self.client_remote.run(args=args,
                                       wait=False, stdout=StringIO())
 
 # XXX: this class has nothing to do with the Ceph daemon (ceph-mgr) of
 # the same name.
 class LocalCephManager(CephManager):
-    def __init__(self):
+    def __init__(self, ctx=None, cluster_name='ceph'):
+        self.ctx = ctx
+        self.cluster = cluster_name
+
         # Deliberately skip parent init, only inheriting from it to get
         # util methods like osd_dump that sit on top of raw_cluster_cmd
         self.controller = LocalRemote()
@@ -957,6 +975,11 @@ class LocalCephManager(CephManager):
         # in no time.  The attribute needs to exist for some of the CephManager
         # methods to work though.
         self.pools = {}
+
+        # Parent helpers such as do_rados() consult these attributes even
+        # though the local runner deliberately skips CephManager.__init__().
+        self.cephadm = False
+        self.rook = False
 
     def find_remote(self, daemon_type, daemon_id):
         """
@@ -1004,6 +1027,20 @@ class LocalCephManager(CephManager):
         """
         kwargs['args'], kwargs['check_status'] = args, False
         return self.run_cluster_cmd(**kwargs).exitstatus
+
+    def do_rados(self, cmd, pool=None, namespace=None, remote=None, **kwargs):
+        """Run rados directly, without teuthology's remote coverage wrapper."""
+        if remote is None:
+            remote = self.controller
+
+        args = [os.path.join(BIN_PREFIX, 'rados'),
+                '--cluster', self.cluster]
+        if pool is not None:
+            args += ['--pool', pool]
+        if namespace is not None:
+            args += ['--namespace', namespace]
+        args.extend(cmd)
+        return remote.run(args=args, wait=True, **kwargs)
 
     def admin_socket(self, daemon_type, daemon_id, command, check_status=True,
                      timeout=None, stdout=None):
@@ -1067,7 +1104,7 @@ class LocalCephCluster(CephCluster):
     def __init__(self, ctx):
         # Deliberately skip calling CephCluster constructor
         self._ctx = ctx
-        self.mon_manager = LocalCephManager()
+        self.mon_manager = LocalCephManager(ctx=self._ctx)
         self._conf = defaultdict(dict)
 
     @property
@@ -1187,7 +1224,7 @@ class LocalFilesystem(LocalMDSCluster, Filesystem):
         self.fs_config = fs_config
         self.ec_profile = fs_config.get('ec_profile')
 
-        self.mon_manager = LocalCephManager()
+        self.mon_manager = LocalCephManager(ctx=ctx)
 
         self.client_remote = LocalRemote()
 
