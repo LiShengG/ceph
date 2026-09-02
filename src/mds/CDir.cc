@@ -2165,8 +2165,8 @@ bool CDir::_omap_fetch_init(fetch_state_t& st, bufferlist& hdrbl,
   if (fnode->snap_purged_thru < realm->get_last_destroyed()) {
     st.snaps = realm->get_snaps();
     st.filter_snaps = true;
-    st.advance_snap_purged_thru = true;
     st.snap_purged_thru_target = realm->get_last_destroyed();
+    st.advance_snap_purged_thru = (get_num_snap_items() == 0);
     dout(10) << " snap_purged_thru " << fnode->snap_purged_thru
 	     << " < " << st.snap_purged_thru_target
 	     << ", snap purge based on " << st.snaps << dendl;
@@ -2243,15 +2243,17 @@ void CDir::_omap_fetch_finish(fetch_state_t& st, bool complete, int r)
 {
   ceph_assert(r == 0 || r == -CEPHFS_ENOENT || r == -CEPHFS_ENODATA);
 
-  // A discarded fetch must not leave the in-memory purge horizon ahead of
-  // the dentries it actually examined.  Commit the horizon only after a full
-  // fetch has decoded its final batch successfully; log_mark_dirty() below
-  // then persists the new fnode together with removal of stale OMAP keys.
-  if (complete && st.advance_snap_purged_thru &&
-      st.snap_purged_thru_target > fnode->snap_purged_thru &&
-      !mdcache->is_readonly()) {
-    const_cast<snapid_t&>(fnode->snap_purged_thru) =
-        st.snap_purged_thru_target;
+  const bool can_advance_horizon =
+      complete &&
+      st.advance_snap_purged_thru &&
+      !state_test(STATE_COMMITTING) &&
+      !is_projected() &&
+      !mdcache->is_readonly();
+  if (can_advance_horizon &&
+      st.snap_purged_thru_target > fnode->snap_purged_thru) {
+    auto next = allocate_fnode(*get_fnode());
+    next->snap_purged_thru = st.snap_purged_thru_target;
+    reset_fnode(std::move(next));
     st.force_dirty = true;
   }
 
@@ -2828,6 +2830,17 @@ void CDir::_committed(int r, version_t v)
   // dir clean?
   if (committed_version == get_version()) 
     mark_clean();
+
+  // A fetch may have found stale OMAP keys after this generation moved its
+  // stale_items into the commit context.  The old horizon was deliberately
+  // left unchanged while the commit was in flight, so defer those removals
+  // to a new generation now that log_mark_dirty() can safely create one.
+  if (!stale_items.empty() &&
+      committed_version == get_version() &&
+      !is_projected() &&
+      !mdcache->is_readonly()) {
+    log_mark_dirty();
+  }
 
   int count = 0;
 
