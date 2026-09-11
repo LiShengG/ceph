@@ -54,6 +54,7 @@ Synopsis
 
 | **cephadm** **bootstrap** [-h] [--config CONFIG] [--mon-id MON_ID]
 |                           [--mon-addrv MON_ADDRV] [--mon-ip MON_IP]
+|                           [--mon-net MON_NET]
 |                           [--mgr-id MGR_ID] [--fsid FSID]
 |                           [--log-to-file] [--single-host-defaults]
 |                           [--output-dir OUTPUT_DIR]
@@ -234,6 +235,7 @@ Arguments:
 * [--config CONFIG, -c CONFIG]    ceph conf file to incorporate
 * [--mon-id MON_ID]               mon id (default: local hostname)
 * [--mon-addrv MON_ADDRV]         mon IPs (e.g., [v2:localipaddr:3300,v1:localipaddr:6789])
+* [--mon-net MON_NET]             mon network in CIDR notation (e.g., 192.168.1.0/24)
 * [--mon-ip MON_IP]               mon IP
 * [--mgr-id MGR_ID]               mgr id (default: randomly generated)
 * [--fsid FSID]                   cluster FSID
@@ -405,9 +407,9 @@ list daemon instances known to cephadm on **this** host::
             "enabled": true,
             "state": "running",
             "container_id": "8562de72370a3836473ecfff8a22c9ccdd99815386b4692a2b30924fb5493c44",
-            "container_image_name": "docker.io/ceph/ceph:v15",
+            "container_image_name": "quay.io/ceph/ceph:v20",
             "container_image_id": "bc83a388465f0568dab4501fb7684398dca8b50ca12a342a57f21815721723c2",
-            "version": "15.2.1",
+            "version": "20.2.3",
             "started": "2020-04-21T01:16:41.831456",
             "created": "2020-04-21T01:16:41.775024",
             "deployed": "2020-04-21T01:16:41.415021",

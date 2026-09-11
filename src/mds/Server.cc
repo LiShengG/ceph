@@ -67,6 +67,7 @@
 #include "common/strescape.h"
 #include "common/ceph_json.h"
 #include "common/debug.h"
+#include "common/errno.h" // for cpp_strerror()
 #include "common/Timer.h"
 #include "common/perf_counters.h"
 #include "include/compat.h"
@@ -196,8 +197,6 @@ void Server::create_logger()
                       PerfCountersBuilder::PRIO_INTERESTING);
   plb.add_u64_counter(l_mdss_cap_revoke_eviction, "cap_revoke_eviction",
                       "Cap Revoke Client Eviction", "cre", PerfCountersBuilder::PRIO_INTERESTING);
-  plb.add_u64_counter(l_mdss_cache_trim_throttle, "cache_trim_throttle",
-                      "Cache trim throttle counter", "ctt", PerfCountersBuilder::PRIO_INTERESTING);
   plb.add_u64_counter(l_mdss_session_recall_throttle, "session_recall_throttle",
                       "Session recall throttle counter", "srt", PerfCountersBuilder::PRIO_INTERESTING);
   plb.add_u64_counter(l_mdss_session_recall_throttle2o, "session_recall_throttle2o",
@@ -503,6 +502,7 @@ void Server::reclaim_session(Session *session, const cref_t<MClientReclaim> &m)
 	       << " != target auth_name " << target->info.auth_name << dendl;
       reply->set_result(-EPERM);
       mds->send_message_client(reply, session);
+      return;
     }
 
     ceph_assert(!target->reclaiming_from);
@@ -5379,15 +5379,19 @@ void Server::handle_client_file_setlock(const MDRequestRef& mdr)
   if (CEPH_LOCK_UNLOCK == set_lock.type) {
     list<ceph_filelock> activated_locks;
     MDSContext::vec waiters;
+    bool changed = false;
     if (lock_state->is_waiting(set_lock)) {
       dout(10) << " unlock removing waiting lock " << set_lock << dendl;
       lock_state->remove_waiting(set_lock);
-      cur->take_waiting(CInode::WAIT_FLOCK, waiters);
-    } else if (!interrupt) {
+      changed = true;
+    }
+    if (!interrupt) {
       dout(10) << " unlock attempt on " << set_lock << dendl;
       lock_state->remove_lock(set_lock, activated_locks);
-      cur->take_waiting(CInode::WAIT_FLOCK, waiters);
+      changed = true;
     }
+    if (changed)
+      cur->take_waiting(CInode::WAIT_FLOCK, waiters);
     mds->queue_waiters(waiters);
 
     respond_to_request(mdr, 0);
@@ -5489,7 +5493,6 @@ void Server::handle_client_setattr(const MDRequestRef& mdr)
     respond_to_request(mdr, -EPERM);
     return;
   }
-
   __u32 mask = req->head.args.setattr.mask;
   __u32 access_mask = MAY_WRITE;
 
@@ -7713,6 +7716,7 @@ void Server::handle_client_symlink(const MDRequestRef& mdr)
   if (req->get_alternate_name().size() > alternate_name_max) {
     dout(10) << " alternate_name longer than " << alternate_name_max << dendl;
     respond_to_request(mdr, -ENAMETOOLONG);
+    return;
   }
   dn->set_alternate_name(req->get_alternate_name());
 
@@ -11936,7 +11940,7 @@ void Server::handle_client_snap_md_op(const MDRequestRef& mdr)
 {
   const cref_t<MClientRequest> &req = mdr->client_request;
 
-  CInode* diri = rdlock_path_pin_ref(mdr, false, true);
+  CInode* diri = rdlock_path_pin_ref(mdr, true, false);
   if (!diri)
     return;
 
@@ -12173,6 +12177,7 @@ void Server::handle_client_readdir_snapdiff(const MDRequestRef& mdr)
   // which frag?
   frag_t fg = (__u32)req->head.args.snapdiff.frag;
   unsigned req_flags = (__u32)req->head.args.snapdiff.flags;
+  unsigned diff_mask = (__u32)req->head.args.snapdiff.mask;
   string offset_str = req->get_path2();
 
   __u32 offset_hash = 0;
@@ -12235,6 +12240,7 @@ void Server::handle_client_readdir_snapdiff(const MDRequestRef& mdr)
   dout(10) << __func__
     << " snap " << mdr->snapid
     << " vs. snap " << mdr->snapid_diff_other
+    << " input mask 0x" << diff_mask
     << dendl;
 
   if (mdr->snapid_diff_other == mdr->snapid ||
@@ -12242,6 +12248,7 @@ void Server::handle_client_readdir_snapdiff(const MDRequestRef& mdr)
       mdr->snapid_diff_other == CEPH_NOSNAP) {
     dout(10) << "reply to " << *req << " snapdiff -EINVAL" << dendl;
     respond_to_request(mdr, -EINVAL);
+    return;
   }
 
   unsigned max = req->head.args.snapdiff.max_entries;
@@ -12281,6 +12288,7 @@ void Server::handle_client_readdir_snapdiff(const MDRequestRef& mdr)
     offset_str,
     offset_hash,
     req_flags,
+    diff_mask,
     dirbl);
 }
 
@@ -12327,6 +12335,7 @@ void Server::_readdir_diff(
   const string& offset_str,
   uint32_t offset_hash,
   unsigned req_flags,
+  unsigned diff_mask,
   bufferlist& dirbl)
 {
   // build dir contents
@@ -12359,6 +12368,7 @@ void Server::_readdir_diff(
     from_the_beginning ? nullptr : & skip_key,
     snapid_prev,
     snapid,
+    diff_mask,
     dnbl,
     [&](CDentry* dn, CInode* in, bool exists) {
       string name;
@@ -12442,18 +12452,57 @@ bool Server::build_snap_diff(
   dentry_key_t* skip_key,
   snapid_t snapid_prev,
   snapid_t snapid,
+  unsigned diff_mask,
   const bufferlist& dnbl,
   std::function<bool (CDentry*, CInode*, bool)> add_result_cb)
 {
-  client_t client = mdr->client_request->get_source().num();
-
   struct EntryInfo {
     CDentry* dn = nullptr;
     CInode* in = nullptr;
-    utime_t mtime;
 
     void reset() {
       *this = EntryInfo();
+    }
+    EntryInfo() {}
+    EntryInfo(CDentry* _dn, CInode* _in) : dn(_dn), in(_in) {}
+
+    bool valid() const {
+      return in != nullptr && dn != nullptr;
+    }
+
+    static bool meta_differs(const CInode::mempool_inode& my,
+                             const CInode::mempool_inode& oth,
+                             unsigned mask,
+                             unsigned& res_mask) {
+      res_mask = 0;
+      if ((mask & CEPH_SNAPDIFF_MODE) && (my.mode != oth.mode))
+	res_mask |= CEPH_SNAPDIFF_MODE;
+      if ((mask & CEPH_SNAPDIFF_UID) && (my.uid != oth.uid))
+	res_mask |= CEPH_SNAPDIFF_UID;
+      if ((mask & CEPH_SNAPDIFF_GID) && (my.gid != oth.gid))
+	res_mask |= CEPH_SNAPDIFF_GID;
+      if ((mask & CEPH_SNAPDIFF_SIZE) && (my.size != oth.size))
+	res_mask |= CEPH_SNAPDIFF_SIZE;
+      if ((mask & CEPH_SNAPDIFF_NLINK) && (my.nlink != oth.nlink))
+	res_mask |= CEPH_SNAPDIFF_NLINK;
+      if ((mask & CEPH_SNAPDIFF_MTIME) && (my.mtime != oth.mtime))
+	res_mask |= CEPH_SNAPDIFF_MTIME;
+      if ((mask & CEPH_SNAPDIFF_ATIME) && (my.atime != oth.atime))
+	res_mask |= CEPH_SNAPDIFF_ATIME;
+      if ((mask & CEPH_SNAPDIFF_CTIME) && (my.ctime != oth.ctime))
+	res_mask |= CEPH_SNAPDIFF_CTIME;
+      if ((mask & CEPH_SNAPDIFF_BTIME) && (my.btime != oth.btime))
+	res_mask |= CEPH_SNAPDIFF_BTIME;
+      return res_mask != 0;
+    }
+
+    bool meta_differs(const CInode* _in,
+                      unsigned mask,
+                      unsigned& res_mask) const {
+      ceph_assert(in);
+      ceph_assert(_in);
+      return meta_differs(*in->get_inode(), *_in->get_inode(),
+                          mask, res_mask);
     }
   } before;
 
@@ -12464,9 +12513,32 @@ bool Server::build_snap_diff(
     ei.reset();
     return r;
   };
+  client_t client = mdr->client_request->get_source().num();
+
+  // Return the inode metadata visible at @snapid. Multiversion inodes keep
+  // their historical versions in old_inodes, keyed by the version's last
+  // snapshot.
+  auto inode_at_snap = [](const CInode* head, snapid_t snapid)
+      -> const CInode::mempool_inode* {
+    ceph_assert(head->is_head());
+
+    if (snapid >= head->first)
+      return head->get_inode().get();
+
+    snapid_t old_last = head->pick_old_inode(snapid);
+    if (!old_last)
+      return nullptr;
+
+    const auto& old_inodes = head->get_old_inodes();
+    ceph_assert(old_inodes);
+    auto it = old_inodes->find(old_last);
+    ceph_assert(it != old_inodes->end());
+    return &it->second.inode;
+  };
 
   auto it = !skip_key ? dir->begin() : dir->upper_bound(*skip_key);
 
+  diff_mask = diff_mask != 0 ? diff_mask : CEPH_SNAPDIFF_MTIME; // to preserve backward compatibility with the original impl.
   while(it != dir->end()) {
     CDentry* dn = it->second;
     dout(20) << __func__ << " " << it->first << "->" << *dn << dendl;
@@ -12523,7 +12595,6 @@ bool Server::build_snap_diff(
     }
     ceph_assert(in);
 
-    utime_t mtime = in->get_inode()->mtime;
     if (in->is_dir()) {
 
       // we need to maintain the order of entries (determined by their name hashes)
@@ -12551,17 +12622,75 @@ bool Server::build_snap_diff(
       }
     } else {
       if (snapid_prev >= dn->first && snapid <= dn->last) {
-	dout(20) << __func__ << " skipping unchanged " << dn->get_name() << " "
-	  << dn->first << "/" << dn->last << dendl;
-	continue;
+        // A multiversion inode can be COWed without COWing its dentry.
+        // Do not infer that the inode is unchanged solely because this
+        // dentry spans both snapshots.
+        CInode* head = in->is_head() ? in : mdcache->get_inode(in->ino());
+        // A replica's first can lag the inode auth MDS, so only use the
+        // range as a fast path when it is authoritative.
+        const bool inode_state_authoritative = head && head->is_auth();
+        bool inode_spans_both =
+          inode_state_authoritative &&
+          snapid_prev >= in->first && snapid <= in->last;
+        if (inode_spans_both) {
+	  dout(20) << __func__ << " skipping unchanged " << dn->get_name() << " "
+	    << dn->first << "/" << dn->last << dendl;
+	  continue;
+        }
+
+        unsigned res_mask = 0;
+        bool attrs_known = false;
+        bool attrs_changed = true;
+
+        // old_inodes is authoritative only on the inode auth MDS. If this
+        // rank has only a replica, report the entry conservatively rather
+        // than silently losing an update.
+        if (inode_state_authoritative) {
+          const auto* prev_inode = inode_at_snap(head, snapid_prev);
+          const auto* snap_inode = inode_at_snap(head, snapid);
+          if (prev_inode && snap_inode) {
+            attrs_known = true;
+            attrs_changed = EntryInfo::meta_differs(
+              *prev_inode, *snap_inode, diff_mask, res_mask);
+          }
+        }
+
+        if (attrs_known && !attrs_changed) {
+          dout(20) << __func__
+            << " skipping unchanged hardlink inode attrs "
+            << dn->get_name() << " " << dn->first << "/" << dn->last
+            << dendl;
+          continue;
+        }
+
+        // Preserve hash/name ordering if a deleted entry is pending.
+        if (before.valid() && !insert_deleted(before))
+          break;
+
+        if (attrs_known) {
+          dout(20) << __func__
+            << " inode attrs changed behind unchanged hardlink dentry "
+            << dn->get_name() << " dn " << dn->first << "/" << dn->last
+            << " inode " << in->first << "/" << in->last
+            << " result mask: 0x" << std::hex << res_mask << std::dec
+            << dendl;
+        } else {
+          dout(10) << __func__
+            << " reporting unchanged-span hardlink conservatively "
+            << dn->get_name() << " dn " << dn->first << "/" << dn->last
+            << " inode " << in->first << "/" << in->last
+            << dendl;
+        }
+
+        if (!add_result_cb(dn, in, true))
+          break;
+        continue;
       } else if (snapid_prev < dn->first && snapid > dn->last) {
 	dout(20) << __func__ << " skipping inner modification " << dn->get_name() << " "
 	  << dn->first << "/" << dn->last << dendl;
 	continue;
       }
-      string_view name_before =
-        before.dn ? string_view(before.dn->get_name()) : string_view();
-      if (before.dn && dn->get_name() != name_before) {
+      if (before.valid() && before.dn->get_name() != dn->get_name()) {
         if (!insert_deleted(before)) {
           break;
         }
@@ -12570,33 +12699,32 @@ bool Server::build_snap_diff(
       if (snapid_prev >= dn->first && snapid_prev <= dn->last) {
 	dout(30) << __func__ << " dn_before " << dn->get_name() << " "
 	  << dn->first << "/" << dn->last << dendl;
-	before = EntryInfo {dn, in, mtime};
+	before = EntryInfo {dn, in};
 	continue;
       } else {
-	if (before.dn && dn->get_name() == name_before) {
+	if (before.valid() && before.dn->get_name() == dn->get_name()) {
 	  if (before.in->ino() != in->ino()) {
 	    dout(30) << __func__ << " inode changed " << dn->get_name() << " "
 		     << dn->first << "/" << dn->last
-		     << " " << before.mtime << " vs. " << mtime
 		     << dendl;
 	    if (!insert_deleted(before)) {
 	      break;
 	    }
 	    before.reset();
 	  } else {
-	    if (mtime == before.mtime) {
-	      dout(30) << __func__ << " timestamp not changed " << dn->get_name() << " "
-		       << dn->first << "/" << dn->last
-		       << " " << mtime
-		       << dendl;
+	    unsigned res_mask = 0;
+	    if (before.meta_differs(in, diff_mask, res_mask) ) {
+	      dout(30) << __func__ << " attrs changed " << dn->get_name() << " "
+		<< dn->first << "/" << dn->last
+		<< " result mask: 0x" << std::hex << res_mask << std::dec
+		<< dendl;
+	      before.reset();
+	    } else {
+	      dout(30) << __func__ << " attrs not changed " << dn->get_name() << " "
+		<< dn->first << "/" << dn->last
+		<< dendl;
 	      before.reset();
 	      continue;
-	    } else {
-	      dout(30) << __func__ << " timestamp changed " << dn->get_name() << " "
-		       << dn->first << "/" << dn->last
-		       << " " << before.mtime << " vs. " << mtime
-		       << dendl;
-	      before.reset();
 	    }
 	  }
 	}

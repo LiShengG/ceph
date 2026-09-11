@@ -143,6 +143,45 @@ bool parse_aws_s3_error(const std::string& input, rgw_err& err)
   return true;
 }
 
+// try to parse the json error response body.
+static bool parse_json_error(const std::string& input, rgw_err& err)
+{
+  JSONParser parser;
+  if (!parser.parse(input.c_str(), input.length())) {
+    return false;
+  }
+  JSONObj* error = parser.find_obj("Error");
+  if (!error) {
+    error = &parser;
+  }
+  if (auto code = error->find_obj("Code"); code) {
+    err.err_code = code->get_data();
+  }
+  if (auto message = error->find_obj("Message"); message) {
+    err.message = message->get_data();
+  }
+  return true;
+}
+
+// parse the error response body. s3/iam/sts use xml, but the admin api
+// uses json
+static bool parse_error_response(const std::string& input, rgw_err& err)
+{
+  const auto pos = input.find_first_not_of(" \t\r\n");
+  if (pos == std::string::npos) {
+    return false;
+  }
+  switch (input[pos]) {
+    case '<':
+      return parse_aws_s3_error(input, err);
+    case '{':
+    case '[':
+      return parse_json_error(input, err);
+    default:
+      return false;
+  }
+}
+
 int rgw_forward_request_to_master(const DoutPrefixProvider* dpp,
                                   const rgw::SiteConfig& site,
                                   const rgw_owner& effective_owner,
@@ -186,7 +225,7 @@ int rgw_forward_request_to_master(const DoutPrefixProvider* dpp,
   }
   err.http_ret = *result;
   if (err.is_err() && outdata.length()) { // 4xx or 5xx
-    std::ignore = parse_aws_s3_error(rgw_bl_str(outdata), err);
+    std::ignore = parse_error_response(rgw_bl_str(outdata), err);
   }
   int ret = rgw_http_error_to_errno(err.http_ret);
   if (ret < 0) {
@@ -428,10 +467,10 @@ static int read_bucket_policy(const DoutPrefixProvider *dpp,
                               rgw_bucket& bucket,
 			      optional_yield y)
 {
-  if (!s->auth.identity->is_admin() && bucket_info.flags & BUCKET_SUSPENDED) {
+  if (!s->auth.identity->is_admin() && bucket_info.bucket_suspended()) {
     ldpp_dout(dpp, 0) << "NOTICE: bucket " << bucket_info.bucket.name
         << " is suspended" << dendl;
-    return -ERR_USER_SUSPENDED;
+    return -ERR_BUCKET_SUSPENDED;
   }
 
   if (bucket.name.empty()) {
@@ -465,10 +504,10 @@ static int read_obj_policy(const DoutPrefixProvider *dpp,
   std::unique_ptr<rgw::sal::Object> mpobj;
   rgw_obj obj;
 
-  if (!s->auth.identity->is_admin() && bucket_info.flags & BUCKET_SUSPENDED) {
+  if (!s->auth.identity->is_admin() && bucket_info.bucket_suspended()) {
     ldpp_dout(dpp, 0) << "NOTICE: bucket " << bucket_info.bucket.name
         << " is suspended" << dendl;
-    return -ERR_USER_SUSPENDED;
+    return -ERR_BUCKET_SUSPENDED;
   }
 
   // when getting policy info for copy-source obj, upload_id makes no sense.
@@ -617,16 +656,30 @@ int rgw_build_bucket_policies(const DoutPrefixProvider *dpp, rgw::sal::Driver* d
     ret = read_bucket_policy(dpp, driver, s, s->bucket->get_info(),
 			     s->bucket->get_attrs(),
 			     s->bucket_acl, s->bucket->get_key(), y);
+    if (ret < 0) {
+      ldpp_dout(dpp, 0) << "failed to read bucket policy, err: "
+          << cpp_strerror(ret) << dendl;
+      return ret;
+    }
 
     s->bucket_owner = s->bucket_acl.get_owner();
     acct_acl_user = &s->bucket_owner;
 
-    s->zonegroup_endpoint = rgw::get_zonegroup_endpoint(zonegroup);
-    s->zonegroup_name = zonegroup.get_name();
+    const std::string& bucket_zonegroup_id = s->bucket->get_info().zonegroup;
 
-    if (!zonegroup.equals(s->bucket->get_info().zonegroup)) {
+    /* the zonegroup that holds the bucket, which is where any redirect has to
+     * point. using the local zonegroup here would send the client back to the
+     * endpoint it just used, and clients that follow redirects would loop */
+    const RGWZoneGroup* bucket_zonegroup = rgw::find_zonegroup_by_id(
+        zonegroup, s->penv.site->get_period(), bucket_zonegroup_id);
+    if (bucket_zonegroup) {
+      s->zonegroup_endpoint = rgw::get_zonegroup_endpoint(*bucket_zonegroup);
+      s->zonegroup_name = bucket_zonegroup->get_name();
+    }
+
+    if (!zonegroup.equals(bucket_zonegroup_id)) {
       ldpp_dout(dpp, 0) << "NOTICE: request for data in a different zonegroup ("
-          << s->bucket->get_info().zonegroup << " != "
+          << bucket_zonegroup_id << " != "
           << zonegroup.get_id() << ")" << dendl;
       /* we now need to make sure that the operation actually requires copy source, that is
        * it's a copy operation
@@ -638,6 +691,11 @@ int rgw_build_bucket_policies(const DoutPrefixProvider *dpp, rgw::sal::Driver* d
       } else if (!s->local_source ||
           (s->op != OP_PUT && s->op != OP_COPY) ||
           rgw::sal::Object::empty(s->object.get())) {
+        if (s->zonegroup_endpoint.empty()) {
+          ldpp_dout(dpp, 0) << "NOTICE: no endpoint found for zonegroup "
+              << bucket_zonegroup_id << ", responding without a redirect "
+              "location" << dendl;
+        }
         return -ERR_PERMANENT_REDIRECT;
       }
     }
@@ -1177,6 +1235,18 @@ int handle_cloudtier_obj(req_state* s, const DoutPrefixProvider *dpp, rgw::sal::
       auto iter = bl.cbegin();
       decode(restore_status, iter);
     }
+
+    // Non-versioned bucket: only the implicit version exists. Versionless
+    // requests on versioned buckets need no handling here; s->object
+    // already carries the OLH-resolved current version from the head read.
+    if (!s->bucket->versioned() && s->object->have_instance()) {
+      if (!s->object->get_key().have_null_instance()) {
+        s->err.message = "versionId is not allowed for a non-versioned bucket";
+        return -ERR_INVALID_REQUEST;
+      }
+      s->object->set_instance("");
+    }
+
     if (restore_status == rgw::sal::RGWRestoreStatus::RestoreAlreadyInProgress) {
       if (read_through) {
         // For glacier tier, fail immediately as restores can take hours/days
@@ -3117,10 +3187,15 @@ void RGWGetUsage::execute(optional_yield y)
   bool is_truncated = true;
 
   RGWUsageIter usage_iter;
-  
-  while (s->bucket && is_truncated) {
-    op_ret = s->bucket->read_usage(this, start_epoch, end_epoch, max_entries, &is_truncated,
+
+  while (is_truncated) {
+    if (s->bucket) {
+      op_ret = s->bucket->read_usage(this, start_epoch, end_epoch, max_entries, &is_truncated,
+				     usage_iter, usage);
+    } else {
+      op_ret = s->user->read_usage(this, start_epoch, end_epoch, max_entries, &is_truncated,
 				   usage_iter, usage);
+    }
     if (op_ret == -ENOENT) {
       op_ret = 0;
       is_truncated = false;
@@ -3128,7 +3203,7 @@ void RGWGetUsage::execute(optional_yield y)
 
     if (op_ret < 0) {
       return;
-    }    
+    }
   }
 
   op_ret = rgw_sync_all_stats(this, y, driver, s->user->get_id(),
@@ -3527,6 +3602,9 @@ int RGWListBucket::verify_permission(optional_yield y)
     s->env.emplace("s3:delimiter", delimiter);
 
   s->env.emplace("s3:max-keys", std::to_string(max));
+
+  // expose rgw's allow-unordered extension to policy evaluation
+  s->env.emplace("rgw:allow-unordered", allow_unordered ? "true" : "false");
 
   auto [has_s3_existing_tag, has_s3_resource_tag] = rgw_check_policy_condition(this, s, false);
   if (has_s3_resource_tag)
@@ -6324,8 +6402,49 @@ int RGWCopyObj::verify_permission(optional_yield y)
     rgw_add_to_iam_environment(s->env, "s3:x-amz-metadata-directive",
                                *md_directive);
 
+  /*
+   * The destination object is tagged whether the tag-set is replaced (from the
+   * request) or copied (from the source), so both paths must authorize object
+   * tagging and expose the tags to policy conditions. For a copied tag-set the
+   * source is read here to learn whether the destination will carry tags.
+   */
+  std::optional<RGWObjTags> dest_obj_tags = obj_tags;
+  if (!dest_obj_tags && copy_source_tags &&
+      s->local_source && source_zone.empty()) {
+    op_ret = s->src_object->get_obj_attrs(y, this);
+    if (op_ret < 0) {
+      return op_ret;
+    }
+    const auto& src_attrs = s->src_object->get_attrs();
+    auto titer = src_attrs.find(RGW_ATTR_TAGS);
+    if (titer != src_attrs.end()) {
+      RGWObjTags tagset;
+      try {
+        auto bliter = titer->second.cbegin();
+        tagset.decode(bliter);
+      } catch (buffer::error& err) {
+        ldpp_dout(s, 0) << "ERROR: caught buffer::error, couldn't decode TagSet" << dendl;
+        return -EIO;
+      }
+      dest_obj_tags = std::move(tagset);
+    }
+  }
+
+  if (dest_obj_tags) {
+    for (const auto& kv : dest_obj_tags->get_tags()) {
+      rgw_add_to_iam_environment(s->env, "s3:RequestObjectTag/" + kv.first, kv.second);
+    }
+  }
+
   if (!verify_bucket_permission(this, s, ARN(s->object->get_obj()),
                                 rgw::IAM::s3PutObject)) {
+    return -EACCES;
+  }
+
+  // writing or clearing object tags requires the tagging permission too
+  if (dest_obj_tags &&
+      !verify_bucket_permission(this, s, ARN(s->object->get_obj()),
+                                rgw::IAM::s3PutObjectTagging)) {
     return -EACCES;
   }
 
@@ -6365,6 +6484,10 @@ int RGWCopyObj::init_common()
     return op_ret;
   }
   populate_with_generic_attrs(s, attrs);
+
+  if (obj_tags) {
+    obj_tags->encode(attrs[RGW_ATTR_TAGS]);
+  }
 
   return 0;
 }
@@ -6420,12 +6543,19 @@ void RGWCopyObj::execute(optional_yield y)
   if (init_common() < 0)
     return;
 
+  // expose replacement tags to the notification event payload
+  if (obj_tags) {
+    s->tagset = *obj_tags;
+  }
+
   // make reservation for notification if needed
   std::unique_ptr<rgw::sal::Notification> res
 				   = driver->get_notification(
 				     s->object.get(), s->src_object.get(),
 				     s, rgw::notify::ObjectCreatedCopy, y);
-  op_ret = res->publish_reserve(this);
+
+  // expose replacement tags to notification filtering
+  op_ret = res->publish_reserve(this, obj_tags ? &*obj_tags : nullptr);
   if (op_ret < 0) {
     return;
   }
@@ -6511,6 +6641,13 @@ void RGWCopyObj::execute(optional_yield y)
   op_ret = rgw::bucketlogging::log_record(driver, rgw::bucketlogging::LoggingType::Journal, s->object.get(), s, canonical_name(), etag, obj_size, this, y, false, false);
   if (op_ret < 0) {
     return;
+  }
+
+  if (copy_source_tags && attrs_mod == rgw::sal::ATTRSMOD_REPLACE) {
+    bufferlist tags_bl;
+    if (s->src_object->get_attr(RGW_ATTR_TAGS, tags_bl)) {
+      attrs[RGW_ATTR_TAGS] = std::move(tags_bl);
+    }
   }
 
   /*
@@ -8103,6 +8240,9 @@ void RGWDeleteMultiObj::handle_individual_object(const RGWMultiDelObject& object
   } prefix{*this, o};
   const DoutPrefixProvider* dpp = &prefix;
 
+  using Clock = ceph::coarse_real_clock;
+  const auto started_at = Clock::now();
+
   std::unique_ptr<rgw::sal::Object> obj = bucket->get_object(o);
   if (o.empty()) {
     send_partial_response(o, false, "", -EINVAL);
@@ -8199,6 +8339,11 @@ void RGWDeleteMultiObj::handle_individual_object(const RGWMultiDelObject& object
   }
   
   send_partial_response(o, del_op->result.delete_marker, del_op->result.version_id, r);
+
+  auto counters = rgw::op_counters::get(s);
+  rgw::op_counters::inc(counters, l_rgw_op_del_obj, 1);
+  rgw::op_counters::inc(counters, l_rgw_op_del_obj_b, obj_size);
+  rgw::op_counters::tinc(counters, l_rgw_op_del_obj_lat, Clock::now() - started_at);
 }
 
 void RGWDeleteMultiObj::handle_objects(const std::vector<RGWMultiDelObject>& objects,
@@ -8282,7 +8427,7 @@ void RGWDeleteMultiObj::execute(optional_yield y)
     bool has_versioned = false;
     for (auto object : multi_delete->objects) {
       const string& instance = object.get_version_id();
-      if (instance.empty()) {
+      if (!instance.empty()) {
         has_versioned = true;
         break;
       }
@@ -8884,7 +9029,7 @@ void RGWBulkUploadOp::execute(optional_yield y)
 
   auto status = rgw::tar::StatusIndicator::create();
   do {
-    op_ret = stream->get_exactly(rgw::tar::BLOCK_SIZE, buffer);
+    op_ret = stream->get_exactly(rgw::tar::TAR_BLOCK_SIZE, buffer);
     if (op_ret < 0) {
       ldpp_dout(this, 2) << "cannot read header" << dendl;
       return;
@@ -8912,7 +9057,7 @@ void RGWBulkUploadOp::execute(optional_yield y)
 	  else
 	    filename = file_prefix + std::string(header->get_filename());
 	  auto body = AlignedStreamGetter(0, header->get_filesize(),
-                                          rgw::tar::BLOCK_SIZE, *stream);
+                                          rgw::tar::TAR_BLOCK_SIZE, *stream);
           op_ret = handle_file(filename,
                                header->get_filesize(),
                                body, y);

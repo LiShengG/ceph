@@ -1252,12 +1252,20 @@ class Module(MgrModule, OrchestratorClientMixin):
 
     @profile_method()
     def get_osd_blocklisted_entries(self) -> None:
-        r = self.mon_command({
+        ret, out, err = self.mon_command({
             'prefix': 'osd blocklist ls',
             'format': 'json'
         })
-        blocklist_entries = r[2].split(' ')
-        blocklist_count = blocklist_entries[1]
+
+        try:
+            parsed_data = json.loads(out)
+            blocklist_count = len(parsed_data.get('blocklist', [])) + \
+                len(parsed_data.get('range_blocklist', []))
+        except json.JSONDecodeError:
+            # Fallback for older Ceph monitor versions
+            blocklist_entries = err.split(' ')
+            blocklist_count = int(blocklist_entries[1])
+
         for stat in OSD_BLOCKLIST:
             self.metrics['cluster_{}'.format(stat)].set(int(blocklist_count))
 
@@ -2209,6 +2217,23 @@ class Module(MgrModule, OrchestratorClientMixin):
     def get_hardware_metrics(self) -> None:
         """Fetch node-proxy fullreport and export all hardware metrics."""
         if not self.orch_is_available():
+            return
+
+        # node-proxy is only implemented by the cephadm orchestrator backend.
+        # Other backends (e.g. rook) report available() as True but don't
+        # implement node_proxy_fullreport(), so calling it every scrape would
+        # raise NotImplementedError on every invocation for no reason.
+        #
+        # Read the backend name directly from config instead of asking the
+        # orchestrator module for it: orch_is_available() above already
+        # makes that exact remote() call internally (via available()), so
+        # a second self.remote() here would just repeat the same
+        # dispatch_remote() round trip for no benefit.
+        try:
+            if self.get_module_option_ex('orchestrator', 'orchestrator') != 'cephadm':
+                return
+        except Exception as e:
+            self.log.debug(f"Failed to determine orchestrator backend: {e}")
             return
 
         try:

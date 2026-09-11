@@ -1753,6 +1753,11 @@ struct CryptAttributes {
       return std::string_view();
     }
   }
+
+  bool exists(crypt_option_e option)
+  {
+    return x_meta_map.count(crypt_options[option].post_part_name) > 0;
+  }
 };
 
 std::string fetch_bucket_key_id(req_state *s)
@@ -2125,7 +2130,7 @@ int rgw_s3_prepare_encrypt(req_state* s, optional_yield y,
           if (!gcm->derive_object_key(
                   reinterpret_cast<const uint8_t*>(key_bin.c_str()),
                   AES_256_KEYSIZE,
-                  s->bucket->get_info().bucket.bucket_id,
+                  s->bucket->get_marker(),
                   s->object->get_name(),
                   part_number)) {
             ldpp_dout(s, 5) << "ERROR: SSE-C-AES256-GCM key derivation failed for "
@@ -2177,7 +2182,7 @@ int rgw_s3_prepare_encrypt(req_state* s, optional_yield y,
     /* AMAZON server side encryption with KMS (key management service) */
     std::string_view req_sse =
         crypt_attributes.get(X_AMZ_SERVER_SIDE_ENCRYPTION);
-    if (! req_sse.empty()) {
+    if (crypt_attributes.exists(X_AMZ_SERVER_SIDE_ENCRYPTION)) {
 
       if (req_sse == "aws:kms") {
         if (s->cct->_conf->rgw_crypt_require_ssl &&
@@ -2249,7 +2254,7 @@ int rgw_s3_prepare_encrypt(req_state* s, optional_yield y,
             if (!gcm || !gcm->derive_object_key(
                     reinterpret_cast<const uint8_t*>(actual_key.c_str()),
                     AES_256_KEYSIZE,
-                    s->bucket->get_info().bucket.bucket_id,
+                    s->bucket->get_marker(),
                     s->object->get_name(),
                     part_number,
                     "SSE-KMS-GCM")) {
@@ -2347,7 +2352,7 @@ int rgw_s3_prepare_encrypt(req_state* s, optional_yield y,
           if (!gcm || !gcm->derive_object_key(
                   reinterpret_cast<const uint8_t*>(actual_key.c_str()),
                   AES_256_KEYSIZE,
-                  s->bucket->get_info().bucket.bucket_id,
+                  s->bucket->get_marker(),
                   s->object->get_name(),
                   part_number,
                   "AES256-GCM")) {
@@ -2416,7 +2421,7 @@ int rgw_s3_prepare_encrypt(req_state* s, optional_yield y,
           if (!gcm->derive_object_key(
                   reinterpret_cast<const uint8_t*>(master_encryption_key.c_str()),
                   AES_256_KEYSIZE,
-                  s->bucket->get_info().bucket.bucket_id,
+                  s->bucket->get_marker(),
                   s->object->get_name(),
                   part_number,
                   "RGW-AUTO-GCM")) {
@@ -2470,12 +2475,12 @@ static void pick_gcm_identity(req_state* s,
       return;
     }
     if (s->src_object && s->src_object->get_bucket()) {
-      bucket_id = s->src_object->get_bucket()->get_info().bucket.bucket_id;
+      bucket_id = s->src_object->get_bucket()->get_marker();
       object_name = s->src_object->get_name();
       return;
     }
   }
-  bucket_id = s->bucket->get_info().bucket.bucket_id;
+  bucket_id = s->bucket->get_marker();
   object_name = s->object->get_name();
 }
 

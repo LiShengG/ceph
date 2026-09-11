@@ -203,6 +203,7 @@ list(APPEND librgw_rados_srcs
   driver/rados/rgw_bl_rados.cc
   driver/rados/rgw_cr_rados.cc
   driver/rados/rgw_cr_tools.cc
+  driver/rados/rgw_bilog.cc
   driver/rados/rgw_d3n_datacache.cc
   driver/rados/rgw_datalog.cc
   driver/rados/rgw_datalog_notify.cc
@@ -541,6 +542,10 @@ if(WITH_RADOSGW_STANDALONE)
   endif()
 endif()
 
+if(WITH_RADOSGW_D4N AND WITH_LIBURING)
+  target_link_libraries(rgw_common PUBLIC uring::uring)
+endif()
+
 set(rgw_a_srcs
   rgw_appmain.cc
   rgw_asio_client.cc
@@ -683,6 +688,7 @@ if(WITH_RADOSGW_STANDALONE)
     PRIVATE
     rgw_schedulers
     kmip
+    heap_profiler
     legacy-option-headers
     common_utf8 global
     ${CRYPTO_LIBS}
@@ -741,6 +747,7 @@ target_include_directories(radosgw
 target_link_libraries(radosgw PRIVATE
   legacy-option-headers
   ${rgw_libs}
+  heap_profiler
   ${ALLOC_LIBS})
 
 if(WITH_RADOSGW_FDB)
@@ -953,6 +960,7 @@ target_link_libraries(rgw
   PRIVATE
   ${rgw_libs}
   rgw_common
+  heap_profiler
   librados
   cls_rgw_client
   cls_otp_client

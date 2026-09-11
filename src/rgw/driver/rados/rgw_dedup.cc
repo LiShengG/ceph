@@ -383,6 +383,65 @@ namespace rgw::dedup {
   }
 
   //---------------------------------------------------------------------------
+  // Detect whether the data pool supports truncate (needed for split-head).
+  // EC pools without allow_ec_overwrites reject TRUNCATE with -EOPNOTSUPP.
+  // We only check the default placement pool because the BI filter applies
+  // exclusively to RGW_STORAGE_CLASS_STANDARD objects, which always reside
+  // in the default placement's data pool. Non-default storage classes have
+  // an empty head and skip the filter entirely.
+  static int detect_pool_alignment(rgw::sal::RadosStore* store,
+                                   const DoutPrefixProvider* dpp,
+                                   bool* p_pool_supports_truncate /* OUT-PARAM */)
+  {
+    auto p_rados_handle = store->getRados()->get_rados_handle();
+
+    *p_pool_supports_truncate = true;
+    const auto& zone_params = store->svc()->zone->get_zone_params();
+    const auto& zonegroup = store->svc()->zone->get_zonegroup();
+    const std::string& default_placement_name = zonegroup.default_placement.name;
+    auto it = zone_params.placement_pools.find(default_placement_name);
+    if (it != zone_params.placement_pools.end()) {
+      const rgw_pool& data_pool = it->second.get_standard_data_pool();
+      if (!data_pool.name.empty()) {
+        librados::IoCtx data_ioctx;
+        int ret = rgw_init_ioctx(dpp, p_rados_handle, data_pool, data_ioctx);
+        if (ret < 0) {
+          ldpp_dout(dpp, 5) << __func__ << "::failed to open default data pool "
+                            << data_pool.name << ": " << cpp_strerror(-ret) << dendl;
+          return ret;
+        }
+
+        bool requires_alignment = false;
+        ret = data_ioctx.pool_requires_alignment2(&requires_alignment);
+        if (ret < 0) {
+          ldpp_dout(dpp, 1) << __func__ << "::ERR: pool_requires_alignment2() failed on "
+                            << data_pool.name << ": " << cpp_strerror(-ret) << dendl;
+          return ret;
+        }
+
+        if (requires_alignment) {
+          *p_pool_supports_truncate = false;
+          ldpp_dout(dpp, 5) << __func__ << "::default data pool " << data_pool.name
+                            << " is EC without allow_ec_overwrites, "
+                            << "disabling split-head" << dendl;
+        }
+      }
+      else {
+        ldpp_dout(dpp, 1) << __func__ << "::ERR: empty data-pool name for default-placement("
+                          << default_placement_name << ")" << dendl;
+        return -ENOENT;
+      }
+    }
+    else {
+      ldpp_dout(dpp, 1) << __func__ << "::ERR: default_placement("
+                        << default_placement_name << ") has no valid pool" << dendl;
+      return -ENOENT;
+    }
+
+    return 0;
+  }
+
+  //---------------------------------------------------------------------------
   int Background::init_rados_access_handles(bool init_pool)
   {
     store = dynamic_cast<rgw::sal::RadosStore*>(driver);
@@ -394,6 +453,7 @@ namespace rgw::dedup {
 
     rados = store->getRados();
     rados_handle = rados->get_rados_handle();
+
     if (init_pool) {
       int ret = init_dedup_pool_ioctx(store, dpp, d_dedup_cluster_ioctx);
       display_ioctx_state(dpp, d_dedup_cluster_ioctx, __func__);
@@ -620,8 +680,15 @@ namespace rgw::dedup {
   }
 
   //---------------------------------------------------------------------------
-  inline bool Background::should_split_head(const RGWObjManifest& manifest)
+  inline bool Background::should_split_head(const RGWObjManifest& manifest,
+                                            md5_stats_t *p_stats)
   {
+    if (!d_pool_supports_truncate) {
+      // we can't split-head without atomic truncate
+      p_stats->split_head_skip_no_truncate++;
+      return false;
+    }
+
     // Split-head is only applicable for single-part objects with a non-empty head.
     // To avoid issues with manifests created via append (specifically for Alibaba Cloud OSS),
     //    we should disable split-head whenever the manifest contains an override_prefix in the rules.
@@ -1242,7 +1309,7 @@ namespace rgw::dedup {
         return -ENOTSUP;
       }
 
-      need_to_split_head = should_split_head(manifest);
+      need_to_split_head = should_split_head(manifest, p_stats);
 
       // force explicit tail_placement as the dedup could be on another bucket
       const rgw_bucket_placement& tail_placement = manifest.get_tail_placement();
@@ -1830,7 +1897,7 @@ namespace rgw::dedup {
     // we might still need to split-head here when hash is valid
     // can happen if we failed compare before (md5-collison) and stored the src hash
     // in the obj-attributes
-    if (should_split_head(src_manifest)) {
+    if (should_split_head(src_manifest, p_stats)) {
       ret = split_head_object(p_src_rec, src_manifest, p_tgt_rec, p_stats);
       // compare_strong_hash() is called internally by split_head_object()
       return (ret == 0);
@@ -2311,8 +2378,21 @@ namespace rgw::dedup {
       p_worker_stats->non_default_storage_class_objs_bytes += ondisk_byte_size;
     }
 
+    const bool multipart_object = (parsed_etag.num_parts > 0);
+    if (entry.meta.size <= d_head_object_size       &&
+        !d_pool_supports_truncate                   &&
+        storage_class == RGW_STORAGE_CLASS_STANDARD &&
+        !multipart_object) {
+      // small objects dedup uses split-head which is dependent on truncate support
+      ldpp_dout(dpp, 20) << __func__ << "::ingress_skip_no_truncate_support::"
+                         << entry.meta.size << dendl;
+      p_worker_stats->ingress_skip_no_truncate_support++;
+      p_worker_stats->ingress_skip_no_truncate_support_bytes += ondisk_byte_size;
+      return 0;
+    }
+
     if (ondisk_byte_size < d_min_obj_size_for_dedup) {
-      if (parsed_etag.num_parts == 0) {
+      if (!multipart_object) {
         // dedup is only applied to objects larger than the configured minimum size
         // `rgw_dedup_min_obj_size_for_dedup`
         p_worker_stats->ingress_skip_too_small++;
@@ -2326,7 +2406,7 @@ namespace rgw::dedup {
       }
     }
     // multipart/single_part counters are for objects being fully processed
-    if (parsed_etag.num_parts > 0) {
+    if (multipart_object) {
       p_worker_stats->multipart_objs++;
     }
     else {
@@ -2649,71 +2729,77 @@ namespace rgw::dedup {
   }
 
   //---------------------------------------------------------------------------
+  static inline void reset_bucket_counters(uint64_t *p_all_buckets_obj_count,
+                                           uint64_t *p_all_buckets_obj_size)
+  {
+    // reset counters to mark that we don't have the info
+    *p_all_buckets_obj_count = 0;
+    *p_all_buckets_obj_size  = 0;
+  }
+
+  //---------------------------------------------------------------------------
   int Background::collect_all_buckets_stats()
   {
     int ret = 0;
     std::string section("bucket.instance");
     std::string marker;
-    void *handle = nullptr;
-    ret = driver->meta_list_keys_init(dpp, section, marker, &handle);
-    if (ret < 0) {
-      ldpp_dout(dpp, 1) << __func__ << "::ERR: Failed meta_list_keys_init: "
-                        << cpp_strerror(-ret) << dendl;
-      return ret;
-    }
+    constexpr int max_keys = 1000;
 
     d_all_buckets_obj_count = 0;
     d_all_buckets_obj_size  = 0;
 
     bool has_more = true;
     while (has_more) {
+      void *handle = nullptr;
+      ret = driver->meta_list_keys_init(dpp, section, marker, &handle);
+      if (ret < 0) {
+        ldpp_dout(dpp, 1) << __func__ << "::ERR: Failed meta_list_keys_init: "
+                          << cpp_strerror(-ret) << dendl;
+        reset_bucket_counters(&d_all_buckets_obj_count, &d_all_buckets_obj_size);
+        return ret;
+      }
       std::list<std::string> entries;
-      constexpr int max_keys = 1000;
       ret = driver->meta_list_keys_next(dpp, handle, max_keys, entries, &has_more);
       if (ret == 0) {
-        for (auto& entry : entries) {
-          ldpp_dout(dpp, 20) <<__func__ << "::bucket_name=" << entry << dendl;
-          rgw_bucket bucket;
-          ret = rgw_bucket_parse_bucket_key(cct, entry, &bucket, nullptr);
-          if (unlikely(ret < 0)) {
-            ldpp_dout(dpp, 1) << __func__ << "::ERR: Failed rgw_bucket_parse_bucket_key: "
-                              << cpp_strerror(-ret) << dendl;
-            goto err;
-          }
-          ldpp_dout(dpp, 20) <<__func__ << "::bucket=" << bucket << dendl;
-          if (!d_filter.allow_bucket(bucket.name)) {
-            ldpp_dout(dpp, 10) << __func__ << "::skip bucket (filter): "
-                               << bucket.name << dendl;
-            continue;
-          }
-          ret = read_bucket_stats(bucket, &d_all_buckets_obj_count,
-                                  &d_all_buckets_obj_size);
-          if (unlikely(ret != 0)) {
-            goto err;
-          }
-        }
-        driver->meta_list_keys_complete(handle);
+        marker = driver->meta_get_marker(handle);
       }
-      else {
+      driver->meta_list_keys_complete(handle);
+
+      if (ret != 0) {
         ldpp_dout(dpp, 1) << __func__ << "::ERR: failed driver->meta_list_keys_next()" << dendl;
-        goto err;
+        reset_bucket_counters(&d_all_buckets_obj_count, &d_all_buckets_obj_size);
+        return ret;
+      }
+      for (auto& entry : entries) {
+        ldpp_dout(dpp, 20) <<__func__ << "::bucket_name=" << entry << dendl;
+        rgw_bucket bucket;
+        ret = rgw_bucket_parse_bucket_key(cct, entry, &bucket, nullptr);
+        if (unlikely(ret < 0)) {
+          ldpp_dout(dpp, 1) << __func__ << "::ERR: Failed rgw_bucket_parse_bucket_key: "
+                            << cpp_strerror(-ret) << dendl;
+          reset_bucket_counters(&d_all_buckets_obj_count, &d_all_buckets_obj_size);
+          return ret;
+        }
+        ldpp_dout(dpp, 20) <<__func__ << "::bucket=" << bucket << dendl;
+        if (!d_filter.allow_bucket(bucket.name)) {
+          ldpp_dout(dpp, 10) << __func__ << "::skip bucket (filter): "
+                             << bucket.name << dendl;
+          continue;
+        }
+        ret = read_bucket_stats(bucket, &d_all_buckets_obj_count,
+                                &d_all_buckets_obj_size);
+        if (unlikely(ret != 0)) {
+          reset_bucket_counters(&d_all_buckets_obj_count, &d_all_buckets_obj_size);
+          return ret;
+        }
       }
     }
+
     ldpp_dout(dpp, 10) <<__func__
                        << "::all_buckets_obj_count=" << d_all_buckets_obj_count
                        << "::all_buckets_obj_size=" << d_all_buckets_obj_size
                        << dendl;
     return 0;
-
-  err:
-    ldpp_dout(dpp, 1) << __func__ << "::error handler" << dendl;
-    // reset counters to mark that we don't have the info
-    d_all_buckets_obj_count = 0;
-    d_all_buckets_obj_size  = 0;
-    if (handle) {
-      driver->meta_list_keys_complete(handle);
-    }
-    return ret;
   }
 
   //---------------------------------------------------------------------------
@@ -2727,61 +2813,66 @@ namespace rgw::dedup {
     int ret = 0;
     std::string section("bucket.instance");
     std::string marker;
-    void *handle = nullptr;
-    ret = driver->meta_list_keys_init(dpp, section, marker, &handle);
-    if (ret < 0) {
-      ldpp_dout(dpp, 1) << __func__ << "::ERR: Failed meta_list_keys_init: "
-                        << cpp_strerror(-ret) << dendl;
-      return ret;
-    }
+    constexpr int max_keys = 1000;
+
     disk_block_array_t disk_arr(dpp, raw_mem, raw_mem_size, worker_id,
                                 p_worker_stats, num_md5_shards);
     bool has_more = true;
-    // iterate over all buckets
-    while (ret == 0 && has_more) {
-      std::list<std::string> entries;
-      constexpr int max_keys = 1000;
-      ret = driver->meta_list_keys_next(dpp, handle, max_keys, entries, &has_more);
-      if (ret == 0) {
-        ldpp_dout(dpp, 20) <<__func__ << "::entries.size()=" << entries.size() << dendl;
-        for (auto& entry : entries) {
-          ldpp_dout(dpp, 20) <<__func__ << "::bucket_name=" << entry << dendl;
-          rgw_bucket bucket;
-          ret = rgw_bucket_parse_bucket_key(cct, entry, &bucket, nullptr);
-          if (unlikely(ret < 0)) {
-            // bad bucket entry, skip to the next one
-            ldpp_dout(dpp, 1) << __func__ << "::ERR: Failed rgw_bucket_parse_bucket_key: "
-                              << cpp_strerror(-ret) << dendl;
-            continue;
-          }
-          ldpp_dout(dpp, 20) <<__func__ << "::bucket=" << bucket << dendl;
-          if (!d_filter.allow_bucket(bucket.name)) {
-            ldpp_dout(dpp, 10) << __func__ << "::worker_id=" << worker_id
-                               << "::skip bucket (filter): " << bucket.name << dendl;
-            p_worker_stats->ingress_skip_filtered_bucket++;
-            continue;
-          }
-          ret = ingress_bucket_objects_single_shard(disk_arr, bucket, worker_id,
-                                                    num_work_shards, p_worker_stats);
-          if (unlikely(ret != 0)) {
-            if (d_ctl.should_stop()) {
-              driver->meta_list_keys_complete(handle);
-              return -ECANCELED;
-            }
-            ldpp_dout(dpp, 1) << __func__ << "::Failed ingress_bucket_objects_single_shard()" << dendl;
-            // skip bad bucket and move on to the next one
-            continue;
-          }
-        }
-        driver->meta_list_keys_complete(handle);
-      }
-      else {
-        ldpp_dout(dpp, 1) << __func__ << "::failed driver->meta_list_keys_next()" << dendl;
-        driver->meta_list_keys_complete(handle);
-        // TBD: what can we do here?
+    while (has_more) {
+      if (unlikely(d_ctl.should_stop())) {
+        ret = -ECANCELED;
         break;
       }
+
+      void *handle = nullptr;
+      ret = driver->meta_list_keys_init(dpp, section, marker, &handle);
+      if (ret < 0) {
+        ldpp_dout(dpp, 1) << __func__ << "::ERR: Failed meta_list_keys_init: "
+                          << cpp_strerror(-ret) << dendl;
+        break;
+      }
+      std::list<std::string> entries;
+      ret = driver->meta_list_keys_next(dpp, handle, max_keys, entries, &has_more);
+      if (ret == 0) {
+        marker = driver->meta_get_marker(handle);
+      }
+      driver->meta_list_keys_complete(handle);
+
+      if (ret != 0) {
+        ldpp_dout(dpp, 1) << __func__ << "::failed driver->meta_list_keys_next()" << dendl;
+        break;
+      }
+      ldpp_dout(dpp, 20) <<__func__ << "::entries.size()=" << entries.size() << dendl;
+      for (auto& entry : entries) {
+        ldpp_dout(dpp, 20) <<__func__ << "::bucket_name=" << entry << dendl;
+        rgw_bucket bucket;
+        int parse_ret = rgw_bucket_parse_bucket_key(cct, entry, &bucket, nullptr);
+        if (unlikely(parse_ret < 0)) {
+          ldpp_dout(dpp, 1) << __func__ << "::ERR: Failed rgw_bucket_parse_bucket_key: "
+                            << cpp_strerror(-parse_ret) << dendl;
+          continue;
+        }
+        ldpp_dout(dpp, 20) <<__func__ << "::bucket=" << bucket << dendl;
+        if (!d_filter.allow_bucket(bucket.name)) {
+          ldpp_dout(dpp, 10) << __func__ << "::worker_id=" << worker_id
+                             << "::skip bucket (filter): " << bucket.name << dendl;
+          p_worker_stats->ingress_skip_filtered_bucket++;
+          continue;
+        }
+        int ingress_ret = ingress_bucket_objects_single_shard(disk_arr, bucket, worker_id,
+                                                              num_work_shards, p_worker_stats);
+        if (unlikely(ingress_ret != 0)) {
+          if (d_ctl.should_stop()) {
+            ret = -ECANCELED;
+            has_more = false;   // break from external loop
+            break; // internal loop
+          }
+          ldpp_dout(dpp, 1) << __func__ << "::Failed ingress_bucket_objects_single_shard()" << dendl;
+          continue;
+        }
+      }
     }
+
     ldpp_dout(dpp, 20) <<__func__ << "::flush_output_buffers() worker_id="
                        << worker_id << dendl;
     disk_arr.flush_output_buffers(dpp, d_dedup_cluster_ioctx);
@@ -3485,6 +3576,7 @@ namespace rgw::dedup {
     // 256x8KB=2MB
     const uint64_t PER_SHARD_BUFFER_SIZE = DISK_BLOCK_COUNT *sizeof(disk_block_t);
     ldpp_dout(dpp, 20) <<__func__ << "::dedup::main loop" << dendl;
+    bool has_default_placement_pool = false;
 
     while (!d_ctl.shutdown_req) {
       if (unlikely(d_ctl.should_pause())) {
@@ -3507,37 +3599,55 @@ namespace rgw::dedup {
           ldpp_dout(dpp, 1) << __func__ << "::bad pool_id" << dendl;
           return;
         }
-        work_shard_t num_work_shards = epoch.num_work_shards;
-        md5_shard_t  num_md5_shards  = epoch.num_md5_shards;
-        const uint64_t RAW_MEM_SIZE = PER_SHARD_BUFFER_SIZE * num_md5_shards;
-        ldpp_dout(dpp, 5) <<__func__ << "::RAW_MEM_SIZE=" << RAW_MEM_SIZE
-                          << "::num_work_shards=" << num_work_shards
-                          << "::num_md5_shards=" << num_md5_shards << dendl;
-        // DEDUP_DYN_ALLOC
-        auto raw_mem = std::make_unique<uint8_t[]>(RAW_MEM_SIZE);
-        if (raw_mem == nullptr) {
-          ldpp_dout(dpp, 1) << "failed slab memory allocation - size=" << RAW_MEM_SIZE << dendl;
-          return;
-        }
 
-        process_all_shards(true, &Background::f_ingress_work_shard, raw_mem.get(),
-                           RAW_MEM_SIZE, num_work_shards, num_md5_shards);
-        if (!d_ctl.should_stop()) {
-          // Wait for all other workers to finish ingress step
-          work_shards_barrier(num_work_shards);
-          if (!d_ctl.should_stop()) {
-            process_all_shards(false, &Background::f_dedup_md5_shard, raw_mem.get(),
-                               RAW_MEM_SIZE, num_work_shards, num_md5_shards);
-            // Wait for all other md5 shards to finish
-            md5_shards_barrier(num_md5_shards);
-            safe_pool_delete(store, dpp, pool_id);
+        if (!has_default_placement_pool) {
+          int ret = detect_pool_alignment(store, dpp, &d_pool_supports_truncate);
+          if (ret == 0) {
+            has_default_placement_pool = true;
+          }
+          else if (ret != -ENOENT) {
+            ldpp_dout(dpp, 1) << __func__ << "::ERR: Failed detect_pool_alignment -> exit" << dendl;
+            return;
           }
           else {
-            ldpp_dout(dpp, 5) <<__func__ << "::stop req from barrier" << dendl;
+            ldpp_dout(dpp, 1) << __func__ << "::default placement pool does not exist"
+                              << " -> There is nothing to dedup yet" << dendl;
           }
         }
-        else {
-          ldpp_dout(dpp, 5) <<__func__ << "::stop req from ingress_work_shard" << dendl;
+
+        if (has_default_placement_pool) {
+          work_shard_t num_work_shards = epoch.num_work_shards;
+          md5_shard_t  num_md5_shards  = epoch.num_md5_shards;
+          const uint64_t RAW_MEM_SIZE = PER_SHARD_BUFFER_SIZE * num_md5_shards;
+          ldpp_dout(dpp, 5) <<__func__ << "::RAW_MEM_SIZE=" << RAW_MEM_SIZE
+                            << "::num_work_shards=" << num_work_shards
+                            << "::num_md5_shards=" << num_md5_shards << dendl;
+          // DEDUP_DYN_ALLOC
+          auto raw_mem = std::make_unique<uint8_t[]>(RAW_MEM_SIZE);
+          if (raw_mem == nullptr) {
+            ldpp_dout(dpp, 1) << "failed slab memory allocation - size=" << RAW_MEM_SIZE << dendl;
+            return;
+          }
+
+          process_all_shards(true, &Background::f_ingress_work_shard, raw_mem.get(),
+                             RAW_MEM_SIZE, num_work_shards, num_md5_shards);
+          if (!d_ctl.should_stop()) {
+            // Wait for all other workers to finish ingress step
+            work_shards_barrier(num_work_shards);
+            if (!d_ctl.should_stop()) {
+              process_all_shards(false, &Background::f_dedup_md5_shard, raw_mem.get(),
+                                 RAW_MEM_SIZE, num_work_shards, num_md5_shards);
+              // Wait for all other md5 shards to finish
+              md5_shards_barrier(num_md5_shards);
+              safe_pool_delete(store, dpp, pool_id);
+            }
+            else {
+              ldpp_dout(dpp, 5) <<__func__ << "::stop req from barrier" << dendl;
+            }
+          }
+          else {
+            ldpp_dout(dpp, 5) <<__func__ << "::stop req from ingress_work_shard" << dendl;
+          }
         }
       } // dedup_exec
 

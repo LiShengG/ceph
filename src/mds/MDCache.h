@@ -126,6 +126,8 @@ enum {
   l_mdc_uninline_succeeded,
   l_mdc_uninline_write_failed,
 
+  l_mdc_cache_trim_throttle,
+
   l_mdc_last,
 };
 
@@ -1178,6 +1180,8 @@ private:
 
   // -- client caps --
   uint64_t last_cap_id = 0;
+
+  uint64_t num_backend_fetching = 0;  // count of in-flight background dirfrag fetches
 
   std::map<ceph_tid_t, discover_info_t> discovers;
   ceph_tid_t discover_last_tid = 0;

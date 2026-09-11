@@ -336,8 +336,10 @@ else:
             "nvmeof gateway refresh_network", model.GwRefreshNetworkStatus,
             alias="nvmeof gw refresh_network",
             success_message_template=("Refreshed configured network masks for subsystem "
-                                      "{nqn} on this gateway: Successful{added}{removed}"),
+                                      "{nqn} on gateway {server_address}: "
+                                      "Successful{added}{removed}"),
             success_message_map={
+                "server_address": lambda v, f: v or f.get("traddr"),
                 "added": lambda v, _f: f"\nAdded: {', '.join(v)}" if v else "",
                 "removed": lambda v, _f: f"\nRemoved: {', '.join(v)}" if v else "",
             }
@@ -347,18 +349,19 @@ else:
             parameters={
                 "nqn": Param(str, "NVMeoF subsystem NQN"),
                 "gw_group": Param(str, "NVMeoF gateway group", True, None),
-                "server_address": Param(str, "NVMeoF gateway address", True, None),
+                "server_address": Param(str, "NVMeoF gateway address"),
                 "traddr": Param(str, "NVMeoF gateway address (deprecated)", True, None),
             },
         )
         @convert_to_model(model.GwRefreshNetworkStatus)
         @handle_nvmeof_error
-        def refresh_network(self, nqn: str, gw_group: Optional[str] = None,
+        def refresh_network(self, nqn: str = "", gw_group: Optional[str] = None,
                             server_address: Optional[str] = None,
                             traddr: Optional[str] = None):
             server_address = resolve_nvmeof_server_address(
                 server_address=server_address,
-                traddr=traddr
+                traddr=traddr,
+                require=True
             )
             return NVMeoFClient(
                 gw_group=gw_group,
@@ -557,6 +560,7 @@ else:
                                           "Make all the auto-listeners for this subsystem secure",
                                           True, False),
                 "traddr": Param(str, "NVMeoF gateway address (deprecated)", True, None),
+                "model_name": Param(str, "Subsystem model name", True, None),
             },
         )
         @convert_to_model(model.SubsystemStatus)
@@ -567,7 +571,7 @@ else:
                    gw_group: Optional[str] = None, server_address: Optional[str] = None,
                    network_mask: Optional[List[str]] = None,
                    port: Optional[int] = None, secure_listeners: Optional[bool] = False,
-                   traddr: Optional[str] = None):
+                   traddr: Optional[str] = None, model_name: Optional[str] = None):
             server_address = resolve_nvmeof_server_address(
                 server_address=server_address,
                 traddr=traddr
@@ -581,7 +585,8 @@ else:
                     max_namespaces=max_namespaces, enable_ha=True,
                     no_group_append=no_group_append,
                     dhchap_key=dhchap_key, network_mask=network_mask,
-                    port=port, secure_listeners=secure_listeners
+                    port=port, secure_listeners=secure_listeners,
+                    model_name=model_name
                 )
             )
 
@@ -618,6 +623,9 @@ else:
 
         @Endpoint('PUT', '{nqn}/change_key')
         @UpdatePermission
+        @empty_response
+        @NvmeofCLICommand("nvmeof subsystem change_key", model.RequestStatus,
+                          success_message_template="Changing key for subsystem {nqn}: Successful")
         @EndpointDoc(
             "Change subsystem inband authentication key",
             parameters={
@@ -628,9 +636,6 @@ else:
                 "traddr": Param(str, "NVMeoF gateway address (deprecated)", True, None),
             },
         )
-        @empty_response
-        @NvmeofCLICommand("nvmeof subsystem change_key", model.RequestStatus,
-                          success_message_template="Changing key for subsystem {nqn}: Successful")
         @convert_to_model(model.RequestStatus)
         @handle_nvmeof_error
         def change_key(self, nqn: str, dhchap_key: str, gw_group: Optional[str] = None,
@@ -650,6 +655,9 @@ else:
                 )
             )
 
+        @empty_response
+        @NvmeofCLICommand("nvmeof subsystem del_key", model.RequestStatus,
+                          success_message_template="Deleting key for subsystem {nqn}: Successful")
         @EndpointDoc(
             "Delete subsystem inband authentication key",
             parameters={
@@ -659,9 +667,6 @@ else:
                 "traddr": Param(str, "NVMeoF gateway address (deprecated)", True, None),
             },
         )
-        @empty_response
-        @NvmeofCLICommand("nvmeof subsystem del_key", model.RequestStatus,
-                          success_message_template="Deleting key for subsystem {nqn}: Successful")
         @convert_to_model(model.RequestStatus)
         @handle_nvmeof_error
         def del_key(self, nqn: str, gw_group: Optional[str] = None,
@@ -805,6 +810,13 @@ else:
                 "gw_group": Param(str, "NVMeoF gateway group", True, None),
                 "server_address": Param(str, "NVMeoF gateway address", True, None),
                 "traddr": Param(str, "NVMeoF gateway address (deprecated)", True, None),
+                "force": Param(
+                    bool,
+                    "Allow deleting the KMIP server's endpoint even if encrypted "
+                    "(or degraded) namespaces still use it",
+                    True,
+                    False
+                ),
             },
         )
         @convert_to_model(model.RequestStatus)
@@ -813,7 +825,8 @@ else:
                                      address: Optional[str] = None,
                                      port: Optional[int] = 5696, gw_group: Optional[str] = None,
                                      server_address: Optional[str] = None,
-                                     traddr: Optional[str] = None):
+                                     traddr: Optional[str] = None,
+                                     force: Optional[bool] = False):
             server_address = resolve_nvmeof_server_address(
                 server_address=server_address,
                 traddr=traddr
@@ -825,7 +838,8 @@ else:
             ).stub.del_kmip_server_endpoints(
                 NVMeoFClient.pb2.del_kmip_server_endpoints_req(
                     subsystem_nqn=nqn, server_name=server_name,
-                    endpoints=[ep]
+                    endpoints=[ep],
+                    force=str_to_bool(force)
                 )
             )
 
@@ -1044,6 +1058,7 @@ else:
 
     @APIRouter("/nvmeof/subsystem/{nqn}/namespace", Scope.NVME_OF)
     @APIDoc("NVMe-oF Subsystem Namespace Management API", "NVMe-oF Subsystem Namespace")
+    # pylint: disable=too-many-public-methods
     class NVMeoFNamespace(RESTController):
         @pick("namespaces")
         @NvmeofCLICommand(
@@ -1263,7 +1278,8 @@ else:
             "nvmeof namespace add",
             model.NamespaceCreation,
             alias="nvmeof ns add",
-            success_message_template="Adding namespace {nsid} to {nqn}: Successful"
+            success_message_template="Adding namespace {nsid} to {nqn}: Successful",
+            deprecated_params={"size": "--size is deprecated, please use --rbd-image-size"}
         )
         @EndpointDoc(
             "Create a new NVMeoF namespace.",
@@ -2058,6 +2074,51 @@ else:
                 )
             )
 
+        @ReadPermission
+        @Endpoint('PUT', '{nsid}/unpin')
+        @NvmeofCLICommand(
+            "nvmeof namespace unpin",
+            model=model.RequestStatus,
+            alias="nvmeof ns unpin",
+            success_message_template=(
+                'Unpinning load balancing group for namespace {nsid} '
+                'in {nqn}: Successful'
+            ),
+        )
+        @EndpointDoc(
+            "Unpin namespace load balancing group",
+            parameters={
+                "nqn": Param(str, "NVMeoF subsystem NQN"),
+                "nsid": Param(str, "NVMeoF Namespace ID"),
+                "gw_group": Param(str, "NVMeoF gateway group", True, None),
+                "server_address": Param(str, "NVMeoF gateway address", True, None),
+                "traddr": Param(str, "NVMeoF gateway address (deprecated)", True, None),
+            },
+        )
+        @convert_to_model(model.RequestStatus)
+        @handle_nvmeof_error
+        def unpin_ns(
+            self,
+            nqn: str,
+            nsid: str,
+            gw_group: Optional[str] = None,
+            server_address: Optional[str] = None,
+            traddr: Optional[str] = None
+        ):
+            server_address = resolve_nvmeof_server_address(
+                server_address=server_address,
+                traddr=traddr
+            )
+            return NVMeoFClient(
+                gw_group=gw_group,
+                server_address=server_address
+            ).stub.namespace_unpin(
+                NVMeoFClient.pb2.namespace_unpin_req(
+                    subsystem_nqn=nqn,
+                    nsid=int(nsid),
+                )
+            )
+
         @pick("namespaces", first=True)
         @NvmeofCLICommand(
             "nvmeof namespace update", model.NamespaceList, alias="nvmeof ns update"
@@ -2336,6 +2397,10 @@ else:
                 "gw_group": Param(str, "NVMeoF gateway group", True, None),
                 "server_address": Param(str, "NVMeoF gateway address", True, None),
                 "traddr": Param(str, "NVMeoF gateway address (deprecated)", True, None),
+                "keep_connections": Param(
+                    bool,
+                    "Do not disconnect existing connections from that host",
+                    True, False),
             },
         )
         @convert_to_model(model.RequestStatus)
@@ -2343,7 +2408,8 @@ else:
         def delete(self, nqn: str, host_nqn: str, force: Optional[bool] = False,
                    gw_group: Optional[str] = None,
                    server_address: Optional[str] = None,
-                   traddr: Optional[str] = None):
+                   traddr: Optional[str] = None,
+                   keep_connections: Optional[bool] = False):
             server_address = resolve_nvmeof_server_address(
                 server_address=server_address,
                 traddr=traddr
@@ -2352,7 +2418,8 @@ else:
                 gw_group=gw_group,
                 server_address=server_address
             ).stub.remove_host(
-                NVMeoFClient.pb2.remove_host_req(subsystem_nqn=nqn, host_nqn=host_nqn, force=force)
+                NVMeoFClient.pb2.remove_host_req(subsystem_nqn=nqn, host_nqn=host_nqn, force=force,
+                                                 keep_connections=keep_connections)
             )
 
         @empty_response

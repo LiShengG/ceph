@@ -321,7 +321,8 @@ add_dependencies(ceph_test_librgw_file
   ceph_test_librgw_file_rename
   ceph_test_librgw_file_nfsns
   ceph_test_librgw_file_aw
-  ceph_test_librgw_file_marker)
+  ceph_test_librgw_file_marker
+  ceph_test_librgw_file_create)
 
 # ceph_test_librgw_file_cd (just the rgw_file create-delete bucket ops)
 add_executable(ceph_test_librgw_file_cd
@@ -450,6 +451,20 @@ target_link_libraries(ceph_test_librgw_file_rename
   ${ALLOC_LIBS}
   )
 install(TARGETS ceph_test_librgw_file_rename DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+# ceph_test_librgw_file_create (librgw_create() single-call semantics test)
+add_executable(ceph_test_librgw_file_create
+  librgw_file_create.cc
+  )
+target_link_libraries(ceph_test_librgw_file_create
+  rgw
+  librados
+  ceph-common
+  ${UNITTEST_LIBS}
+  ${EXTRALIBS}
+  ${ALLOC_LIBS}
+  )
+install(TARGETS ceph_test_librgw_file_create DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 # ceph_test_rgw_token
 add_executable(ceph_test_rgw_token
@@ -1060,6 +1075,9 @@ add_ceph_unittest(unittest_weighted_shuffle)
 
 add_executable(unittest_intarith test_intarith.cc)
 add_ceph_unittest(unittest_intarith)
+
+add_catch2_test(concepts)
+
 #make check ends here
 
 # test_nvmeof_mon_encoding
@@ -1109,4 +1127,3 @@ add_executable(test_nvmeof_gw_utils
 target_link_libraries(test_nvmeof_gw_utils
   mon ceph-common global-static
   )
-

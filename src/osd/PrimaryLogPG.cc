@@ -105,7 +105,6 @@ using ceph::bufferlist;
 using ceph::bufferptr;
 using ceph::Formatter;
 using ceph::decode;
-using ceph::decode_noclear;
 using ceph::encode;
 using ceph::encode_destructively;
 
@@ -875,6 +874,12 @@ bool PrimaryLogPG::check_laggy(OpRequestRef& op)
 
     // go to laggy state
     state_set(PG_STATE_LAGGY);
+    const auto& acting_osds = recovery_state.get_acting();
+    auto msg = fmt::format("PG {} marked LAGGY; acting [{}]",
+                           get_pgid(), fmt::join(acting_osds, ","));
+    dout(0) << __func__ << " " << msg << dendl;
+    osd->clog->warn() << msg;
+
     publish_stats_to_osd();
   }
   dout(10) << __func__ << " not readable" << dendl;
@@ -2724,6 +2729,15 @@ PrimaryLogPG::cache_result_t PrimaryLogPG::maybe_handle_manifest_detail(
       MOSDOp *m = static_cast<MOSDOp*>(op->get_nonconst_req());
       ceph_assert(m->get_type() == CEPH_MSG_OSD_OP);
       hobject_t head = m->get_hobj();
+
+      // Balanced/Localized reads can be sent to a replica shard
+      // which cannot test if an object is degarded or backfilling
+      // redirect these requests to the primary
+      if (!is_primary()) {
+        dout(20) << __func__ << " need to redirect to primary" << dendl;
+        osd->reply_op_error(op, -EAGAIN);
+        return cache_result_t::REPLIED_WITH_EAGAIN;
+      }
 
       if (is_degraded_or_backfilling_object(head)) {
 	dout(20) << __func__ << ": " << head << " is degraded, waiting" << dendl;
@@ -4650,8 +4664,7 @@ void PrimaryLogPG::do_scan(
       auto p = m->get_data().cbegin();
 
       // take care to preserve ordering!
-      bi.clear_objects();
-      decode_noclear(bi.objects, p);
+      decode(bi.objects, p);
       dout(10) << __func__ << " bi.begin=" << bi.begin << " bi.end=" << bi.end
                << " bi.objects.size()=" << bi.objects.size() << dendl;
 
@@ -9194,7 +9207,12 @@ int PrimaryLogPG::prepare_transaction(OpContext *ctx)
     make_writeable(ctx);
 
   int log_op_type;
-  if (ctx->use_replace_op) {
+  // REPLACE (op 11) was added in umbrella. Tentacle is_update() does not
+  // include it, so a mixed-version peer that later becomes primary will
+  // assert in recover_primary. Only use REPLACE once require_osd_release
+  // says every OSD understands it; until then keep the old MODIFY/DELETE.
+  if (ctx->use_replace_op &&
+      get_osdmap()->require_osd_release >= ceph_release_t::umbrella) {
     log_op_type = pg_log_entry_t::REPLACE;
   } else {
     log_op_type = ctx->new_obs.exists ? pg_log_entry_t::MODIFY :
@@ -16049,6 +16067,10 @@ boost::statechart::result PrimaryLogPG::NotTrimming::react(const KickTrim&)
   if (!pg->is_clean() ||
       pg->snap_trimq.empty()) {
     ldout(pg->cct, 10) << "NotTrimming not clean or nothing to trim" << dendl;
+    return discard_event();
+  }
+  if (pg->get_osdmap()->test_flag(CEPH_OSDMAP_NOSNAPTRIM)) {
+    ldout(pg->cct, 10) << "NotTrimming as the nosnaptrim flag is set" << dendl;
     return discard_event();
   }
   if (pg->is_scrub_queued_or_active()) {

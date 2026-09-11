@@ -19,6 +19,7 @@
 
 #include <rocksdb/version.h>
 
+#include "common/debug.h"
 #include "common/errno.h"
 #include "common/perf_counters_key.h"
 #include "crush/CrushWrapper.h"
@@ -675,13 +676,14 @@ std::optional<std::vector<std::byte>> ActivePyModules::dispatch_remote(
     const std::string &method,
     std::span<std::byte const> pickled_args,
     std::span<std::byte const> pickled_kwargs,
-    std::string *err)
+    std::string *err,
+    bool *crash_dump)
 {
   auto mod_iter = modules.find(other_module);
   ceph_assert(mod_iter != modules.end());
 
   return mod_iter->second->dispatch_remote(
-    method, pickled_args, pickled_kwargs, err);
+    method, pickled_args, pickled_kwargs, err, crash_dump);
 }
 
 
@@ -758,7 +760,15 @@ PyObject *ActivePyModules::get_store_prefix(const std::string &module_name,
   PyFormatter f;
   for (auto p = store_cache.lower_bound(global_prefix);
        p != store_cache.end() && p->first.find(global_prefix) == 0; ++p) {
-    f.dump_string(p->first.c_str() + base_prefix.size(), p->second);
+    PyObject *value = PyUnicode_FromStringAndSize(
+      p->second.c_str(), p->second.size());
+    if (!value) {
+      dout(1) << __func__ << " skipping key " << p->first
+              << " due to PyUnicode_FromStringAndSize failure" << dendl;
+      PyErr_Clear();
+      continue;
+    }
+    f.dump_pyobject(p->first.substr(base_prefix.size()).c_str(), value);
   }
   return f.get();
 }

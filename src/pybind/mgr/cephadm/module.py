@@ -17,7 +17,14 @@ from threading import Event
 
 from ceph.deployment.service_spec import PrometheusSpec
 from cephadm.cert_mgr import CertMgr
+from .utils import get_default_ssh_config
 from cephadm.tlsobject_store import TLSObjectScope, TLSObjectException
+from ceph.deployment.tls_utils import (
+    SSLConfigException,
+    contains_private_key,
+    contains_multiple_pem_blocks,
+    parse_tls_pem_bundle
+)
 
 import string
 from typing import List, Dict, Optional, Callable, Tuple, TypeVar, \
@@ -34,6 +41,7 @@ from prettytable import PrettyTable
 from ceph.cephadm.images import DefaultImages
 from ceph.deployment import inventory
 from ceph.deployment.drive_group import DriveGroupSpec, OSDType
+from ceph.deployment.hostspec import normalize_hostname
 from ceph.deployment.service_spec import (
     ServiceSpec,
     PlacementSpec,
@@ -101,11 +109,12 @@ from .inventory import (
 from .upgrade import CephadmUpgrade
 from .template import TemplateMgr
 from .utils import CEPH_IMAGE_TYPES, RESCHEDULE_FROM_OFFLINE_HOSTS_TYPES, forall_hosts, \
-    cephadmNoImage, SpecialHostLabels
+    cephadmNoImage, SpecialHostLabels, is_fips_enabled
 from .configchecks import CephadmConfigChecks
 from .offline_watcher import OfflineHostWatcher
 from .tuned_profiles import TunedProfileUtils
 from .ceph_volume import CephVolume
+from .version_tracker import VersionTracker
 
 try:
     import asyncssh
@@ -143,13 +152,15 @@ def host_exists(hostname_position: int = 1) -> Callable:
         @wraps(func)
         def wrapper(*args: Any, **kwargs: Any) -> Any:
             this = args[0]  # self object
-            hostname = args[hostname_position]
+            hostname = normalize_hostname(args[hostname_position])
             if hostname not in this.cache.get_hosts():
                 candidates = ','.join([h for h in this.cache.get_hosts() if h.startswith(hostname)])
                 help_msg = f"Did you mean {candidates}?" if candidates else ""
                 raise OrchestratorError(
                     f"Cannot find host '{hostname}' in the inventory. {help_msg}")
 
+            args = list(args)  # type: ignore
+            args[hostname_position] = hostname
             return func(*args, **kwargs)
         return wrapper
     return inner
@@ -157,6 +168,7 @@ def host_exists(hostname_position: int = 1) -> Callable:
 
 class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule):
     CLICommand = CephadmCLICommand
+
     _STORE_HOST_PREFIX = "host"
 
     instance = None
@@ -197,7 +209,7 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule):
         Option(
             'facts_cache_timeout',
             type='secs',
-            default=1 * 60,
+            default=10 * 60,
             desc='Seconds for which to cache host facts data',
         ),
         Option(
@@ -553,6 +565,17 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule):
                  'When enabled, cephadm and bash commands are validated and executed via '
                  'the secure invoker wrapper.'
         ),
+        Option(
+            'log_deploy_configuration',
+            type='bool',
+            default=False,
+            desc=(
+                'Whether to log deploy config for daemons cephadm deploys in both the cephadm mgr '
+                'module and cephadm.log on individual hosts. Useful for debugging and developers, '
+                'but these log statements may contain sensitive info such as cephx keys. Only relevant '
+                'when logging at debug level'
+            )
+        )
     ]
     for image in DefaultImages:
         MODULE_OPTIONS.append(Option(image.key, default=image.image_ref, desc=image.desc))
@@ -669,6 +692,7 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule):
             self.certificate_check_debug_mode = False
             self.certificate_check_period = 0
             self.cephadm_binary_logging_level = 'debug'
+            self.log_deploy_configuration = False
 
         self.notify(NotifyType.mon_map, None)
         self.config_notify()
@@ -689,6 +713,8 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule):
         self.ssh._reconfig_ssh()
 
         CephadmOrchestrator.instance = self
+
+        self.version_tracker = VersionTracker(self)
 
         self.upgrade = CephadmUpgrade(self)
 
@@ -1178,6 +1204,7 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule):
         self.offline_watcher.set_hosts(list(set([h for h in hosts_to_watch if h is not None])))
 
     def offline_hosts_remove(self, host: str) -> None:
+        host = normalize_hostname(host)
         if host in self.offline_hosts:
             self.offline_hosts.remove(host)
             self._invalidate_all_host_metadata_and_kick_serve(host)
@@ -1384,7 +1411,7 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule):
         ssh_config = self.get_store("ssh_config")
         if ssh_config:
             return HandleCommandResult(stdout=ssh_config)
-        return HandleCommandResult(stdout=DEFAULT_SSH_CONFIG)
+        return HandleCommandResult(stdout=get_default_ssh_config())
 
     @CephadmCLICommand.Write('cephadm generate-key')
     def _generate_key(self) -> Tuple[int, str, str]:
@@ -1392,16 +1419,31 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule):
         Generate a cluster SSH key (if not present)
         """
         if not self.ssh_pub or not self.ssh_key:
-            self.log.info('Generating ssh key...')
+            fips_enabled = is_fips_enabled()
+            key_type = 'rsa' if fips_enabled else 'ed25519'
+            self.log.info(
+                'Generating %s ssh key%s...',
+                key_type,
+                ' for FIPS mode' if fips_enabled else '',
+            )
             tmp_dir = TemporaryDirectory()
             path = tmp_dir.name + '/key'
+            args = [
+                '/usr/bin/ssh-keygen',
+                '-t', key_type,
+            ]
+
+            if fips_enabled:
+                args.extend(['-b', '4096'])
+
+            args.extend([
+                '-C', 'ceph-%s' % self._cluster_fsid,
+                '-N', '',
+                '-f', path,
+            ])
+
             try:
-                subprocess.check_call([
-                    '/usr/bin/ssh-keygen',
-                    '-C', 'ceph-%s' % self._cluster_fsid,
-                    '-N', '',
-                    '-f', path
-                ])
+                subprocess.check_call(args)
                 with open(path, 'r') as f:
                     secret = f.read()
                 with open(path + '.pub', 'r') as f:
@@ -2224,7 +2266,20 @@ Then run the following:
         :param host: host name
         """
         HostSpec.validate(spec)
-        ip_addr = self._check_valid_addr(spec.hostname, spec.addr)
+        # Drop the cached SSH connection when re-adding a host with a new
+        # address. Otherwise check-host may reuse the old connection and
+        # validate the wrong machine.
+        addr_changed = spec.hostname in self.inventory and self.inventory.get_addr(spec.hostname) != spec.addr
+        if addr_changed:
+            self.ssh.reset_con(spec.hostname)
+        try:
+            ip_addr = self._check_valid_addr(spec.hostname, spec.addr)
+        except Exception:
+            # Validation failed. Clear the connection we just created to the
+            # wrong address so future operations use a fresh connection.
+            if addr_changed:
+                self.ssh.reset_con(spec.hostname)
+            raise
         if spec.addr == spec.hostname and ip_addr:
             spec.addr = ip_addr
 
@@ -2354,6 +2409,8 @@ Then run the following:
         :param force: bypass running daemons check
         :param offline: remove offline host
         """
+        original_host = host
+        host = normalize_hostname(host)
 
         # check if host is offline
         host_offline = host in self.offline_hosts
@@ -2422,7 +2479,7 @@ Then run the following:
 
             cmd_args = {
                 'prefix': 'osd crush rm',
-                'name': host
+                'name': original_host
             }
             run_cmd(cmd_args)
 
@@ -2430,7 +2487,7 @@ Then run the following:
             try:
                 self.check_mon_command({
                     'prefix': 'osd crush remove',
-                    'name': host,
+                    'name': original_host,
                 })
             except MonCommandFailed as e:
                 self.log.error(f'Couldn\'t remove host {host} from CRUSH map: {str(e)}')
@@ -2449,6 +2506,10 @@ Then run the following:
 
     @handle_orch_error
     def update_host_addr(self, host: str, addr: str) -> str:
+        host = normalize_hostname(host)
+        # Drop the cached connection before validating so check-host
+        # runs on the new address, not the old one.
+        self.ssh.reset_con(host)
         self._check_valid_addr(host, addr)
         self.inventory.set_addr(host, addr)
         self.ssh.reset_con(host)
@@ -2489,6 +2550,7 @@ Then run the following:
 
     @handle_orch_error
     def remove_host_label(self, host: str, label: str, force: bool = False) -> str:
+        host = normalize_hostname(host)
         # if we remove the _admin label from the only host that has it we could end up
         # removing the only instance of the config and keyring and cause issues
         if not force and label == SpecialHostLabels.ADMIN:
@@ -2548,6 +2610,7 @@ Then run the following:
 
     @handle_orch_error
     def host_ok_to_stop(self, hostname: str) -> str:
+        hostname = normalize_hostname(hostname)
         if hostname not in self.cache.get_hosts():
             raise OrchestratorError(f'Cannot find host "{hostname}"', errno=errno.EINVAL)
 
@@ -3023,6 +3086,26 @@ Then run the following:
                 result.append(dd)
         return result
 
+    def _unmanaged_noop_note(self, service_name: str) -> Optional[str]:
+        """Warn when an orch action is scheduled but deferred by unmanaged.
+
+        Returns a note only when a matching service spec exists with
+        ``unmanaged=True``. That matches serve.py behavior: scheduled daemon
+        actions and reconciliation are skipped for those specs.
+
+        Intentionally returns None for daemons whose service name is not in
+        the spec store (notably adopted OSDs under the bare ``osd`` service).
+        Those are still acted on by explicit ``ceph orch daemon ...`` commands.
+        """
+        spec = self.spec_store.all_specs.get(service_name)
+        if not spec or not spec.unmanaged:
+            return None
+        return (
+            f'NOTE: {service_name} is unmanaged. The operation will take effect'
+            f' only when the service becomes managed'
+            f' (e.g. `ceph orch set-managed {service_name}`).'
+        )
+
     def perform_service_action(self, action: str, service_name: str) -> List[str]:
         dds: List[DaemonDescription] = self.cache.get_daemons_by_service(service_name)
         if not dds:
@@ -3042,7 +3125,24 @@ Then run the following:
         if action == 'stop' and service_name.split('.')[0].lower() in ['mgr', 'mon', 'osd']:
             return [f'Stopping entire {service_name} service is prohibited.']
 
-        return self.perform_service_action(action, service_name)
+        results = self.perform_service_action(action, service_name)
+        note = self._unmanaged_noop_note(service_name)
+        if note:
+            results.append(note)
+        return results
+
+    def key_rotate(self, daemon_spec: CephadmDaemonDeploySpec) -> None:
+        rc, out, err = self.mon_command({
+            'prefix': 'auth rotate',
+            'entity': daemon_spec.entity_name(),
+            'format': 'json',
+            'key_type': utils.ROTATION_CIPHER
+        })
+        if rc:
+            raise OrchestratorError(
+                f'Failed to rotate daemon key for {daemon_spec.entity_name()}.\n'
+                f'Rc: {rc}\nOut: {out}\nErr: {err}'
+            )
 
     def _rotate_daemon_key(self, daemon_spec: CephadmDaemonDeploySpec) -> str:
         self.log.info(f'Rotating authentication key for {daemon_spec.name()}')
@@ -3136,7 +3236,7 @@ Then run the following:
             return ''  # unreachable
 
         if action == 'rotate-key':
-            return self._rotate_daemon_key(daemon_spec)
+            raise OrchestratorError('rotate-key is not supported in this release')
 
         if action == 'redeploy' or action == 'reconfig' or (action == 'restart' and self._mon_public_network_changed(daemon_spec)):
             if action == 'restart':
@@ -3217,11 +3317,13 @@ Then run the following:
                 raise OrchestratorError(f'Unable to {action} daemon {d.name()}: {r.stderr} \nNote: Warnings can be bypassed with the --force flag')
 
         if action == 'rotate-key':
-            if d.daemon_type not in ['mgr', 'osd', 'mds',
-                                     'rgw', 'crash', 'nfs', 'rbd-mirror', 'iscsi']:
-                raise OrchestratorError(
-                    f'key rotation not supported for {d.daemon_type}'
-                )
+            # TODO: add this commented section back once this command is fixed
+            # if d.daemon_type not in ['mgr', 'osd', 'mds',
+            #                          'rgw', 'crash', 'nfs', 'rbd-mirror', 'iscsi']:
+            #     raise OrchestratorError(
+            #         f'key rotation not supported for {d.daemon_type}'
+            #     )
+            raise OrchestratorError(f'key rotation by orchestrator not supported in this release (for {d.name()})')
 
         # Track user-initiated stop/start actions
         if action == 'stop':
@@ -3234,7 +3336,11 @@ Then run the following:
         self._daemon_action_set_image(action, image, d.daemon_type, d.daemon_id)
 
         self.log.info(f'Schedule {action} daemon {daemon_name}')
-        return self._schedule_daemon_action(daemon_name, action)
+        msg = self._schedule_daemon_action(daemon_name, action)
+        note = self._unmanaged_noop_note(d.service_name())
+        if note:
+            msg += f'\n{note}'
+        return msg
 
     def daemon_is_self(self, daemon_type: str, daemon_id: str) -> bool:
         return daemon_type == 'mgr' and daemon_id == self.get_mgr_id()
@@ -3276,7 +3382,7 @@ Then run the following:
                                   <fsid>/removed/.
         """
         args = []
-        for host, dm in self.cache.daemons.items():
+        for host, dm in list(self.cache.daemons.items()):
             for name in names:
                 if name in dm:
                     args.append((name, host, force_delete_data))
@@ -3335,15 +3441,6 @@ Then run the following:
                     msg += f'\thost {h}: {" ".join([f"osd.{id}" for id in ls])}'
                 raise OrchestratorError(
                     f'If {service_name} is removed then the following OSDs will remain, --force to proceed anyway\n{msg}')
-        elif service_name.startswith('nfs.'):
-            # check if its using old node id style and remove from mon store
-            nfs_services = self.get_store('nfs_services_with_old_nodeid')
-            if nfs_services:
-                nfs_services = nfs_services.split(',')
-                if service_name in nfs_services:
-                    nfs_services.remove(service_name)
-                    val = ','.join(nfs_services) if nfs_services else None
-                    self.set_store('nfs_services_with_old_nodeid', val)
 
         spec = self.spec_store[service_name].spec
         CephadmServe(self)._remove_service_config(spec)
@@ -3408,9 +3505,10 @@ Then run the following:
             str: output from the zap command
         """
 
+        host = normalize_hostname(host)
         self.log.info('Zap device %s:%s' % (host, path))
 
-        if host not in self.inventory.keys():
+        if host not in self.inventory:
             raise OrchestratorError(
                 f"Host '{host}' is not a member of the cluster")
 
@@ -4126,6 +4224,36 @@ Then run the following:
         if consumer not in self.cert_mgr.list_consumers():
             raise OrchestratorError(f"Invalid service: {consumer}. Please use 'ceph orch certmgr bindings ls' to list valid bindings.")
 
+        # --- Fullchain PEM auto-detection -----------------------------------
+        # When the user passes a fullchain PEM (private key + cert chain bundled
+        # in a single blob) as the ``cert`` argument the key is extracted here so
+        # the rest of the function always operates on a clean cert-only PEM and an
+        # explicit key string. A cert blob with multiple CERTIFICATE blocks but no
+        # embedded key (e.g. leaf + intermediates) is also normalised here, even
+        # when a separate --key argument was supplied.
+        if contains_private_key(cert) and key:
+            raise OrchestratorError(
+                'Received a fullchain PEM (cert blob contains an embedded private key) '
+                'but a separate --key argument was also provided. '
+                'Please either supply the fullchain PEM without a separate key, '
+                'or supply a plain certificate PEM with the key separately.'
+            )
+        if contains_private_key(cert) or contains_multiple_pem_blocks(cert):
+            try:
+                cert, split_key = parse_tls_pem_bundle(cert)
+            except SSLConfigException as exc:
+                raise OrchestratorError(f'Failed to parse fullchain PEM: {exc}') from exc
+            if split_key:
+                key = split_key
+        # --------------------------------------------------------------------
+
+        if not cert or not key:
+            raise OrchestratorError(
+                'A certificate and a private key are both required to set a cert/key pair. '
+                'Provide a fullchain PEM (certificate with an embedded private key) or supply '
+                'the private key separately.'
+            )
+
         # Check the certificate validity status
         target = service_name or hostname
         cert_info = self.cert_mgr.check_certificate_state(consumer, target, cert, key)
@@ -4168,6 +4296,25 @@ Then run the following:
         hostname: str = "",
         force: bool = False
     ) -> str:
+
+        # --- Reject embedded key material on the cert-only path -------------
+        # This endpoint has no key parameter to redirect a key to, so a cert
+        # blob with an embedded private key must be rejected outright rather
+        # than silently persisted under the cert object. A multi-block,
+        # key-free cert chain is still normalised via parse_tls_pem_bundle.
+        if contains_private_key(cert):
+            raise OrchestratorError(
+                'The certificate PEM contains private key material. '
+                "Use 'ceph orch certmgr cert-key set' instead of "
+                "'ceph orch certmgr cert set', or provide the bundle through a "
+                'service spec field that supports fullchain PEM input.'
+            )
+        if contains_multiple_pem_blocks(cert):
+            try:
+                cert, _ = parse_tls_pem_bundle(cert)
+            except SSLConfigException as exc:
+                raise OrchestratorError(f'Failed to parse certificate PEM: {exc}') from exc
+        # ----------------------------------------------------------------------
 
         debug_mode = self.certificate_check_debug_mode and force
         if not debug_mode:
@@ -4515,6 +4662,77 @@ Then run the following:
             and bool(nvmeof_spec.group)
         )
 
+    def _check_and_migrate_legacy_rgw_frontend_ssl_field(self, spec: ServiceSpec) -> None:
+        """
+        Strictly validate and migrate RGW's legacy ``rgw_frontend_ssl_certificate``
+        field when a spec is applied through cephadm.
+
+        ``RGWSpec.validate()`` already attempts a best-effort, non-destructive
+        migration of this legacy field during spec deserialization. That path must
+        not raise on parsing failures because it is also used when loading stored
+        specs from the config-key store during mgr restart, failover, or upgrade.
+        Failing there could prevent an existing RGW spec from being loaded.
+
+        This helper is intentionally stricter and is meant for the user-facing apply
+        path only, before the spec is persisted. If a newly applied RGW spec still
+        uses ``rgw_frontend_ssl_certificate``, require it to contain a valid combined
+        PEM bundle with one unencrypted private key and at least one certificate. On
+        success, migrate it to ``ssl_cert`` / ``ssl_key`` and clear the legacy field.
+        On failure, raise ``OrchestratorError`` so bad new input is rejected instead
+        of being stored.
+        """
+
+        if spec.service_type != 'rgw':
+            return
+
+        from ceph.deployment.service_spec import RGWSpec
+        spec = cast(RGWSpec, spec)
+
+        if not spec.ssl:
+            return
+
+        # If ssl_cert is already set, do not touch the legacy field. The new
+        # ssl_cert/ssl_key fields take precedence.
+        if spec.ssl_cert:
+            return
+
+        legacy_cert = spec.rgw_frontend_ssl_certificate
+        if legacy_cert is None:
+            return
+
+        from ceph.deployment.tls_utils import SSLConfigException, parse_tls_pem_bundle
+
+        if isinstance(legacy_cert, list):
+            combined_cert = '\n'.join(legacy_cert)
+        else:
+            combined_cert = legacy_cert
+
+        try:
+            ssl_cert, ssl_key = parse_tls_pem_bundle(combined_cert)
+        except SSLConfigException as e:
+            raise OrchestratorError(
+                'Failed to parse rgw_frontend_ssl_certificate field. '
+                'Expected a PEM bundle containing an unencrypted private key '
+                'and at least one certificate: private key + leaf certificate '
+                '+ optional intermediate CA certificates. '
+                f'Parser error: {e}'
+            ) from e
+
+        if not (ssl_cert and ssl_key):
+            raise OrchestratorError(
+                'Invalid rgw_frontend_ssl_certificate field. '
+                'Expected a combined PEM bundle containing both an unencrypted '
+                'private key and at least one certificate: private key + leaf '
+                'certificate + optional intermediate CA certificates. '
+                'A certificate chain without the private key is not valid for '
+                'this field.'
+            )
+
+        spec.ssl_cert = ssl_cert
+        spec.ssl_key = ssl_key
+        spec.certificate_source = CertificateSource.INLINE.value
+        spec.rgw_frontend_ssl_certificate = None
+
     def _apply_service_spec(self, spec: ServiceSpec) -> str:
         if spec.placement.is_empty():
             # fill in default placement
@@ -4559,6 +4777,7 @@ Then run the following:
         host_count = len(self.inventory.keys())
         max_count = self.max_count_per_host
 
+        self._check_and_migrate_legacy_rgw_frontend_ssl_field(spec)
         cert_warning = self._check_cert_source(spec)
 
         if spec.service_type == 'nvmeof':
@@ -4613,7 +4832,18 @@ Then run the following:
             spec.service_name(), spec.placement.pretty_str()))
         self.spec_store.save(spec)
         self._kick_serve_loop()
-        return f"Scheduled {spec.service_name()} update...{cert_warning}"
+        msg = f"Scheduled {spec.service_name()} update...{cert_warning}"
+        if spec.unmanaged:
+            # Spec is stored, but reconciliation/_check_daemons will no-op until
+            # the service is managed again. Do not special-case OSDs here: an
+            # unmanaged drive-group apply also creates no OSDs.
+            msg += (
+                f'\nNOTE: {spec.service_name()} is unmanaged. The spec has been'
+                f' saved but daemon changes will take effect only when the'
+                f' service becomes managed'
+                f' (e.g. `ceph orch set-managed {spec.service_name()}`).'
+            )
+        return msg
 
     @handle_orch_error
     def apply(
@@ -4768,8 +4998,8 @@ Then run the following:
             'up_to_date': list(),
             'non_ceph_image_daemons': list()
         }
-        for host, dm in self.cache.daemons.items():
-            for name, dd in dm.items():
+        for host, dm in list(self.cache.daemons.items()):
+            for name, dd in list(dm.items()):
                 # check if the container digest for the digest we're checking upgrades for matches
                 # the container digests for the daemon if "use_repo_digest" setting is true
                 # or that the image name matches the daemon's image name if "use_repo_digest"
@@ -4874,6 +5104,7 @@ Then run the following:
                        clear: bool = False,
                        yes_i_really_mean_it: bool = False) -> Any:
         output: str = ''
+        hostname = normalize_hostname(hostname)
 
         self.ceph_volume.lvm_list.get_data(hostname=hostname)
 
@@ -4881,7 +5112,7 @@ Then run the following:
             output = self.ceph_volume.clear_replace_header(hostname, device)
         else:
             osds_to_zap: List[str] = []
-            if hostname not in list(self.inventory.keys()):
+            if hostname not in self.inventory:
                 raise OrchestratorError(f'{hostname} invalid host.')
 
             if device not in self.ceph_volume.lvm_list.all_devices():
@@ -5096,3 +5327,20 @@ Then run the following:
     def trigger_connect_dashboard_rgw(self) -> None:
         self.need_connect_dashboard_rgw = True
         self.event.set()
+
+    @CephadmCLICommand.Read('cephadm get-cluster-version-history')
+    def do_get_cluster_version_history(self, show_config: Optional[bool] = False) -> HandleCommandResult:
+        '''
+        Shows all previous and current cluster versions ordered chronologically
+        '''
+        out = self.version_tracker.get_cluster_version_history(show_config)
+        return HandleCommandResult(stdout=out)
+
+    @CephadmCLICommand.Write('cephadm remove-cluster-version-history')
+    def do_remove_cluster_version_history(self, all: Optional[bool] = False, before: Optional[str] = None, after: Optional[str] = None) -> HandleCommandResult:
+        '''
+        Delete cluster versions stored in history
+        '''
+        err, msg = self.version_tracker.remove_cluster_version_history(all, before, after)
+        kwargs = {'stderr': msg} if err else {'stdout': msg}
+        return HandleCommandResult(retval=err, **kwargs)

@@ -3,26 +3,8 @@ import socket
 from typing import Tuple, Optional, Any, List
 from urllib.parse import urlparse
 from ceph.deployment.hostspec import SpecValidationError
+from ceph.utils import with_units_to_int
 from numbers import Number
-
-
-def parse_combined_pem_file(pem_data: str) -> Tuple[Optional[str], Optional[str]]:
-
-    # Extract the certificate
-    cert_start = "-----BEGIN CERTIFICATE-----"
-    cert_end = "-----END CERTIFICATE-----"
-    cert = None
-    if cert_start in pem_data and cert_end in pem_data:
-        cert = pem_data[pem_data.index(cert_start):pem_data.index(cert_end) + len(cert_end)]
-
-    # Extract the private key
-    key_start = "-----BEGIN PRIVATE KEY-----"
-    key_end = "-----END PRIVATE KEY-----"
-    private_key = None
-    if key_start in pem_data and key_end in pem_data:
-        private_key = pem_data[pem_data.index(key_start):pem_data.index(key_end) + len(key_end)]
-
-    return cert, private_key
 
 
 def unwrap_ipv6(address):
@@ -142,6 +124,24 @@ def verify_non_negative_int(field: Any, field_name: str) -> None:
         verify_int(field, field_name)
         if field < 0:
             raise SpecValidationError(f"{field_name} can't be negative")
+
+
+def verify_size_with_units(field: Any, field_name: str) -> Optional[int]:
+    """Validate a size value that may be an int (bytes) or a size string.
+
+    Accepts None, an int (bytes), or a size string such as ``512KiB``,
+    ``100MB``, or ``1GiB``. Returns the size in bytes, or None when
+    ``field`` is None.
+    """
+    if field is None:
+        return None
+    try:
+        size = with_units_to_int(str(field))
+    except (ValueError, TypeError, IndexError, UnboundLocalError):
+        raise SpecValidationError(f'{field_name}: invalid size {field!r}')
+    if size < 0:
+        raise SpecValidationError(f"{field_name} can't be negative")
+    return size
 
 
 def verify_positive_int(field: Any, field_name: str) -> None:

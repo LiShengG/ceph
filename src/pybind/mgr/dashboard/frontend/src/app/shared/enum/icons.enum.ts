@@ -29,6 +29,7 @@ export enum Icons {
   expand = 'maximize', // Expand cluster
   user = 'user', // User, Initiators
   users = 'user--multiple', // Users, Groups
+  replicate = 'replicate', // replicate
   share = 'share', // share
   key = 'password', // S3 Keys, Swift Keys, Authentication
   warning = 'warning--alt--filled', // Notification warning
@@ -88,6 +89,7 @@ export enum Icons {
   idea = 'idea',
   userAccessLocked = 'user--access-locked', // User access locked
   chevronDown = 'chevron--down',
+  chevronUp = 'chevron--up',
   connect = 'connect',
   checkmarkOutline = 'checkmark--outline',
   circleDash = 'circle-dash',
@@ -120,12 +122,15 @@ export enum Icons {
   vmdkDisk = 'vmdk-disk',
   checkMarkOutline = 'checkmark--outline',
   warningAlt = 'warning--alt',
+  arrowRight = 'arrow--right',
   arrowUpRight = 'arrow--up-right',
   inProgress = 'in-progress',
   arrowDown = 'arrow--down',
   locked = 'locked', // Access denied, locked state
   cloudMonitoring = 'cloud--monitoring',
-  temperature = 'temperature'
+  temperature = 'temperature',
+  pendingFilled = 'pending--filled',
+  folder = 'folder'
 }
 
 export enum IconSize {
@@ -164,6 +169,7 @@ export const ICON_TYPE = {
   vmdkDisk: 'vmdk-disk',
   warningAlt: 'warning--alt',
   checkMarkOutline: 'checkmark--outline',
+  arrowRight: 'arrow--right',
   arrowUpRight: ' arrow--up-right',
   inProgress: 'in-progress',
   arrowDown: 'arrow--down',
@@ -178,7 +184,13 @@ export const ICON_TYPE = {
   cloudMonitoring: 'cloud--monitoring',
   trash: 'trash-can',
   temperature: 'temperature',
-  left: 'arrow--left'
+  left: 'arrow--left',
+  replicate: 'replicate',
+  share: 'share',
+  pendingFilled: 'pending--filled',
+  chevronDown: 'chevron--down',
+  chevronUp: 'chevron--up',
+  folder: 'folder'
 } as const;
 
 export const EMPTY_STATE_IMAGE = {

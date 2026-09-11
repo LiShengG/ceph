@@ -45,7 +45,7 @@ Linux Kernel
   Older kernel client versions may not support your :ref:`CRUSH
   tunables <crush-map-tunables>` profile or other newer features of the Ceph
   cluster, requiring the storage cluster to be configured with those features
-  disabled. For RBD, a kernel of version 5.3 or CentOS 8.2 is the minimum
+  disabled. For RBD, a kernel of version 5.3 or Enterprise Linux (EL) 8.2 is the minimum
   necessary for reasonable support for RBD image features.
 
 - **Ceph MS Windows Client**
@@ -63,9 +63,9 @@ The chart below shows the platforms for which Ceph provides packages, and
 the platforms on which Ceph has been tested.
 
 Ceph does not require a specific Linux distribution. Ceph can run on any
-distribution that includes a supported kernel and supported system startup
-framework, for example ``sysvinit`` or ``systemd``. Ceph is sometimes ported to
-non-Linux systems but these are not supported by the core Ceph effort.
+distribution that includes a supported kernel and ``systemd``. Ceph is
+sometimes ported to non-Linux systems but these are not supported by the
+core Ceph effort.
 
 +----------------+-------------------------+----------------+-------------------+-----------------+----------------+----------------+----------------+
 | Distribution   | Distribution EOL        | Squid (19.2.z) | Tentacle (20.2.z) | Umbrella (21.x) | Vampire (22.x) | W (23.x)       | X (24.x)       |
@@ -153,6 +153,36 @@ leverages standard container runtimes (Podman or Docker), the Ceph container
 will run smoothly on any supported container host OS (such as Ubuntu 24.04 or
 CentOS 9), completely isolated from the host's native package manager.
 
+
+Block Device I/O Scheduler
+==========================
+
+Set the Linux block-layer I/O scheduler to match the class of device
+backing each OSD:
+
+* **Rotational (HDD) devices:** ``mq-deadline`` (or ``bfq``).  Request
+  merging and the deadline elevator complement the drive's own command
+  reordering (NCQ/TCQ) and help avoid read starvation during recovery
+  and backfill.
+* **Solid-state (SSD / NVMe) devices:** ``none``.  These devices reorder
+  requests internally, so a kernel-level elevator only adds latency.
+
+Recent ``blk-mq`` kernels frequently default to these values already, but
+this is not guaranteed across distributions, kernel versions, or TuneD
+profiles, so it is worth verifying::
+
+    # the active scheduler is shown in brackets
+    cat /sys/block/sda/queue/scheduler
+
+    # set it for a single device
+    echo mq-deadline > /sys/block/sda/queue/scheduler
+
+Make the setting persistent with a ``udev`` rule keyed on
+``/sys/block/*/queue/rotational`` so it survives reboots and applies to
+devices added later.  For BlueStore this is a modest tuning knob -- its
+large, mostly-sequential I/O together with the drive's own reordering does
+most of the work -- but setting it per device class avoids pathological
+behavior.
 
 Host Distribution Upgrades (Horizontal Paths)
 =============================================

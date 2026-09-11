@@ -41,8 +41,7 @@ Make sure X (and, ideally, X+1) is defined:
 Github Actions
 ~~~~~~~~~~~~~~
 
-- [ ] .github/workflows/redmine-upkeep.yml add release branch to pull_request_target trigger
-- [ ] .github/workflows/releng-audit.yml add release branch to pull_request_target trigger
+- [ ] ``.github/workflows/*.yml`` add release branch to pull_request_target trigger
 
 Scripts
 ~~~~~~~
@@ -137,6 +136,8 @@ After dev freeze
 - [ ] open the Branch Protection settings of the Ceph repo.  Duplicate settings to the new release branch.
 - [ ] create vX.3.0 annotated tag on ``main`` so upgrades from new release to main are not wrongly considered downgrades.
 - [ ] remove ``doc/releases/*.rst``. This should leave behind ``doc/releases/releases.yml`` which is used for doc building purposes. See also commit 33d63c3 ("doc: remove release notes for release branch") for details.
+- [ ] remove ``.github/workflows``. ``main`` is authoritative for workflows; avoid possible confusion/conflicts.
+- [ ] remove ``.github/pull_request_template.md``. Backports do not use it.
 - [ ] cherry-pick 8cf9ad62949516666ad0f2c0bb7726ef68e4d666 ("doc: add releases links to toc"). There will be trivial conflicts.
 - [ ] add redirect for new major release at `RTD <https://readthedocs.org/dashboard/ceph/redirects/>`_.
 - [ ] add release name to redmine (using https://tracker.ceph.com/custom_fields/16/edit)
@@ -157,6 +158,8 @@ First stable release
 - [ ] src/ceph_release: change type `stable`
 - [ ] generate new object corpus for encoding/decoding tests - see :doc:`corpus`
 - [ ] src/cephadm/cephadmlib/constants.py: update `LATEST_STABLE_RELEASE`
+- [ ] add release to doc/releases/releases.yml
+- [ ] add release to doc/releases/index.rst
 - [ ] activate latest release in readthedocs, as described in `the readthedocs
   documentation <https://docs.readthedocs.io/en/stable/versions.html>`_ 
 - [ ] add release and supported distros to tables in `doc/start/os-recommendations.rst`

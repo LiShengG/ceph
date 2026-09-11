@@ -5,6 +5,9 @@ import _ from 'lodash';
 
 import { CephfsListComponent } from './ceph/cephfs/cephfs-list/cephfs-list.component';
 import { ConfigurationFormComponent } from './ceph/cluster/configuration/configuration-form/configuration-form.component';
+import { ConfigurationResourceBreadcrumbResolver } from './ceph/cluster/configuration/configuration-resource-page/configuration-resource-breadcrumb.resolver';
+import { ConfigurationResourcePageComponent } from './ceph/cluster/configuration/configuration-resource-page/configuration-resource-page.component';
+import { ConfigurationResourceSidebarComponent } from './ceph/cluster/configuration/configuration-resource-sidebar/configuration-resource-sidebar.component';
 import { ConfigurationComponent } from './ceph/cluster/configuration/configuration.component';
 import { CreateClusterComponent } from './ceph/cluster/create-cluster/create-cluster.component';
 import { CrushmapComponent } from './ceph/cluster/crushmap/crushmap.component';
@@ -17,6 +20,9 @@ import { InventoryComponent } from './ceph/cluster/inventory/inventory.component
 import { LogsComponent } from './ceph/cluster/logs/logs.component';
 import { MgrModuleFormComponent } from './ceph/cluster/mgr-modules/mgr-module-form/mgr-module-form.component';
 import { MgrModuleListComponent } from './ceph/cluster/mgr-modules/mgr-module-list/mgr-module-list.component';
+import { MgrModuleResourceBreadcrumbResolver } from './ceph/cluster/mgr-modules/mgr-module-resource-page/mgr-module-resource-breadcrumb.resolver';
+import { MgrModuleResourcePageComponent } from './ceph/cluster/mgr-modules/mgr-module-resource-page/mgr-module-resource-page.component';
+import { MgrModuleResourceSidebarComponent } from './ceph/cluster/mgr-modules/mgr-module-resource-sidebar/mgr-module-resource-sidebar.component';
 import { MonitorComponent } from './ceph/cluster/monitor/monitor.component';
 import { OsdFormComponent } from './ceph/cluster/osd/osd-form/osd-form.component';
 import { OsdListComponent } from './ceph/cluster/osd/osd-list/osd-list.component';
@@ -25,6 +31,9 @@ import { RulesListComponent } from './ceph/cluster/prometheus/rules-list/rules-l
 import { SilenceFormComponent } from './ceph/cluster/prometheus/silence-form/silence-form.component';
 import { SilenceListComponent } from './ceph/cluster/prometheus/silence-list/silence-list.component';
 import { ServiceFormComponent } from './ceph/cluster/services/service-form/service-form.component';
+import { ServiceResourceBreadcrumbResolver } from './ceph/cluster/services/service-resource-page/service-resource-breadcrumb.resolver';
+import { ServiceResourcePageComponent } from './ceph/cluster/services/service-resource-page/service-resource-page.component';
+import { ServiceResourceSidebarComponent } from './ceph/cluster/services/service-resource-sidebar/service-resource-sidebar.component';
 import { ServicesComponent } from './ceph/cluster/services/services.component';
 import { TelemetryComponent } from './ceph/cluster/telemetry/telemetry.component';
 import { NfsFormComponent } from './ceph/nfs/nfs-form/nfs-form.component';
@@ -50,6 +59,7 @@ import { ChangePasswordGuardService } from './shared/services/change-password-gu
 import { FeatureTogglesGuardService } from './shared/services/feature-toggles-guard.service';
 import { ModuleStatusGuardService } from './shared/services/module-status-guard.service';
 import { NoSsoGuardService } from './shared/services/no-sso-guard.service';
+import { PermissionGuardService } from './shared/services/permission-guard.service';
 import { UpgradeComponent } from './ceph/cluster/upgrade/upgrade.component';
 import { CephfsVolumeFormComponent } from './ceph/cephfs/cephfs-form/cephfs-form.component';
 import { UpgradeProgressComponent } from './ceph/cluster/upgrade/upgrade-progress/upgrade-progress.component';
@@ -61,13 +71,23 @@ import { SmbJoinAuthFormComponent } from './ceph/smb/smb-join-auth-form/smb-join
 import { SmbUsersgroupsFormComponent } from './ceph/smb/smb-usersgroups-form/smb-usersgroups-form.component';
 import { NfsClusterComponent } from './ceph/nfs/nfs-cluster/nfs-cluster.component';
 import { SmbClusterListComponent } from './ceph/smb/smb-cluster-list/smb-cluster-list.component';
+import { SmbClusterResourceSidebarComponent } from './ceph/smb/smb-cluster-resource-sidebar/smb-cluster-resource-sidebar.component';
+import { SmbClusterResourcePageComponent } from './ceph/smb/smb-cluster-resource-page/smb-cluster-resource-page.component';
+import { SmbClusterResourceBreadcrumbResolver } from './ceph/smb/smb-cluster-resource-page/smb-cluster-resource-breadcrumb.resolver';
 import { SmbJoinAuthListComponent } from './ceph/smb/smb-join-auth-list/smb-join-auth-list.component';
 import { SmbUsersgroupsListComponent } from './ceph/smb/smb-usersgroups-list/smb-usersgroups-list.component';
 import { SmbOverviewComponent } from './ceph/smb/smb-overview/smb-overview.component';
+import { SmbUsersgroupsResourceSidebarComponent } from './ceph/smb/smb-usersgroups-resource-sidebar/smb-usersgroups-resource-sidebar.component';
+import { SmbUsersgroupsResourcePageComponent } from './ceph/smb/smb-usersgroups-resource-page/smb-usersgroups-resource-page.component';
+import { SmbUsergroupsResourceBreadcrumbResolver } from './ceph/smb/smb-usersgroups-resource-page/smb-usersgroups-resource-breadcrumb.resolver';
 import { MultiClusterFormComponent } from './ceph/cluster/multi-cluster/multi-cluster-form/multi-cluster-form.component';
 import { CephfsMirroringListComponent } from './ceph/cephfs/cephfs-mirroring-list/cephfs-mirroring-list.component';
+import { CephfsAddMirroringPathComponent } from './ceph/cephfs/cephfs-add-mirroring-path/cephfs-add-mirroring-path.component';
+import { CephfsMirroringFsTabsComponent } from './ceph/cephfs/cephfs-mirroring-fs-tabs/cephfs-mirroring-fs-tabs.component';
+import { CephfsMirroringFsOverviewComponent } from './ceph/cephfs/cephfs-mirroring-fs-overview/cephfs-mirroring-fs-overview.component';
+import { CephfsMirroringFsMirrorPathsComponent } from './ceph/cephfs/cephfs-mirroring-fs-mirror-paths/cephfs-mirroring-fs-mirror-paths.component';
+import { CephfsMirroringFsBreadcrumbResolver } from './ceph/cephfs/cephfs-mirroring-fs-tabs/cephfs-mirroring-fs-breadcrumb.resolver';
 import { NotificationsPageComponent } from './core/navigation/notification-panel/notifications-page/notifications-page.component';
-import { CephfsMirroringWizardComponent } from './ceph/cephfs/cephfs-mirroring-wizard/cephfs-mirroring-wizard.component';
 import { CephfsMirroringErrorComponent } from './ceph/cephfs/cephfs-mirroring-error/cephfs-mirroring-error.component';
 import { OverviewComponent } from './ceph/overview/overview.component';
 
@@ -135,12 +155,17 @@ const routes: Routes = [
       {
         path: 'add-storage',
         component: CreateClusterComponent,
-        canActivate: [ModuleStatusGuardService],
+        canActivate: [ModuleStatusGuardService, PermissionGuardService],
         data: {
           moduleStatusGuardConfig: {
             uiApiPath: 'orchestrator',
             redirectTo: 'overview',
             backend: 'cephadm'
+          },
+          permissionGuardConfig: {
+            scope: 'configOpt',
+            action: 'update',
+            redirectTo: '/overview'
           }
         }
       },
@@ -159,7 +184,10 @@ const routes: Routes = [
       {
         path: 'hosts/:hostname',
         component: HostSidebarComponent,
-        data: { breadcrumbs: HostResourceBreadcrumbResolver },
+        data: {
+          breadcrumbs: HostResourceBreadcrumbResolver,
+          showBreadcrumbsLayout: false
+        },
         children: [
           { path: '', redirectTo: 'overview', pathMatch: 'full' },
           {
@@ -175,7 +203,7 @@ const routes: Routes = [
           {
             path: 'daemons',
             component: HostResourcePageComponent,
-            data: { breadcrumbs: 'Daemons', section: 'daemons' }
+            data: { breadcrumbs: 'Service instances', section: 'daemons' }
           },
           {
             path: 'performance',
@@ -220,6 +248,45 @@ const routes: Routes = [
         path: 'monitor',
         component: MonitorComponent,
         data: { breadcrumbs: 'Cluster/Monitors' }
+      },
+      {
+        path: 'services/:service_name',
+        component: ServiceResourceSidebarComponent,
+        canActivate: [ModuleStatusGuardService],
+        data: {
+          moduleStatusGuardConfig: {
+            uiApiPath: 'orchestrator',
+            redirectTo: 'error',
+            section: 'orch',
+            section_info: 'Orchestrator',
+            header: 'Orchestrator is not available'
+          },
+          breadcrumbs: ServiceResourceBreadcrumbResolver,
+          showBreadcrumbsLayout: false
+        },
+        children: [
+          { path: '', redirectTo: 'overview', pathMatch: 'full' },
+          {
+            path: 'overview',
+            component: ServiceResourcePageComponent,
+            data: { breadcrumbs: 'Overview', section: 'overview' }
+          },
+          {
+            path: 'service-instances',
+            component: ServiceResourcePageComponent,
+            data: { breadcrumbs: 'Service Instances', section: 'service-instances' }
+          },
+          {
+            path: 'certificate',
+            component: ServiceResourcePageComponent,
+            data: { breadcrumbs: 'Certificate', section: 'certificate' }
+          },
+          {
+            path: 'events',
+            component: ServiceResourcePageComponent,
+            data: { breadcrumbs: 'Service Events', section: 'events' }
+          }
+        ]
       },
       {
         path: 'services',
@@ -321,6 +388,22 @@ const routes: Routes = [
             path: 'edit/:name',
             component: ConfigurationFormComponent,
             data: { breadcrumbs: ActionLabels.EDIT }
+          },
+          {
+            path: ':name',
+            component: ConfigurationResourceSidebarComponent,
+            data: {
+              breadcrumbs: ConfigurationResourceBreadcrumbResolver,
+              showBreadcrumbsLayout: false
+            },
+            children: [
+              { path: '', redirectTo: 'overview', pathMatch: 'full' },
+              {
+                path: 'overview',
+                component: ConfigurationResourcePageComponent,
+                data: { breadcrumbs: 'Overview', section: 'overview' }
+              }
+            ]
           }
         ]
       },
@@ -434,6 +517,22 @@ const routes: Routes = [
             data: {
               breadcrumbs: StartCaseBreadcrumbsResolver
             }
+          },
+          {
+            path: ':name',
+            component: MgrModuleResourceSidebarComponent,
+            data: {
+              breadcrumbs: MgrModuleResourceBreadcrumbResolver,
+              showBreadcrumbsLayout: false
+            },
+            children: [
+              { path: '', redirectTo: 'overview', pathMatch: 'full' },
+              {
+                path: 'overview',
+                component: MgrModuleResourcePageComponent,
+                data: { breadcrumbs: 'Overview', section: 'overview' }
+              }
+            ]
           }
         ]
       },
@@ -472,22 +571,51 @@ const routes: Routes = [
           {
             path: 'mirroring',
             canActivate: [ModuleStatusGuardService],
-            component: CephfsMirroringListComponent,
             data: {
               moduleStatusGuardConfig: {
                 uiApiPath: 'cephfs/mirror',
                 redirectTo: 'cephfs/mirroring/error',
                 module_name: 'mirroring',
                 navigate_to: 'File/Mirroring'
+              }
+            },
+            children: [
+              {
+                path: '',
+                component: CephfsMirroringListComponent,
+                data: {
+                  breadcrumbs: 'File/Mirroring',
+                  pageHeader: CEPHFS_MIRRORING_PAGE_HEADER
+                },
+                children: [
+                  {
+                    path: 'add-path/:fsId/:fsName',
+                    component: CephfsAddMirroringPathComponent,
+                    outlet: 'modal'
+                  }
+                ]
               },
-              breadcrumbs: 'File/Mirroring',
-              pageHeader: CEPHFS_MIRRORING_PAGE_HEADER
-            }
-          },
-          {
-            path: `mirroring/${URLVerbs.CREATE}`,
-            component: CephfsMirroringWizardComponent,
-            data: { breadcrumbs: ActionLabels.CREATE }
+              {
+                path: ':fsName',
+                component: CephfsMirroringFsTabsComponent,
+                data: {
+                  breadcrumbs: CephfsMirroringFsBreadcrumbResolver,
+                  // PageHeader included within the CephfsMirroringFsTabsComponent
+                  pageHeaderHidden: true
+                },
+                children: [
+                  { path: '', redirectTo: 'overview', pathMatch: 'full' },
+                  {
+                    path: 'overview',
+                    component: CephfsMirroringFsOverviewComponent
+                  },
+                  {
+                    path: 'mirror-paths',
+                    component: CephfsMirroringFsMirrorPathsComponent
+                  }
+                ]
+              }
+            ]
           },
           {
             path: 'nfs',
@@ -538,7 +666,7 @@ const routes: Routes = [
               { path: '', component: SmbClusterListComponent },
               {
                 path: 'cluster',
-                data: { breadcrumbs: 'Cluster' },
+                data: { breadcrumbs: 'Clusters' },
                 children: [
                   { path: '', component: SmbClusterListComponent },
                   {
@@ -550,6 +678,22 @@ const routes: Routes = [
                     path: `${URLVerbs.EDIT}/:cluster_id`,
                     component: SmbClusterFormComponent,
                     data: { breadcrumbs: ActionLabels.EDIT }
+                  },
+                  {
+                    path: ':cluster_id',
+                    component: SmbClusterResourceSidebarComponent,
+                    data: {
+                      breadcrumbs: SmbClusterResourceBreadcrumbResolver,
+                      showBreadcrumbsLayout: false
+                    },
+                    children: [
+                      { path: '', redirectTo: 'overview', pathMatch: 'full' },
+                      {
+                        path: 'overview',
+                        component: SmbClusterResourcePageComponent,
+                        data: { breadcrumbs: 'Overview', section: 'overview' }
+                      }
+                    ]
                   }
                 ]
               },
@@ -583,6 +727,22 @@ const routes: Routes = [
                   {
                     path: `${URLVerbs.EDIT}/:usersGroupsId`,
                     component: SmbUsersgroupsFormComponent
+                  },
+                  {
+                    path: ':users_groups_id',
+                    component: SmbUsersgroupsResourceSidebarComponent,
+                    data: {
+                      breadcrumbs: SmbUsergroupsResourceBreadcrumbResolver,
+                      showBreadcrumbsLayout: false
+                    },
+                    children: [
+                      { path: '', redirectTo: 'overview', pathMatch: 'full' },
+                      {
+                        path: 'overview',
+                        component: SmbUsersgroupsResourcePageComponent,
+                        data: { breadcrumbs: 'Overview', section: 'overview' }
+                      }
+                    ]
                   }
                 ]
               },

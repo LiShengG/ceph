@@ -104,6 +104,13 @@ as follows:
 :command:`bucket stats`
   List bucket statistics plus other internal information about a bucket.
 
+:command:`bucket suspend`
+  Suspend an individual bucket. S3 requests against the bucket fail with
+  ``403 BucketSuspended``.
+
+:command:`bucket unsuspend`
+  Unsuspend a previously suspended bucket.
+
 :command:`bucket rm`
   Remove a bucket.
 
@@ -476,6 +483,24 @@ as follows:
 
 :command:`role-policy delete`
   Remove the policy attached to a role
+
+:command:`oidc-provider create`
+  Create an OIDC provider. If ``account-id`` is not specified,
+  the provider is created in the global scope.
+
+:command:`oidc-provider modify`
+  Update thumbprints and/or client-ids of an OIDC provider. The provided list
+  fully replaces the existing list for that field; unspecified fields are left
+  unchanged.
+
+:command:`oidc-provider get`
+  Get information about an OIDC provider.
+
+:command:`oidc-provider delete`
+  Delete an OIDC provider.
+
+:command:`oidc-provider list`
+  List OIDC providers.
 
 :command:`reshard add`
   Schedule a resharding of a bucket
@@ -984,6 +1009,22 @@ Role Options
 .. option:: --path-prefix
 
    The path prefix for filtering the roles.
+
+
+OIDC Provider Options
+=====================
+
+.. option:: --provider-url
+
+   URL of the OIDC provider.
+
+.. option:: --client-ids
+
+   Comma-separated list of client IDs.
+
+.. option:: --thumbprints
+
+   Comma-separated list of thumbprints.
 
 
 Bucket Notifications/PubSub Options

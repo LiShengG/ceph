@@ -246,7 +246,7 @@ endif()
 
 # Set WITH_EC_ISA_PLUGIN early so it's available when processing common/options
 # This must be set before add_subdirectory(common) is called
-if(HAVE_NASM_X64_AVX2 OR HAVE_ARMV8_SIMD OR HAS_ALTIVEC OR HAVE_RISCV_RVV)
+if(HAVE_NASM_X64_AVX2 OR HAVE_ARMV8_SIMD OR HAS_ALTIVEC OR HAVE_RISCV_RVV OR HAVE_S390X)
   set(WITH_EC_ISA_PLUGIN TRUE CACHE BOOL "")
 endif()
 
@@ -472,7 +472,7 @@ if(WITH_CRIMSON)
       _find_package(${ARGV})
     endif()
   endmacro ()
-  set(Seastar_API_LEVEL "6" CACHE STRING "" FORCE)
+  set(Seastar_API_LEVEL "10" CACHE STRING "" FORCE)
   set(Seastar_IO_URING ${HAVE_LIBURING} CACHE BOOL "" FORCE)
   set(Seastar_DEPRECATED_OSTREAM_FORMATTERS OFF CACHE BOOL "" FORCE)
   if(WITH_ASAN)
@@ -481,7 +481,7 @@ if(WITH_CRIMSON)
     set(Seastar_SANITIZE "OFF" CACHE STRING "" FORCE)
   endif()
   if(Seastar_DPDK)
-    find_package(dpdk QUIET)
+    find_package(DPDK QUIET)
     if(NOT DPDK_FOUND)
       include(BuildDPDK)
       build_dpdk(${CMAKE_BINARY_DIR}/src/dpdk)
@@ -654,26 +654,12 @@ if(WIN32)
   list(APPEND ceph_common_deps dlfcn_win32)
 endif()
 
-if(WITH_BLUESTORE_PMEM OR WITH_RBD_RWL)
+if(WITH_RBD_RWL)
   if(WITH_SYSTEM_PMDK)
-    set(pmdk_COMPONENTS)
-    if(WITH_BLUESTORE_PMEM)
-      list(APPEND pmdk_COMPONENTS pmem)
-    endif()
-    if(WITH_RBD_RWL)
-      list(APPEND pmdk_COMPONENTS pmemobj)
-    endif()
-    find_package(pmdk 1.8 REQUIRED COMPONENTS ${pmdk_COMPONENTS})
+    find_package(pmdk 1.8 REQUIRED COMPONENTS pmemobj)
   else()
     include(Buildpmdk)
-    if(WITH_BLUESTORE_PMEM)
-      set(enable_ndctl ON)
-      find_package(ndctl 63 REQUIRED)
-      find_package(daxctl 63 REQUIRED)
-    else()
-      set(enable_ndctl OFF)
-    endif()
-    build_pmdk(${enable_ndctl})
+    build_pmdk()
   endif()
 endif()
 
@@ -952,6 +938,7 @@ install(FILES
 install(PROGRAMS
   ceph_common.sh
   ceph-osd-prestart.sh
+  block-device-health
   DESTINATION ${CMAKE_INSTALL_LIBEXECDIR}/ceph)
 
 install(PROGRAMS

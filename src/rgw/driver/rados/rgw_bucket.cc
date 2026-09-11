@@ -3,6 +3,7 @@
 
 #include "common/Clock.h" // for ceph_clock_now()
 #include "common/JSONFormatter.h"
+#include "common/errno.h"
 #include "include/function2.hpp"
 #include "rgw_acl_s3.h"
 #include "rgw_tag_s3.h"
@@ -28,7 +29,9 @@
 
 #include "cls/user/cls_user_types.h"
 
+#ifdef WITH_RADOSGW_RADOS
 #include "rgw_sal_rados.h"
+#endif
 
 #define dout_subsys ceph_subsys_rgw
 
@@ -261,10 +264,45 @@ bool rgw_find_bucket_by_id(const DoutPrefixProvider *dpp, CephContext *cct, rgw:
   return false;
 }
 
+static int load_account_name(const DoutPrefixProvider* dpp,
+                             optional_yield y,
+                             rgw::sal::Driver* driver,
+                             const rgw_account_id& id,
+                             std::string& name)
+{
+  RGWAccountInfo info;
+  rgw::sal::Attrs attrs;
+  RGWObjVersionTracker objv;
+  int r = driver->load_account_by_id(dpp, y, id, info, attrs, objv);
+  if (r < 0) {
+    return r;
+  }
+  name = std::move(info.name);
+  return 0;
+}
+
 int RGWBucket::chown(RGWBucketAdminOpState& op_state, const string& marker,
                      optional_yield y, const DoutPrefixProvider *dpp, std::string *err_msg)
 {
-  return rgw_chown_bucket_and_objects(driver, bucket.get(), user.get(), marker, err_msg, dpp, y);
+  rgw_owner new_owner;
+  std::string new_owner_name;
+
+  if (!op_state.account_id.empty()) {
+    new_owner = op_state.account_id;
+    int r = load_account_name(dpp, y, driver, op_state.account_id, new_owner_name);
+    if (r < 0) {
+      set_err_msg(err_msg, "failed to load account");
+      return r;
+    }
+  } else if (!user->get_info().account_id.empty()) {
+    set_err_msg(err_msg, "account users cannot own buckets. use --account-id instead");
+    return -EINVAL;
+  } else {
+    new_owner = user->get_id();
+    new_owner_name = user->get_display_name();
+  }
+
+  return rgw_chown_bucket_and_objects(driver, bucket.get(), new_owner, new_owner_name, marker, err_msg, dpp, y);
 }
 
 int RGWBucket::set_quota(RGWBucketAdminOpState& op_state, const DoutPrefixProvider *dpp, optional_yield y, std::string *err_msg)
@@ -1484,21 +1522,21 @@ int RGWBucketAdminOp::remove_bucket(rgw::sal::Driver* driver, const rgw::SiteCon
     return -ERR_PERMANENT_REDIRECT;
   }
 
-  if (bypass_gc)
-    ret = bucket->remove_bypass_gc(op_state.get_max_aio(), keep_index_consistent, y, dpp);
-  else
-    ret = bucket->remove(dpp, op_state.will_delete_children(), y);
-  if (ret < 0)
-    return ret;
-
-  // forward to master zonegroup
+  // forward to master first
   const std::string delpath = "/admin/bucket";
   RGWEnv env;
   env.set("REQUEST_METHOD", "DELETE");
   env.set("SCRIPT_URI", delpath);
   env.set("REQUEST_URI", delpath);
-  env.set("QUERY_STRING", fmt::format("bucket={}&tenant={}", bucket->get_name(), bucket->get_tenant()));
   req_info req(dpp->get_cct(), &env);
+  req.args.append("bucket", bucket->get_name());
+  req.args.append("tenant", bucket->get_tenant());
+  if (op_state.will_delete_children()) {
+    req.args.append("purge-objects", "true");
+  }
+  if (bypass_gc) {
+    req.args.append("bypass-gc", "true");
+  }
   rgw_err err; // unused
 
   ret = rgw_forward_request_to_master(dpp, site, bucket->get_owner(), nullptr, nullptr, req, err, y);
@@ -1507,6 +1545,11 @@ int RGWBucketAdminOp::remove_bucket(rgw::sal::Driver* driver, const rgw::SiteCon
                       << ret << dendl;
     return ret;
   }
+
+  if (bypass_gc)
+    ret = bucket->remove_bypass_gc(op_state.get_max_aio(), keep_index_consistent, y, dpp);
+  else
+    ret = bucket->remove(dpp, op_state.will_delete_children(), y);
 
   return ret;
 }
@@ -1650,6 +1693,7 @@ static int bucket_stats(rgw::sal::Driver* driver, const rgw::SiteConfig& site,
   logrecord_ut.gmtime(formatter->dump_stream("judge_reshard_lock_time"));
   formatter->dump_bool("object_lock_enabled", bucket_info.obj_lock_enabled());
   formatter->dump_bool("mfa_enabled", bucket_info.mfa_enabled());
+  formatter->dump_bool("suspended", bucket_info.bucket_suspended());
   ::encode_json("owner", bucket_info.owner, formatter);
 
   if (has_index) {
@@ -1828,19 +1872,9 @@ static int list_owner_bucket_info(const DoutPrefixProvider* dpp,
 
   const std::string empty_end_marker;
   const size_t list_buckets_max = dpp->get_cct()->_conf->rgw_list_buckets_max_chunk;
+  constexpr bool no_need_stats = false; // set need_stats to false
 
   uint32_t max_items = (uint32_t)list_buckets_max;
-
-  if (max_entries_specified) {
-    /* we never want to allow max_items higher than rgw_list_buckets_max_chunk */
-    if (max_entries > list_buckets_max) {
-      max_items = list_buckets_max;
-    } else {
-      max_items = max_entries;
-    }
-  }
-
-  constexpr bool no_need_stats = false; // set need_stats to false
 
   rgw::sal::BucketList listing;
   listing.next_marker = marker;
@@ -1910,11 +1944,14 @@ int RGWBucketAdminOp::info(rgw::sal::Driver* driver,
   const std::string& bucket_name = op_state.get_bucket_name();
   if (!bucket_name.empty()) {
     ret = bucket.init(driver, op_state, y, dpp);
-    if (-ENOENT == ret)
+    if (-ENOENT == ret) {
       return -ERR_NO_SUCH_BUCKET;
-    else if (ret < 0)
+    } else if (ret < 0) {
       return ret;
+    }
   }
+
+  const bool max_entries_specified = (op_state.max_entries > 0);
 
   Formatter *formatter = flusher.get_formatter();
   flusher.start(0);
@@ -1965,24 +2002,39 @@ int RGWBucketAdminOp::info(rgw::sal::Driver* driver,
       return ret;
     }
   } else {
+    constexpr uint64_t max_keys = 1000;
     void *handle = nullptr;
     bool truncated = true;
+    uint64_t count = 0;
+    bool done = false;
 
     formatter->open_array_section("buckets");
     ret = driver->meta_list_keys_init(dpp, "bucket", string(), &handle);
-    while (ret == 0 && truncated) {
+
+    while (ret == 0 && !done && truncated) {
       std::list<std::string> buckets;
-      constexpr int max_keys = 1000;
+
+      // in experiments, meta_list_keys_next often doesn't return as
+      // many keys as requested; so asking for only the minimal amount
+      // needed to reach max_entries often requires extra calls, so
+      // we'll always ask for the maximum number of keys
       ret = driver->meta_list_keys_next(dpp, handle, max_keys, buckets,
-						   &truncated);
-      for (auto& bucket_name : buckets) {
+                                        &truncated);
+      for (const auto& bucket_name : buckets) {
         if (show_stats) {
-          bucket_stats(driver, site, user_id.tenant, bucket_name, op_state.restore_stats, formatter, dpp, y);
+          bucket_stats(driver, site, user_id.tenant, bucket_name,
+                       op_state.restore_stats, formatter, dpp, y);
 	} else {
           formatter->dump_string("bucket", bucket_name);
 	}
-      }
-    }
+
+        ++count;
+        if (max_entries_specified && count >= op_state.max_entries) {
+          done = true;
+          break;
+        }
+      } // for bucket_name
+    } // while continuing to read
     driver->meta_list_keys_complete(handle);
     formatter->close_section();
   }
@@ -3011,6 +3063,7 @@ void init_default_bucket_layout(CephContext *cct, rgw::BucketLayout& layout,
 				const RGWZone& zone,
 				std::optional<rgw::BucketIndexType> type,
 				std::optional<uint32_t> shards) {
+
   layout.current_index.gen = 0;
   layout.current_index.layout.normal.hash_type = rgw::BucketHashType::Mod;
 
@@ -3029,7 +3082,13 @@ void init_default_bucket_layout(CephContext *cct, rgw::BucketLayout& layout,
   }
 
   if (layout.current_index.layout.type == rgw::BucketIndexType::Normal) {
-    layout.logs.push_back(log_layout_from_index(0, layout.current_index));
+    const bool use_fifo =
+      (cct->_conf.get_val<std::string>("rgw_default_bucket_bilog_type") == "fifo");
+    if (use_fifo) {
+      layout.logs.push_back(fifo_log_layout_from_index(0, layout.current_index));
+    } else {
+      layout.logs.push_back(log_layout_from_index(0, layout.current_index));
+    }
   }
 }
 
@@ -3085,7 +3144,7 @@ int RGWBucketInstanceMetadataHandler::put_prepare(
     const auto& log = bci.info.layout.logs.back();
     if (bci.info.bucket_deleted() && log.layout.type != rgw::BucketLogType::Deleted) {
       const auto index_log = bci.info.layout.logs.back();
-      const int shards_num = rgw::num_shards(index_log.layout.in_index);
+      const int shards_num = rgw::num_shards(index_log);
       bci.info.layout.logs.push_back({log.gen+1, {rgw::BucketLogType::Deleted}});
       ldpp_dout(dpp, 10) << "store log layout type: " <<  bci.info.layout.logs.back().layout.type << dendl;
       for (int i = 0; i < shards_num; ++i) {

@@ -1,16 +1,18 @@
-import { Component, Input } from '@angular/core';
+import { Component, Input, OnChanges } from '@angular/core';
 
 export type OverviewValue = string | number | boolean | null | undefined;
 
 export interface OverviewField {
   /* Human-readable label shown for the field. */
   label: string;
+  /* Optional helper text shown next to the label. */
+  helperText?: string;
   /* Single value rendered for text/status fields. */
   value?: OverviewValue;
   /* Multiple values rendered when the field uses tag display. */
   values?: OverviewValue[];
   /* Selects how the field value should be presented in the UI. */
-  type?: 'text' | 'status' | 'tags';
+  type?: 'text' | 'status' | 'tags' | 'password';
   /* Visual tone used by status rendering (icon/text styling). */
   status?: 'success' | 'warning' | 'danger' | 'info-circle';
   /* Fallback text shown when the value is empty. */
@@ -23,11 +25,20 @@ export interface OverviewField {
   styleUrls: ['./resource-overview-card.component.scss'],
   standalone: false
 })
-export class OverviewComponent {
+export class OverviewComponent implements OnChanges {
   /* Title shown at the top of the overview card. */
   @Input() title = '';
+  /* Displays field placeholders while data is loading. */
+  @Input() loading = false;
   /* Fields rendered in the overview card. */
   @Input() fields: OverviewField[] = [];
   /* Number of columns used to layout the fields. */
   @Input() columns = 3;
+
+  loadingPlaceholders: number[] = Array.from({ length: this.columns }, (_, index) => index);
+
+  ngOnChanges(): void {
+    const count = this.fields.length || this.columns;
+    this.loadingPlaceholders = Array.from({ length: Math.max(1, count) }, (_, index) => index);
+  }
 }

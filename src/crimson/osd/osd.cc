@@ -29,6 +29,10 @@
 #include "messages/MOSDPGUpdateLogMissingReply.h"
 #include "messages/MOSDRepOpReply.h"
 #include "messages/MOSDScrub2.h"
+#include "messages/MOSDECSubOpWrite.h"
+#include "messages/MOSDECSubOpWriteReply.h"
+#include "messages/MOSDECSubOpRead.h"
+#include "messages/MOSDECSubOpReadReply.h"
 #include "messages/MOSDPGPCT.h"
 #include "messages/MPGStats.h"
 
@@ -49,8 +53,10 @@
 #include "crimson/os/futurized_collection.h"
 #include "crimson/os/futurized_store.h"
 #include "crimson/osd/heartbeat.h"
+#include "crimson/osd/osd_connection_priv.h"
 #include "crimson/osd/osd_meta.h"
 #include "crimson/osd/pg.h"
+#include "crimson/osd/watch.h"
 #include "crimson/osd/pg_backend.h"
 #include "crimson/osd/pg_meta.h"
 #include "crimson/osd/osd_operations/client_request.h"
@@ -486,7 +492,7 @@ seastar::future<> OSD::report_osd_stats()
 seastar::future<> OSD::start()
 {
   LOG_PREFIX(OSD::start);
-  INFO("seastar::smp::count {}", seastar::smp::count);
+  INFO("smp shard count {}", seastar::this_smp_shard_count());
   if (auto cpu_cores =
         local_conf().get_val<std::string>("crimson_cpu_set");
       cpu_cores.empty()) {
@@ -496,7 +502,7 @@ seastar::future<> OSD::start()
   ceph_assert(seastar::this_shard_id() == PRIMARY_CORE);
   DEBUG("starting store");
   uint32_t store_shards_num = co_await store.start();
-  co_await pg_to_shard_mappings.start(0, seastar::smp::count, store_shards_num);
+  co_await pg_to_shard_mappings.start(0, seastar::this_smp_shard_count(), store_shards_num);
   co_await osd_singleton_state.start_single(
         whoami, std::ref(*cluster_msgr), std::ref(*public_msgr),
         std::ref(*monc), std::ref(*mgrc));
@@ -521,7 +527,7 @@ seastar::future<> OSD::start()
     );
   auto stats_seconds = local_conf().get_val<int64_t>("crimson_osd_stat_interval");
   if (stats_seconds > 0) {
-    shard_stats.resize(seastar::smp::count);
+    shard_stats.resize(seastar::this_smp_shard_count());
     stats_timer.set_callback([this] {
       gate.dispatch_in_background("stats_osd", *this, [this] {
         return report_osd_stats();
@@ -731,8 +737,10 @@ seastar::future<> OSD::_add_device_class()
   }
 
   INFO("device_class is {} ", device_class);
+  std::string lowered = device_class;
+  std::transform(lowered.begin(), lowered.end(), lowered.begin(), ::tolower);
+  is_rotational = !(lowered == "ssd" || lowered == "random_block_ssd");
 
-  is_rotational = (device_class != "ssd");
   std::string cmd = fmt::format(
     R"({{"prefix": "osd crush set-device-class", "class": "{}", "ids": ["{}"]}})",
     device_class, stringify(whoami)
@@ -1034,9 +1042,24 @@ OSD::do_ms_dispatch(
 
 void OSD::ms_handle_reset(crimson::net::ConnectionRef conn, bool is_replace)
 {
-  // TODO: cleanup the session attached to this connection
+  // Runs on the connection's home core. Disconnect every watch reachable over
+  // this connection so notifies buffer (and are replayed on reconnect) and the
+  // watch timeout can eventually reap it -- mirrors classic
+  // WatchConState::reset() driven from OSD::ms_handle_reset(). Fire-and-forget:
+  // the reset() fans out one cross-core hop per watch; keep `conn` alive until
+  // it finishes.
   LOG_PREFIX(OSD::ms_handle_reset);
   WARN("{}", *conn);
+  if (!conn->has_user_private()) {
+    INFO("{} has no user private - nothing to reset", *conn);
+    return;
+  }
+  auto& priv = get_osd_priv(&*conn);
+  if (!priv.watch_conn_state) {
+    INFO("{} has no watch connection state - nothing to reset", *conn);
+    return;
+  }
+  std::ignore = priv.watch_conn_state->reset(&*conn).finally([conn] {});
 }
 
 void OSD::ms_handle_remote_reset(crimson::net::ConnectionRef conn)

@@ -350,7 +350,7 @@ unsigned PG::get_target_pg_log_entries() const
   const unsigned local_num_pgs = shard_services.get_num_local_pgs();
   const unsigned local_target =
     local_conf().get_val<uint64_t>("osd_target_pg_log_entries_per_osd") /
-    seastar::smp::count;
+    seastar::this_smp_shard_count();
   const unsigned min_pg_log_entries =
     local_conf().get_val<uint64_t>("osd_min_pg_log_entries");
   if (local_num_pgs > 0 && local_target > 0) {
@@ -684,6 +684,10 @@ void PG::initiate_snap_trim()
 
 void PG::kick_snap_trim()
 {
+  // Scrub completion may try to resume snaptrim during PG shutdown.
+  if (stopping) {
+    return;
+  }
   if (peering_state.is_active() && peering_state.is_clean()
       && !snap_trimq.empty()
       && !peering_state.state_test(PG_STATE_SNAPTRIM)) {
@@ -1100,7 +1104,7 @@ PG::interruptible_future<> PG::complete_error_log(const ceph_tid_t& rep_tid,
   log_update.waiting_on.erase(pg_whoami);
   if (log_update.waiting_on.empty()) {
     log_entry_update_waiting_on.erase(rep_tid);
-    peering_state.complete_write(version, last_complete);
+    complete_write(version, last_complete);
     logger().debug("complete_error_log: write complete,"
                    " erasing rep_tid {}", rep_tid);
   } else {
@@ -1110,7 +1114,7 @@ PG::interruptible_future<> PG::complete_error_log(const ceph_tid_t& rep_tid,
       log_update.all_committed.get_shared_future()
     ).then_interruptible([this, last_complete, rep_tid, version] {
       logger().debug("complete_error_log: rep_tid {} awaited ", rep_tid);
-      peering_state.complete_write(version, last_complete);
+      complete_write(version, last_complete);
       ceph_assert(!log_entry_update_waiting_on.contains(rep_tid));
       return seastar::now();
     });
@@ -1701,6 +1705,7 @@ seastar::future<> PG::stop()
   co_await osdmap_gate.stop();
   co_await wait_for_active_blocker.stop();
   client_request_orderer.clear_and_cancel(*this);
+  scrubber.stop();
   co_await recovery_handler->stop();
   co_await recovery_backend->stop();
   co_await backend->stop();
@@ -1731,6 +1736,9 @@ void PG::on_change(ceph::os::Transaction &t) {
   auto _t = osdriver.get_transaction(&t);
   snap_mapper.flush_and_reset_backend(&_t);
   reset_pglog_based_recovery_op();
+  if (is_primary()) {
+    recovery_handler->cancel_backfill();
+  }
 }
 
 void PG::context_registry_on_change() {

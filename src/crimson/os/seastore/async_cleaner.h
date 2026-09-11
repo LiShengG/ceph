@@ -10,6 +10,7 @@
 
 #include "osd/osd_types.h"
 
+#include "crimson/common/config_proxy.h"
 #include "crimson/os/seastore/cached_extent.h"
 #include "crimson/os/seastore/seastore_types.h"
 #include "crimson/os/seastore/segment_manager.h"
@@ -351,6 +352,66 @@ public:
     rewrite_gen_t target_generation,
     sea_time_point modify_time) = 0;
 
+  using rewrite_extents_iertr = base_iertr;
+  using rewrite_extents_ret = rewrite_extents_iertr::future<>;
+  virtual rewrite_extents_ret rewrite_extents(
+    Transaction &t,
+    std::vector<CachedExtentRef> &extents,
+    rewrite_gen_t target_generation,
+    placement_hint_t hint,
+    sea_time_point modify_time) = 0;
+
+  /**
+   * promote_extent
+   *
+   * Promote an extent located from slow devices to the faster devices.
+   * When the type of extent is ObjectDataBlock, the original extent won't
+   * be retired, so that this extent is located in two differenct devices
+   * at the same time, which is helpful to reduce the cost of cleaner process.
+   * The others follow the normal rewrite process but its rewrite generation
+   * will be INIT_GENERATION(XXX: or the maximum generation of the hot tier?).
+   */
+  using promote_extent_iertr = base_iertr;
+  using promote_extent_ret = promote_extent_iertr::future<>;
+  virtual promote_extent_ret promote_extent(
+    Transaction &t,
+    CachedExtentRef extent) = 0;
+
+  virtual promote_extent_ret promote_extents_from_disk(
+    Transaction &t,
+    paddr_t paddr) = 0;
+
+  /**
+   * demote_region
+   *
+   * Demote the logical extents promoted from the slower device and evict
+   * the extents to the cold tier under the given laddr prefix.
+   */
+  struct demote_region_res_t {
+    std::size_t demoted_size = 0;
+    std::size_t evicted_size = 0;
+    bool complete = false;
+  };
+  using demote_region_iertr = base_iertr;
+  using demote_region_ret = demote_region_iertr::future<
+    demote_region_res_t>;
+  virtual demote_region_ret demote_region(
+    Transaction &t,
+    laddr_t prefix,
+    std::size_t max_proceed_size) = 0;
+
+  /**
+   * maybe_remove_shadow
+   *
+   * Remove the shadow of the extent if it exists
+   */
+  using maybe_remove_shadow_iertr = base_iertr;
+  using maybe_remove_shadow_ret =
+    maybe_remove_shadow_iertr::future<>;
+  virtual maybe_remove_shadow_ret maybe_remove_shadow(
+    Transaction &t,
+    CachedExtent &e) = 0;
+
   /**
    * get_extents_if_live
    *
@@ -418,6 +479,7 @@ struct BackgroundListener {
   virtual ~BackgroundListener() = default;
   virtual void maybe_wake_background() = 0;
   virtual void maybe_wake_blocked_io() = 0;
+  virtual void maybe_wake_promote() = 0;
   virtual state_t get_state() const = 0;
 
   bool is_ready() const {
@@ -622,7 +684,7 @@ public:
     reserved_usage -= usage;
   }
 
-  seastar::future<> trim();
+  seastar::future<> trim(bool force);
 
   static JournalTrimmerImplRef create(
       store_index_t store_index,
@@ -654,7 +716,7 @@ private:
   }
 
   bool can_drop_backref() const {
-    return get_backend_type() == backend_type_t::RANDOM_BLOCK;
+    return !tail_include_alloc;
   }
 
   bool should_trim_alloc() const {
@@ -1231,17 +1293,25 @@ public:
 
   virtual void release_projected_usage(std::size_t) = 0;
 
+  // Returns true when the allocator is full (failsafe limit) and writes should
+  // be refused. Only RBMCleaner overrides this; SegmentCleaner returns false.
+  virtual bool is_storage_full() const { return false; }
+
   virtual bool should_block_io_on_clean() const = 0;
 
   virtual bool can_clean_space() const = 0;
 
   virtual bool should_clean_space() const = 0;
 
+  virtual double get_alive_ratio() const = 0;
+
   using clean_space_ertr = base_ertr;
   using clean_space_ret = clean_space_ertr::future<>;
   virtual clean_space_ret clean_space() = 0;
 
   virtual const std::set<device_id_t>& get_device_ids() const = 0;
+
+  virtual backend_type_t get_backend_type() const = 0;
 
   virtual std::size_t get_reclaim_size_per_cycle() const = 0;
 
@@ -1467,6 +1537,10 @@ public:
     return sm_group->get_device_ids();
   }
 
+  backend_type_t get_backend_type() const final {
+    return backend_type_t::SEGMENTED;
+  }
+
   std::size_t get_reclaim_size_per_cycle() const final {
     return config.reclaim_bytes_per_cycle;
   }
@@ -1609,7 +1683,7 @@ private:
     if (segments.get_unavailable_bytes() == 0) return 0;
     return (double)get_unavailable_unused_bytes() / (double)segments.get_unavailable_bytes();
   }
-  double get_alive_ratio() const {
+  double get_alive_ratio() const final {
     return stats.used_bytes / (double)segments.get_total_bytes();
   }
 
@@ -1741,17 +1815,19 @@ public:
     RBMDeviceGroupRef&& rb_group,
     BackrefManager &backref_manager,
     LBAManager &lba_manager,
-    bool detailed);
+    bool detailed,
+    bool is_cold);
 
   static RBMCleanerRef create(
       store_index_t store_index,
       RBMDeviceGroupRef&& rb_group,
       BackrefManager &backref_manager,
       LBAManager &lba_manager,
-      bool detailed) {
+      bool detailed,
+      bool is_cold) {
     return std::make_unique<RBMCleaner>(
       store_index,
-      std::move(rb_group), backref_manager, lba_manager, detailed);
+      std::move(rb_group), backref_manager, lba_manager, detailed, is_cold);
   }
 
   RBMDeviceGroup* get_rb_group() {
@@ -1783,6 +1859,10 @@ public:
     return st;
   }
 
+  double get_alive_ratio() const final {
+    return stats.used_bytes / (double)get_total_bytes();
+  }
+
   void print(std::ostream &, bool is_detailed) const final;
 
   mount_ret mount() final;
@@ -1801,6 +1881,19 @@ public:
     return false;
   }
 
+  bool is_storage_full() const final {
+    auto st = get_stat();
+    if (st.total == 0) {
+      return false;
+    }
+    // Failsafe limit: full once the used fraction reaches the same ratio
+    // classic uses for its failsafe check (osd_failsafe_full_ratio, default
+    // 0.97), i.e. free fraction drops below (1 - ratio).
+    const double failsafe_full_ratio =
+      crimson::common::get_conf<double>("osd_failsafe_full_ratio");
+    return st.available < st.total * (1.0 - failsafe_full_ratio);
+  }
+
   bool can_clean_space() const final {
     return false;
   }
@@ -1813,6 +1906,10 @@ public:
 
   const std::set<device_id_t>& get_device_ids() const final {
     return rb_group->get_device_ids();
+  }
+
+  backend_type_t get_backend_type() const final {
+    return backend_type_t::RANDOM_BLOCK;
   }
 
   std::size_t get_reclaim_size_per_cycle() const final {
@@ -1850,10 +1947,11 @@ public:
     return paddr;
   }
 
-  std::list<alloc_paddr_result> alloc_paddrs(extent_len_t length) {
+  std::list<alloc_paddr_result> alloc_paddrs(
+    extent_len_t length, paddr_t hint) {
     // TODO: implement allocation strategy (dirty metadata and multiple devices)
     auto rbs = rb_group->get_rb_managers();
-    auto ret = rbs[0]->alloc_extents(length);
+    auto ret = rbs[0]->alloc_extents(length, hint);
     if (!ret.empty()) {
       stats.used_bytes += length;
     }
@@ -1893,6 +1991,7 @@ private:
 
   store_index_t store_index;
   const bool detailed;
+  const bool is_cold;
   RBMDeviceGroupRef rb_group;
   BackrefManager &backref_manager;
   LBAManager &lba_manager;

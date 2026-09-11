@@ -201,6 +201,7 @@ class Namespace(NamedTuple):
     rbd_image_name: Annotated[str, CliHeader("RBD Image")]
     rados_namespace_name: Annotated[Optional[str], CliHeader("RADOS Namespace")]
     rbd_pool_name: Annotated[str, CliHeader("RBD Pool")]
+    rbd_data_pool_name: Annotated[str, CliHeader("RBD Data Pool")]
     load_balancing_group: Annotated[int, CliHeader('LB Group')]
     rbd_image_size: Annotated[int, CliFlags.SIZE]
     block_size: Annotated[int, CliFlags.SIZE]
@@ -217,8 +218,9 @@ class Namespace(NamedTuple):
     disable_auto_resize: Optional[bool]
     read_only: Optional[bool]
     location: Optional[str]
-    encryption_algorithm: Optional[str]
     encryption_entries: Annotated[List[EncryptionEntry], CliFlags.EXCLUSIVE_LIST]
+    degraded: Optional[bool]
+    pinned: Optional[bool]
 
 
 class NamespaceList(NamedTuple):
@@ -435,5 +437,23 @@ class SubsystemInfo(NamedTuple):
     has_dhchap_key: Optional[bool]
 
 
+class SubsystemCached(NamedTuple):
+    nqn: str
+    subtype: str
+    allow_any_host: bool
+    serial_number: Optional[str]
+    model_number: Optional[str]
+    max_namespaces: Optional[int]
+    min_cntlid: Annotated[Optional[int], CliFlags.DROP]
+    max_cntlid: Annotated[Optional[int], CliFlags.DROP]
+    has_dhchap_key: Optional[bool]
+    network_mask: Annotated[List[str], CliFieldTransformer(lambda v: "\n".join(v))] = []
+    # nested repeated fields — count namespaces, drop the rest
+    namespaces: Annotated[List[Any], CliFieldTransformer(len), CliHeader('Namespace Count')] = []
+    listen_addresses: Annotated[List[Any], CliFlags.DROP] = []
+    hosts: Annotated[List[Any], CliFlags.DROP] = []
+
+
 class GetSubsystems(NamedTuple):
-    subsystems: List[Subsystem]
+    subsystems: Annotated[List[SubsystemCached], CliFlags.EXCLUSIVE_LIST,
+                          CliEmptyMessage("No subsystems")]

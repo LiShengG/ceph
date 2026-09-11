@@ -477,7 +477,7 @@ You may set values for the following keys:
    :Description: Sets or unsets the ``NODELETE`` flag on a given pool.
    :Type: Integer
    :Valid Range: 1 sets flag, 0 unsets flag
-   :Version: Version ``FIXME``
+   :Version: ``0.93`` and above
 
 .. _nopgchange:
 
@@ -486,7 +486,7 @@ You may set values for the following keys:
    :Description: Sets or unsets the ``NOPGCHANGE`` flag on a given pool.
    :Type: Integer
    :Valid Range: 1 sets flag, 0 unsets flag
-   :Version: Version ``FIXME``
+   :Version: ``0.93`` and above
 
 .. _nosizechange:
 
@@ -495,7 +495,7 @@ You may set values for the following keys:
    :Description: Sets or unsets the ``NOSIZECHANGE`` flag on a given pool.
    :Type: Integer
    :Valid Range: 1 sets flag, 0 unsets flag
-   :Version: Version ``FIXME``
+   :Version: ``0.93`` and above
 
 .. _bulk:
 
@@ -836,7 +836,7 @@ Here are the breakdowns of the arguments:
 
 .. describe:: {min_size}
             
-   The minimum number of replicas that must be active for IO operations to be
+   The minimum number of replicas that must be active for I/O operations to be
    serviced.
 
    :Type: Integer

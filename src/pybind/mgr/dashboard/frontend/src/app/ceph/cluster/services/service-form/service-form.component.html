@@ -355,7 +355,7 @@
             spacingClass="mb-3"
             i18n
           >
-            The RGW daemons for this service must be restarted to apply the updated realm,
+            The RGW service instances for this service must be restarted to apply the updated realm,
             zonegroup, or zone configuration.
           </cd-alert-panel>
         }
@@ -377,8 +377,9 @@
           >
             Enable
             <cd-help-text i18n>
-              If Unmanaged is selected, the orchestrator will not start or stop any daemons
-              associated with this service. Placement and all other properties will be ignored.
+              If Unmanaged is selected, the orchestrator will not start or stop any service
+              instances associated with this service. Placement and all other properties will be
+              ignored.
             </cd-help-text>
           </cds-checkbox>
         </fieldset>
@@ -473,7 +474,7 @@
             formControlName="count"
             id="count"
             min="1"
-            helperText="Number of deamons that will be deployed"
+            helperText="Number of service instances that will be deployed"
             i18n-helperText
           >
           </cds-number>
@@ -492,7 +493,7 @@
             id="rgw_frontend_port"
             min="1"
             max="65535"
-            helperText="Number of deamons that will be deployed"
+            helperText="Port on which the service listens for client requests."
             i18n-helperText
             [invalid]="
               serviceForm.controls.rgw_frontend_port.invalid &&
@@ -538,9 +539,16 @@
             formControlName="virtual_host_enabled"
           >
             Enable virtual-host style bucket access
-            <cd-help-text i18n>
-              Allows bucket access via hostnames such as mybucket.s3.example.com.
-            </cd-help-text>
+            @if (realmList.length === 0) {
+              <cd-help-text i18n>
+                Requires a multisite realm, zonegroup, and zone. Create a realm to enable
+                virtual-host style bucket access.
+              </cd-help-text>
+            } @else {
+              <cd-help-text i18n>
+                Allows bucket access via hostnames such as mybucket.s3.example.com.
+              </cd-help-text>
+            }
           </cds-checkbox>
         </div>
         @if (serviceForm.controls.virtual_host_enabled.value) {
@@ -1666,6 +1674,10 @@
               id="ssl"
               i18n
               >SSL
+              <cd-help-text>
+                Secure client connections by using SSL. When enabled, provide a certificate and the
+                corresponding private key.
+              </cd-help-text>
             </cds-checkbox>
           </div>
         }
@@ -1696,9 +1708,11 @@
                 context: {
                   controlName: 'ssl_cert',
                   title: 'Certificate Input',
+                  placeholder: 'Paste the certificate in PEM format',
                   helperText:
-                    'Uploaded files will populate the certificate details automatically. Or paste the PEM content directly in the text area.',
-                  description: 'Upload a .crt file, or paste the certificate PEM content directly.',
+                    'Uploading a certificate file automatically populates this field. Alternatively, paste the certificate in PEM format.',
+                  description:
+                    'Upload a certificate (.crt) file or paste the certificate in PEM format.',
                   invalidTemplate: invalidSslCertError,
                   isRequired: false
                 }
@@ -1730,6 +1744,8 @@
                 context: {
                   controlName: 'ssl_key',
                   title: 'Private Key Input',
+                  placeholder:
+                    'Uploading a private key file automatically populates this field. Alternatively, paste the private key in PEM format.',
                   helperText:
                     'Uploaded files will populate the private key details automatically. Or paste the PEM content directly in the text area.',
                   description: 'Upload a .key file, or paste the private key PEM content directly.',
@@ -1768,6 +1784,7 @@
                   context: {
                     controlName: 'ssl_ca_cert',
                     title: 'CA Certificate Input',
+                    placeholder: 'Paste the certificate in PEM format',
                     helperText:
                       'Uploaded files will populate the CA certificate details automatically. Or paste the PEM content directly in the text area.',
                     description:
@@ -1934,6 +1951,7 @@
                   context: {
                     controlName: 'root_ca_cert',
                     title: 'Root CA Certificate Input',
+                    placeholder: 'Paste the certificate in PEM format',
                     helperText:
                       'Uploaded files will populate the Root CA certificate details automatically. Or paste the PEM content directly in the text area.',
                     description:
@@ -1962,6 +1980,7 @@
                   context: {
                     controlName: 'client_cert',
                     title: 'Client Certificate Input',
+                    placeholder: 'Paste the certificate in PEM format',
                     helperText:
                       'Uploaded files will populate the client certificate details automatically. Or paste the PEM content directly in the text area.',
                     description:
@@ -1990,6 +2009,8 @@
                   context: {
                     controlName: 'client_key',
                     title: 'Client Key Input',
+                    placeholder:
+                      'Uploading a private key file automatically populates this field. Alternatively, paste the private key in PEM format.',
                     helperText:
                       'Uploaded files will populate the client key details automatically. Or paste the PEM content directly in the text area.',
                     description:
@@ -2018,6 +2039,7 @@
                   context: {
                     controlName: 'server_cert',
                     title: 'Gateway Server Certificate Input',
+                    placeholder: 'Paste the certificate in PEM format',
                     helperText:
                       'Uploaded files will populate the gateway server certificate details automatically. Or paste the PEM content directly in the text area.',
                     description:
@@ -2046,6 +2068,8 @@
                   context: {
                     controlName: 'server_key',
                     title: 'Gateway Server Key Input',
+                    placeholder:
+                      'Uploading a private key file automatically populates this field. Alternatively, paste the private key in PEM format.',
                     helperText:
                       'Uploaded files will populate the gateway server key details automatically. Or paste the PEM content directly in the text area.',
                     description:
@@ -2097,6 +2121,7 @@
   let-description="description"
   let-invalidTemplate="invalidTemplate"
   let-isRequired="isRequired"
+  let-placeholder="placeholder"
 >
   <cds-textarea-label
     [attr.cdRequiredField]="isRequired ? title : null"
@@ -2119,7 +2144,7 @@
       cdsTextArea
       [id]="controlName"
       [theme]="'dark'"
-      placeholder="Paste certificate or private key PEM content"
+      [placeholder]="placeholder"
       [formControl]="serviceForm.controls[controlName]"
       cols="50"
       rows="5"

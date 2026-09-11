@@ -2,8 +2,9 @@ import { Component, OnDestroy, OnInit } from '@angular/core';
 import { HttpParams } from '@angular/common/http';
 import { ActivatedRoute, ParamMap } from '@angular/router';
 import { Subscription } from 'rxjs';
-
+import { finalize, mergeMap } from 'rxjs/operators';
 import { HostService } from '~/app/shared/api/host.service';
+import { OrchestratorService } from '~/app/shared/api/orchestrator.service';
 import { OverviewField } from '~/app/shared/components/resource-overview-card/resource-overview-card.component';
 import { HostOverviewDetails, STATUS_MAP, getStatus } from '~/app/shared/models/host.interface';
 import { Permissions } from '~/app/shared/models/permissions';
@@ -20,11 +21,13 @@ export class HostResourcePageComponent implements OnInit, OnDestroy {
   hostname = '';
   section = '';
   permissions: Permissions;
+  isOverviewLoading = false;
   hostOverviewFields: OverviewField[] = [];
 
   constructor(
     private route: ActivatedRoute,
     private hostService: HostService,
+    private orchService: OrchestratorService,
     private authStorageService: AuthStorageService,
     private formatter: FormatterService
   ) {
@@ -47,6 +50,7 @@ export class HostResourcePageComponent implements OnInit, OnDestroy {
 
   private loadOverview(): void {
     if (!this.hostname) {
+      this.isOverviewLoading = false;
       this.hostOverviewFields = [];
       return;
     }
@@ -56,18 +60,30 @@ export class HostResourcePageComponent implements OnInit, OnDestroy {
     params = params.set('limit', '1');
     params = params.set('search', this.hostname);
     params = params.set('sort', '+hostname');
+    this.isOverviewLoading = true;
 
     this.sub.add(
-      this.hostService.list(params, 'true').subscribe({
-        next: (hosts: object[]) => {
-          const hostList = (Array.isArray(hosts) ? hosts : []) as HostOverviewDetails[];
-          const host = hostList.find((item) => item.hostname === this.hostname);
-          this.hostOverviewFields = this.buildOverviewFields(host);
-        },
-        error: () => {
-          this.hostOverviewFields = this.buildOverviewFields();
-        }
-      })
+      this.orchService
+        .status()
+        .pipe(
+          mergeMap((orchStatus) => {
+            const factsAvailable = this.hostService.checkHostsFactsAvailable(orchStatus);
+            return this.hostService.list(params, factsAvailable.toString());
+          }),
+          finalize(() => {
+            this.isOverviewLoading = false;
+          })
+        )
+        .subscribe({
+          next: (hosts: object[]) => {
+            const hostList = (Array.isArray(hosts) ? hosts : []) as HostOverviewDetails[];
+            const host = hostList.find((item) => item.hostname === this.hostname);
+            this.hostOverviewFields = this.buildOverviewFields(host);
+          },
+          error: () => {
+            this.hostOverviewFields = this.buildOverviewFields();
+          }
+        })
     );
   }
 

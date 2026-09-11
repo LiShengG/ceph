@@ -751,7 +751,6 @@ void OSDMonitor::update_from_paxos(bool *need_bootstrap)
     mapping_job.reset();
   }
 
-  load_health();
 
   /*
    * We will possibly have a stashed latest that *we* wrote, and we will
@@ -2129,9 +2128,8 @@ void OSDMonitor::encode_pending(MonitorDBStore::TransactionRef t)
   }
 
   // health
-  health_check_map_t next;
+  auto& next = get_health_checks_pending_writeable();
   tmp.check_health(cct, &next);
-  encode_health(next, t);
 }
 
 int OSDMonitor::load_metadata(int osd, map<string, string>& m, ostream *err)
@@ -6164,20 +6162,24 @@ bool OSDMonitor::preprocess_command(MonOpRequestRef op)
     }
     rdata.append(ds);
   } else if (prefix == "osd blocklist ls" ||
-	     prefix == "osd blacklist ls") {
-    if (f)
+             prefix == "osd blacklist ls") {
+    bool new_format = op->get_connection()->has_features(CEPH_FEATUREMASK_SERVER_UMBRELLA);
+    if (f) {
+      if (new_format) {
+        f->open_object_section("blocklist_info");
+      }
       f->open_array_section("blocklist");
-
-    for (auto p = osdmap.blocklist.begin(); p != osdmap.blocklist.end(); ++p) {
+    }
+    for (auto & p : osdmap.blocklist) {
       if (f) {
 	f->open_object_section("entry");
-	f->dump_string("addr", p->first.get_legacy_str());
-	f->dump_stream("until") << p->second;
+	f->dump_string("addr", p.first.get_legacy_str());
+	f->dump_stream("until") << p.second;
 	f->close_section();
       } else {
 	stringstream ss;
 	string s;
-	ss << p->first << " " << p->second;
+	ss << p.first << " " << p.second;
 	getline(ss, s);
 	s += "\n";
 	rdata.append(s);
@@ -6185,40 +6187,49 @@ bool OSDMonitor::preprocess_command(MonOpRequestRef op)
     }
     if (f) {
       f->close_section();
-      f->flush(rdata);
+      if (!new_format) {
+        f->flush(rdata);
+      }
     }
     if (f)
       f->open_array_section("range_blocklist");
 
-    for (auto p = osdmap.range_blocklist.begin();
-	 p != osdmap.range_blocklist.end();
-	 ++p) {
+    for (auto & p : osdmap.range_blocklist) {
       if (f) {
-	f->open_object_section("entry");
-	f->dump_string("range", p->first.get_legacy_str());
-	f->dump_stream("until") << p->second;
-	f->close_section();
+        f->open_object_section("entry");
+        f->dump_string("range", p.first.get_legacy_str());
+        f->dump_stream("until") << p.second;
+        f->close_section();
       } else {
-	stringstream ss;
-	string s;
-	ss << p->first << " " << p->second;
-	getline(ss, s);
-	s += "\n";
-	rdata.append(s);
+        stringstream ss;
+        string s;
+        ss << p.first << " " << p.second;
+        getline(ss, s);
+        s += "\n";
+        rdata.append(s);
       }
     }
     if (f) {
       f->close_section();
-      f->flush(rdata);
+      if (new_format) {
+        f->close_section();
+        f->flush(ds);
+        rdata.append(ds);
+      } else {
+        f->flush(rdata);
+      }
     }
-    ss << "listed " << osdmap.blocklist.size() + osdmap.range_blocklist.size() << " entries";
-
+    if (!new_format || !f) {
+      ss << "listed " << osdmap.blocklist.size() + osdmap.range_blocklist.size() << " entries";
+    }
   } else if (prefix == "osd pool ls") {
     string detail;
     cmd_getval(cmdmap, "detail", detail);
+    bool show_rule_names = false;
+    cmd_getval(cmdmap, "show_rule_names", show_rule_names);
     if (!f && detail == "detail") {
       ostringstream ss;
-      osdmap.print_pools(cct, ss);
+      osdmap.print_pools(cct, ss, show_rule_names);
       rdata.append(ss.str());
     } else {
       if (f)
@@ -6229,7 +6240,7 @@ bool OSDMonitor::preprocess_command(MonOpRequestRef op)
 	    f->open_object_section("pool");
 	    f->dump_int("pool_id", pid);
 	    f->dump_string("pool_name", osdmap.get_pool_name(pid));
-	    pdata.dump(f.get());
+	    pdata.dump(f.get(), osdmap.crush.get(), show_rule_names);
 	    osdmap.dump_read_balance_score(cct, pid, pdata, f.get());
 	    f->close_section();
 	  } else {
@@ -7628,12 +7639,14 @@ int OSDMonitor::prepare_new_pool(MonOpRequestRef op)
   stringstream ss;
   string rule_name;
   bool bulk = false;
+  bool force_create = false;
   int ret = 0;
   ret = prepare_new_pool(m->name, m->crush_rule, rule_name,
 			 0, 0, 0, 0, 0, 0, 0.0,
 			 erasure_code_profile,
 			 pg_pool_t::TYPE_REPLICATED, 0, FAST_READ_OFF, {}, bulk,
 			 cct->_conf.get_val<bool>("osd_pool_default_crimson"),
+       force_create,
 			 &ss);
 
   if (ret < 0) {
@@ -8233,7 +8246,16 @@ int OSDMonitor::check_pg_num(int64_t pool,
   // assume min cluster size 3
   osd_num_by_crush = std::max(osd_num_by_crush, 3u);
   auto projected_pgs_per_osd = projected / osd_num_by_crush;
-
+  uint64_t pg_limit = max_pgs_per_osd * osd_num_by_crush;
+  if (projected > pg_limit) {
+      *ss << " pg_num " << pg_num
+      << " size " << size
+      << " for this pool would result in "
+      << projected
+      << " cumulative PGs which exceeds the limit of "
+      << "value of " << max_pgs_per_osd;
+    return -ERANGE;
+  }
   if (projected_pgs_per_osd > max_pgs_per_osd) {
     if (pool >= 0) {
       *ss << "pool id " << pool;
@@ -8288,6 +8310,7 @@ int OSDMonitor::prepare_new_pool(string& name,
 				 string pg_autoscale_mode,
 				 bool bulk,
 				 bool crimson,
+         bool force_create,
 				 ostream *ss)
 {
   if (crimson && pg_autoscale_mode.empty()) {
@@ -8301,15 +8324,7 @@ int OSDMonitor::prepare_new_pool(string& name,
     return -EINVAL;
 
   if (pg_num == 0) {
-    auto pg_num_from_mode =
-      [pg_num=g_conf().get_val<uint64_t>("osd_pool_default_pg_num")]
-      (const string& mode) {
-      return mode == "on" ? 1 : pg_num;
-    };
-    pg_num = pg_num_from_mode(
-      pg_autoscale_mode.empty() ?
-      g_conf().get_val<string>("osd_pool_default_pg_autoscale_mode") :
-      pg_autoscale_mode);
+    pg_num = g_conf().get_val<uint64_t>("osd_pool_default_pg_num");
   }
   if (pgp_num == 0)
     pgp_num = g_conf().get_val<uint64_t>("osd_pool_default_pgp_num");
@@ -8382,7 +8397,7 @@ int OSDMonitor::prepare_new_pool(string& name,
              << duration << dendl;
   }
   r = check_pg_num(-1, pg_num, size, crush_rule, ss);
-  if (r) {
+  if (r && !force_create) {
     dout(10) << "check_pg_num returns " << r << dendl;
     return r;
   }
@@ -8398,7 +8413,6 @@ int OSDMonitor::prepare_new_pool(string& name,
     dout(10) << "prepare_pool_stripe_width returns " << r << dendl;
     return r;
   }
-  
   bool fread = false;
   if (pool_type == pg_pool_t::TYPE_ERASURE) {
     switch (fast_read) {
@@ -13308,8 +13322,20 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
 
     case OP_RM_PG_UPMAP_PRIMARY_ALL:
       {
-	osdmap.rm_all_upmap_prims(cct, &pending_inc);
-	ss << "cleared all pg_upmap_primary mappings";
+        string pool_name;
+        if (cmd_getval(cmdmap, "pool", pool_name)) {
+          auto pool_id = osdmap.lookup_pg_pool_name(pool_name);
+          if (pool_id < 0) {
+            err = -EINVAL;
+            ss << "unrecognized pool name '" << pool_name << "'";
+            goto reply_no_propose;
+          }
+          osdmap.rm_all_upmap_prims(cct, &pending_inc, pool_id);
+          ss << "cleared all pg_upmap_primary mappings for pool '" << pool_name << "'";
+        } else {
+          osdmap.rm_all_upmap_prims(cct, &pending_inc);
+          ss << "cleared all pg_upmap_primary mappings";
+        }
       }
       break;
 
@@ -14128,7 +14154,8 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
 
     bool crimson = cmd_getval_or<bool>(cmdmap, "crimson", false) ||
       cct->_conf.get_val<bool>("osd_pool_default_crimson");
-
+    bool force_create = false;
+    cmd_getval(cmdmap, "force_pg_limit", force_create);
     err = prepare_new_pool(poolstr,
 			   -1, // default crush rule
 			   rule_name,
@@ -14140,6 +14167,7 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
 			   pg_autoscale_mode,
 			   bulk,
 			   crimson,
+         force_create,
 			   &ss);
     if (err < 0) {
       switch(err) {
@@ -15031,7 +15059,7 @@ bool OSDMonitor::enforce_pool_op_caps(MonOpRequestRef op)
         pool_name = &osdmap.get_pool_name(m->pool);
       }
 
-      if (!is_unmanaged_snap_op_permitted(cct, mon.key_server,
+      if (!is_unmanaged_snap_op_permitted(cct, mon,
                                           session->entity_name, session->caps,
 					  session->get_peer_socket_addr(),
                                           pool_name)) {
@@ -15044,12 +15072,19 @@ bool OSDMonitor::enforce_pool_op_caps(MonOpRequestRef op)
     }
     break;
   default:
-    if (!session->is_capable("osd", MON_CAP_W)) {
-      dout(0) << "got pool op from entity with insufficient privileges. "
-              << "message: " << *m  << std::endl
-              << "caps: " << session->caps << dendl;
-      _pool_op_reply(op, -EPERM, osdmap.get_epoch());
-      return true;
+    {
+      // pool create can also be authorized by an 'osd pool create' command
+      // grant; MPoolOp carries no command name, so supply one here
+      const char *cmd = (m->op == POOL_OP_CREATE) ? "osd pool create" : "";
+      if (!session->caps.is_capable(
+            cct, session->entity_name, "osd", cmd, {},
+            false, true, false, session->get_peer_socket_addr())) {
+        dout(0) << "got pool op from entity with insufficient privileges. "
+                << "message: " << *m  << std::endl
+                << "caps: " << session->caps << dendl;
+        _pool_op_reply(op, -EPERM, osdmap.get_epoch());
+        return true;
+      }
     }
     break;
   }
