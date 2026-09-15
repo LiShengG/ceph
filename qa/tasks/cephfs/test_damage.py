@@ -692,3 +692,42 @@ class TestDamage(CephFSTestCase):
             self.assertTrue("Input/output error" in p.stderr.getvalue())
         else:
             self.fail("command should fail")
+
+    def test_keyed_fetch_bad_header(self):
+        """
+        That a lookup fetching a single dentry from a dirfrag with a corrupt
+        header fails with EIO instead of hanging.
+        """
+
+        # Without prefetch, a lookup miss fetches only the wanted dentry.
+        self.config_set("mds", "mds_dir_prefetch", False)
+        self.addCleanup(self.config_rm, "mds", "mds_dir_prefetch")
+
+        self.mount_a.run_shell_payload("mkdir subdir && touch subdir/file")
+        ino = self.mount_a.path_to_ino("subdir")
+        self.mount_a.umount_wait()
+        # A lingering session could load the dirfrag during rejoin.
+        self.wait_until_equal(lambda: self.fs.rank_asok(["session", "ls"]), [],
+                              timeout=30)
+        self.fs.flush()
+        self.fs.fail()
+        self.fs.radosm(["setomapheader", "{0:x}.00000000".format(ino), "junk"])
+        self.fs.set_joinable()
+        self.fs.wait_for_daemons()
+        self.mount_a.mount_wait()
+        self.assertEqual(self.fs.get_damage(rank=0), [])
+
+        # If the lookup hangs, tearDown kills the client, which frees it.
+        p = self.mount_a.run_shell(["stat", "subdir/file"], wait=False)
+        try:
+            wait([p], 60)
+        except MaxWhileTries:
+            self.fail("lookup hung on a dirfrag with a corrupt header")
+        except CommandFailedError:
+            self.assertIn("Input/output error", p.stderr.getvalue())
+        else:
+            self.fail("stat should fail")
+
+        damage = self.fs.get_damage(rank=0)
+        self.assertEqual([(d["damage_type"], d["ino"]) for d in damage],
+                         [("dir_frag", ino)])
