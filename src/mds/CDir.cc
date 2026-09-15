@@ -2343,7 +2343,8 @@ void CDir::go_bad(bool complete)
 
   state_clear(STATE_FETCHING);
   auth_unpin(this);
-  finish_waiting(WAIT_COMPLETE, -EIO);
+  // keyed fetches park their waiters on waiting_on_dentry, wake them too
+  finish_waiting(WAIT_COMPLETE | WAIT_DENTRY, -EIO);
 }
 
 // -----------------------
