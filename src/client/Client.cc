@@ -248,9 +248,7 @@ int Client::get_fd_inode(int fd, InodeRef *in) {
 }
 
 dir_result_t::dir_result_t(Inode *in, const UserPerm& perms)
-  : inode(in), offset(0), next_offset(2),
-    release_count(0), ordered_count(0), cache_index(0), start_shared_gen(0),
-    perms(perms)
+  : inode(in), offset(0), next_offset(2), perms(perms)
   { }
 
 void Client::_reset_faked_inos()
@@ -1076,6 +1074,8 @@ Inode * Client::add_update_inode(InodeStat *st, utime_t from,
       in->dir_layout = st->dir_layout;
       ldout(cct, 20) << " dir hash is " << (int)in->dir_layout.dl_dir_hash << dendl;
       in->rstat = st->rstat;
+      if (st->cap.flags & CEPH_CAP_FLAG_AUTH)
+	in->rstat_seq = readdir_listing_seq;
       in->quota = st->quota;
       in->dir_pin = st->dir_pin;
     }
@@ -1121,6 +1121,7 @@ Inode * Client::add_update_inode(InodeStat *st, utime_t from,
     if (in->auth_cap && in->auth_cap->session == session) {
       in->max_size = st->max_size;
       in->rstat = st->rstat;
+      in->rstat_seq = readdir_listing_seq;
     }
 
     // setting I_COMPLETE needs to happen after adding the cap
@@ -1356,14 +1357,39 @@ void Client::insert_readdir_results(MetaRequest *request, MetaSession *session, 
 		   << ", last_hash " << last_hash
 		   << ", next_offset " << readdir_offset << dendl;
 
-    if (diri->snapid != CEPH_SNAPDIR &&
-	fg.is_leftmost() && readdir_offset == 2 &&
-	!(hash_order && last_hash)) {
-      dirp->release_count = diri->dir_release_count;
-      dirp->ordered_count = diri->dir_ordered_count;
-      dirp->start_shared_gen = diri->shared_gen;
-      dirp->cache_index = 0;
+    // This reply lists every dentry of the directory from 'start' on, in
+    // readdir order, up to its last entry.
+    bool from_beginning = fg.is_leftmost() && readdir_offset == 2 &&
+			  !(hash_order && last_hash);
+    bool start_known = from_beginning || !readdir_start.empty() ||
+		       !hash_order || (flags & CEPH_READDIR_OFFSET_HASH);
+    int64_t start = 0;
+    if (!from_beginning)
+      start = hash_order ?
+	dir_result_t::make_fpos(last_hash, readdir_offset, true) :
+	dir_result_t::make_fpos(fg, readdir_offset, false);
+
+    auto& pass = dir->readdir_pass;
+    bool pass_ok = pass.active &&
+		   pass.release_count == diri->dir_release_count &&
+		   pass.shared_gen == diri->shared_gen;
+    if (diri->snapid == CEPH_SNAPDIR || diri->is_complete_and_ordered()) {
+      pass_ok = false;
+    } else if (from_beginning &&
+	       !(pass_ok && pass.ordered_count == diri->dir_ordered_count)) {
+      ldout(cct, 10) << __func__ << " starting readdir pass on " << *diri << dendl;
+      pass.active = true;
+      pass.release_count = diri->dir_release_count;
+      pass.ordered_count = diri->dir_ordered_count;
+      pass.shared_gen = diri->shared_gen;
+      pass.end = 0;
+      dir->readdir_cache.clear();
+      pass_ok = true;
     }
+    // may this reply extend the pass, and keep readdir_cache in order?
+    bool extend = pass_ok && start_known &&
+		  dir_result_t::fpos_cmp(start, pass.end) <= 0;
+    bool ordered = extend && pass.ordered_count == diri->dir_ordered_count;
 
     dirp->buffer_frag = fg;
 
@@ -1411,28 +1437,55 @@ void Client::insert_readdir_results(MetaRequest *request, MetaSession *session, 
 	dn->offset = dir_result_t::make_fpos(fg, readdir_offset++, false);
       }
       // add to readdir cache
-      if (dirp->release_count == diri->dir_release_count &&
-	  dirp->ordered_count == diri->dir_ordered_count &&
-	  dirp->start_shared_gen == diri->shared_gen) {
-	if (dirp->cache_index == dir->readdir_cache.size()) {
-	  if (i == 0) {
-	    ceph_assert(!dirp->inode->is_complete_and_ordered());
-	    dir->readdir_cache.reserve(dirp->cache_index + numdn);
+      if (extend) {
+	if (dir_result_t::fpos_cmp(dn->offset, pass.end) >= 0) {
+	  if (ordered)
+	    dir->readdir_cache.push_back(dn);
+	  pass.end = dn->offset + 1;
+	} else if (ordered) {
+	  // already seen by the pass, must be at the same place
+	  auto it = std::lower_bound(
+	    dir->readdir_cache.begin(), dir->readdir_cache.end(), dn->offset,
+	    [](const Dentry *d, int64_t off) {
+	      return dir_result_t::fpos_cmp(d->offset, off) < 0;
+	    });
+	  if (it == dir->readdir_cache.end() || *it != dn) {
+	    ldout(cct, 10) << __func__ << " readdir pass on " << *diri
+			   << " disagrees at '" << dname << "', dropping it" << dendl;
+	    pass.active = false;
+	    extend = ordered = false;
 	  }
-	  dir->readdir_cache.push_back(dn);
-	} else if (dirp->cache_index < dir->readdir_cache.size()) {
-	  if (dirp->inode->is_complete_and_ordered())
-	    ceph_assert(dir->readdir_cache[dirp->cache_index] == dn);
-	  else
-	    dir->readdir_cache[dirp->cache_index] = dn;
-	} else {
-	  ceph_abort_msg("unexpected readdir buffer idx");
 	}
-	dirp->cache_index++;
       }
       // add to cached result list
       dirp->buffer.push_back(dir_result_t::dentry(dn->offset, dname, dn->alternate_name, in));
       ldout(cct, 15) << __func__ << "  " << hex << dn->offset << dec << ": '" << dname << "' -> " << in->ino << dendl;
+    }
+
+    if (extend && end) {
+      if (fg.is_rightmost()) {
+	// the pass has seen the whole directory
+	if (pass.release_count == diri->dir_release_count &&
+	    pass.shared_gen == diri->shared_gen) {
+	  if (ordered && pass.ordered_count == diri->dir_ordered_count) {
+	    ldout(cct, 10) << " marking (I_COMPLETE|I_DIR_ORDERED) on " << *diri << dendl;
+	    diri->flags |= I_COMPLETE | I_DIR_ORDERED;
+	  } else {
+	    ldout(cct, 10) << " marking I_COMPLETE on " << *diri << dendl;
+	    dir->readdir_cache.clear();
+	    diri->flags |= I_COMPLETE;
+	  }
+	}
+	pass.active = false;
+      } else {
+	// the pass goes on with the next frag, unless replies to other
+	// streams already took it further
+	int64_t next = hash_order ?
+	  dir_result_t::make_fpos(fg.next().value(), 2, true) :
+	  dir_result_t::make_fpos(diri->dirfragtree[fg.next().value()], 2, false);
+	if (dir_result_t::fpos_cmp(next, pass.end) > 0)
+	  pass.end = next;
+      }
     }
 
     if (numdn > 0)
@@ -5235,6 +5288,7 @@ void Client::handle_quota(const MConstRef<MClientQuota>& m)
     if (in) {
       in->quota = m->quota;
       in->rstat = m->rstat;
+      in->rstat_seq = readdir_listing_seq;
     }
   }
 }
@@ -8859,6 +8913,7 @@ int Client::_opendir(Inode *in, dir_result_t **dirpp, const UserPerm& perms)
   if (!in->is_dir())
     return -CEPHFS_ENOTDIR;
   *dirpp = new dir_result_t(in, perms);
+  (*dirpp)->listing_seq = ++readdir_listing_seq;
   opened_dirs.insert(*dirpp);
   ldout(cct, 8) << __func__ << "(" << in->ino << ") = " << 0 << " (" << *dirpp << ")" << dendl;
   return 0;
@@ -8901,6 +8956,7 @@ void Client::rewinddir(dir_result_t *dirp)
   dir_result_t *d = static_cast<dir_result_t*>(dirp);
   _readdir_drop_dirp_buffer(d);
   d->reset();
+  d->listing_seq = ++readdir_listing_seq;  // a new listing
 }
  
 loff_t Client::telldir(dir_result_t *dirp)
@@ -8923,12 +8979,15 @@ void Client::seekdir(dir_result_t *dirp, loff_t offset)
   if (offset == dirp->offset)
     return;
 
-  if (offset > dirp->offset)
-    dirp->release_count = 0;   // bump if we do a forward seek
-  else
-    dirp->ordered_count = 0;   // disable filling readdir cache
+  if (offset == 0)
+    dirp->listing_seq = ++readdir_listing_seq;  // a new listing
 
-  if (dirp->hash_order()) {
+  if (offset != 0 && !dirp->buffer.empty() &&
+      dir_result_t::fpos_cmp(offset, dirp->buffer.front().offset) >= 0 &&
+      dir_result_t::fpos_cmp(offset, dirp->buffer.back().offset + 1) <= 0) {
+    // the buffer still holds this position, e.g. an NFS server going back
+    // to the cookie of the last entry its client kept
+  } else if (dirp->hash_order()) {
     if (dirp->offset > offset) {
       _readdir_drop_dirp_buffer(dirp);
       dirp->reset();
@@ -9118,8 +9177,13 @@ int Client::_readdir_cache_cb(dir_result_t *dirp, add_dirent_cb_t cb, void *p,
     }
 
     int idx = pd - dir->readdir_cache.begin();
-    if (dn->inode->is_dir()) {
-      mask |= CEPH_STAT_RSTAT;
+    if (dn->inode->is_dir() && cct->_conf->client_dirsize_rbytes &&
+	dn->inode->rstat_seq < dirp->listing_seq) {
+      // The cached rstat predates this listing.  Rather than a getattr per
+      // dir entry, go on reading from the mds, whose replies refresh the
+      // rstat of all the entries they carry.
+      ldout(cct, 15) << " rstat of '" << dn->name << "' predates this listing" << dendl;
+      return -CEPHFS_EAGAIN;
     }
     int r = _getattr(dn->inode, mask, dirp->perms);
     if (r < 0)
@@ -9163,7 +9227,6 @@ int Client::_readdir_cache_cb(dir_result_t *dirp, add_dirent_cb_t cb, void *p,
     else
       dirp->next_offset = dirp->offset_low();
     dirp->last_name = dn_name; // we successfully returned this one; update!
-    dirp->release_count = 0; // last_name no longer match cache index
     if (r > 0)
       return r;
   }
@@ -9177,6 +9240,7 @@ int Client::readdir_r_cb(dir_result_t *d, add_dirent_cb_t cb, void *p,
 			 unsigned want, unsigned flags, bool getref)
 {
   int caps = statx_to_mask(flags, want);
+  int rstat_on_dir = cct->_conf->client_dirsize_rbytes ? CEPH_STAT_RSTAT : 0;
 
   RWRef_t mref_reader(mount_state, CLIENT_MOUNTING);
   if (!mref_reader.is_state_satisfied())
@@ -9206,7 +9270,7 @@ int Client::readdir_r_cb(dir_result_t *d, add_dirent_cb_t cb, void *p,
     uint64_t next_off = 1;
 
     int r;
-    r = _getattr(diri, caps | CEPH_STAT_RSTAT, dirp->perms);
+    r = _getattr(diri, caps | rstat_on_dir, dirp->perms);
     if (r < 0)
       return r;
 
@@ -9239,7 +9303,7 @@ int Client::readdir_r_cb(dir_result_t *d, add_dirent_cb_t cb, void *p,
       in = diri->get_first_parent()->dir->parent_inode;
 
     int r;
-    r = _getattr(in, caps | CEPH_STAT_RSTAT, dirp->perms);
+    r = _getattr(in, caps | rstat_on_dir, dirp->perms);
     if (r < 0)
       return r;
 
@@ -9306,8 +9370,9 @@ int Client::readdir_r_cb(dir_result_t *d, add_dirent_cb_t cb, void *p,
       int r;
       if (check_caps) {
 	int mask = caps;
-	if(entry.inode->is_dir()){
-          mask |= CEPH_STAT_RSTAT;
+	// no need to refetch rstat the auth mds sent during this listing
+	if (entry.inode->is_dir() && entry.inode->rstat_seq < dirp->listing_seq) {
+          mask |= rstat_on_dir;
 	}
 	r = _getattr(entry.inode, mask, dirp->perms);
 	if (r < 0)
@@ -9349,21 +9414,8 @@ int Client::readdir_r_cb(dir_result_t *d, add_dirent_cb_t cb, void *p,
       continue;
     }
 
-    if (diri->shared_gen == dirp->start_shared_gen &&
-	diri->dir_release_count == dirp->release_count) {
-      if (diri->dir_ordered_count == dirp->ordered_count) {
-	ldout(cct, 10) << " marking (I_COMPLETE|I_DIR_ORDERED) on " << *diri << dendl;
-	if (diri->dir) {
-	  ceph_assert(diri->dir->readdir_cache.size() >= dirp->cache_index);
-	  diri->dir->readdir_cache.resize(dirp->cache_index);
-	}
-	diri->flags |= I_COMPLETE | I_DIR_ORDERED;
-      } else {
-	ldout(cct, 10) << " marking I_COMPLETE on " << *diri << dendl;
-	diri->flags |= I_COMPLETE;
-      }
-    }
-
+    // the directory is marked complete when its readdir pass sees the end,
+    // see insert_readdir_results()
     dirp->set_end();
     return 0;
   }

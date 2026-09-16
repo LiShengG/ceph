@@ -211,8 +211,6 @@ struct dir_result_t {
     last_name.clear();
     next_offset = 2;
     offset = 0;
-    ordered_count = 0;
-    cache_index = 0;
     buffer.clear();
   }
 
@@ -226,10 +224,9 @@ struct dir_result_t {
   unsigned next_offset;  // offset of next chunk (last_name's + 1)
   string last_name;      // last entry in previous chunk
 
-  uint64_t release_count;
-  uint64_t ordered_count;
-  unsigned cache_index;
-  int start_shared_gen;  // dir shared_gen at start of readdir
+  // Client::readdir_listing_seq when this listing started: the rstat of a
+  // dir entry received from the auth mds since then needs no refresh
+  uint64_t listing_seq = 0;
   UserPerm perms;
 
   frag_t buffer_frag;
@@ -1526,6 +1523,8 @@ private:
   ceph::unordered_map<int, Fh*> fd_map;
   set<Fh*> ll_unclosed_fh_set;
   ceph::unordered_set<dir_result_t*> opened_dirs;
+  // bumped when a directory listing starts, see dir_result_t::listing_seq
+  uint64_t readdir_listing_seq = 0;
   uint64_t fd_gen = 1;
 
   bool   mount_aborted = false;
