@@ -101,6 +101,17 @@ options:
   services:
   - rgw
   with_legacy: true
+- name: rgw_dedup_skip_compressed
+  type: bool
+  level: advanced
+  desc: Skip server-side compressed objects during dedup.
+  long_desc: When true, compressed objects are skipped during the dedup process.
+    When false (default), compressed objects participate in dedup and their
+    uncompressed data is hashed on-the-fly for matching.
+  default: false
+  services:
+  - rgw
+  with_legacy: true
 - name: rgw_max_chunk_size
   type: size
   level: advanced
@@ -745,15 +756,13 @@ options:
     For compatibility, setting this configuration variable to the empty string causes
     the default ``swift`` to be used; if you do want an empty prefix, set this option
     to ``/``.
-
-    .. warning::
-
-       If you set this option to ``/``, you must disable the S3 API by modifying
-       ``rgw_enable_apis`` to exclude ``s3``. It is not possible to operate radosgw
-       with ``rgw_swift_url_prefix = /`` and simultaneously support both the S3 and
-       Swift APIs. If you do need to support both APIs without prefixes, deploy
-       multiple radosgw instances to listen on different hosts (or ports) instead,
-       enabling some for S3 and some for Swift.
+  warning: |
+    If you set this option to ``/``, you must disable the S3 API by modifying
+    ``rgw_enable_apis`` to exclude ``s3``. It is not possible to operate radosgw
+    with ``rgw_swift_url_prefix = /`` and simultaneously support both the S3 and
+    Swift APIs. If you do need to support both APIs without prefixes, deploy
+    multiple radosgw instances to listen on different hosts (or ports) instead,
+    enabling some for S3 and some for Swift.
   example: /swift-testing
   default: swift
   services:
@@ -1516,6 +1525,73 @@ options:
   services:
   - rgw
   with_legacy: true
+# overrides for librgw/smb
+- name: rgw_smb_run_gc_threads
+  type: bool
+  level: advanced
+  desc: run GC threads in librgw/smb (default off)
+  default: false
+  services:
+  - rgw
+  with_legacy: true
+- name: rgw_smb_run_lc_threads
+  type: bool
+  level: advanced
+  desc: run lifecycle threads in librgw/smb (default off)
+  default: false
+  services:
+  - rgw
+  with_legacy: true
+- name: rgw_smb_run_quota_threads
+  type: bool
+  level: advanced
+  desc: run quota threads in librgw/smb (default on)
+  default: true
+  services:
+  - rgw
+  with_legacy: true
+- name: rgw_smb_run_restore_threads
+  type: bool
+  level: advanced
+  desc: run objects' restore threads in librgw/smb (default off)
+  default: false
+  services:
+  - rgw
+  with_legacy: true
+- name: rgw_smb_run_dedup_threads
+  type: bool
+  level: advanced
+  desc: run dedup threads in librgw/smb (default off)
+  default: false
+  services:
+  - rgw
+  with_legacy: true
+- name: rgw_smb_run_sync_thread
+  type: bool
+  level: advanced
+  desc: run sync thread in librgw/smb (default off)
+  default: false
+  services:
+  - rgw
+  with_legacy: true
+- name: rgw_smb_frontends
+  type: str
+  level: basic
+  desc: RGW frontends configuration when running as librgw/smb
+  long_desc: A comma-delimited list of frontends configuration. Each configuration
+    contains the type of the frontend followed by an optional space delimited set
+    of key=value config parameters.
+  fmt_desc: Configures the rgw-smb frontend(s). The configuration for multiple
+    frontends can be provided in a comma-delimited list. Each frontend
+    configuration may include a list of options separated by spaces,
+    where each option is in the form "key=value" or "key". See
+    `RGW_SMB Frontends`_ for more on supported options.
+  default: rgw-smb
+  services:
+  - rgw
+  with_legacy: true
+  see_also:
+  - rgw_frontends
 - name: rgw_nfs_frontends
   type: str
   level: basic
