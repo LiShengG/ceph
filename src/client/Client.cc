@@ -987,7 +987,8 @@ void Client::_fragmap_remove_stopped_mds(Inode *in, mds_rank_t mds)
 
 Inode * Client::add_update_inode(InodeStat *st, utime_t from,
 				 MetaSession *session,
-				 const UserPerm& request_perms)
+				 const UserPerm& request_perms,
+				 uint64_t listing_seq)
 {
   Inode *in;
   bool was_new = false;
@@ -1075,7 +1076,7 @@ Inode * Client::add_update_inode(InodeStat *st, utime_t from,
       ldout(cct, 20) << " dir hash is " << (int)in->dir_layout.dl_dir_hash << dendl;
       in->rstat = st->rstat;
       if (st->cap.flags & CEPH_CAP_FLAG_AUTH)
-	in->rstat_seq = readdir_listing_seq;
+	in->rstat_seq = listing_seq;
       in->quota = st->quota;
       in->dir_pin = st->dir_pin;
     }
@@ -1121,7 +1122,7 @@ Inode * Client::add_update_inode(InodeStat *st, utime_t from,
     if (in->auth_cap && in->auth_cap->session == session) {
       in->max_size = st->max_size;
       in->rstat = st->rstat;
-      in->rstat_seq = readdir_listing_seq;
+      in->rstat_seq = listing_seq;
     }
 
     // setting I_COMPLETE needs to happen after adding the cap
@@ -1420,7 +1421,7 @@ void Client::insert_readdir_results(MetaRequest *request, MetaSession *session, 
       ldout(cct, 15) << "" << i << ": '" << dname << "'" << dendl;
 
       Inode *in = add_update_inode(&ist, request->sent_stamp, session,
-				   request->perms);
+				   request->perms, request->sent_listing_seq);
       Dentry *dn;
       if (diri->dir->dentries.count(dname)) {
 	Dentry *olddn = diri->dir->dentries[dname];
@@ -1611,13 +1612,13 @@ Inode* Client::insert_trace(MetaRequest *request, MetaSession *session)
     }
 
     in = add_update_inode(&ist, request->sent_stamp, session,
-			  request->perms);
+			  request->perms, request->sent_listing_seq);
   }
 
   Inode *diri = NULL;
   if (reply->head.is_dentry) {
     diri = add_update_inode(&dirst, request->sent_stamp, session,
-			    request->perms);
+			    request->perms, request->sent_listing_seq);
     mds_rank_t from_mds = mds_rank_t(reply->get_source().num());
     update_dir_dist(diri, &dst, from_mds);  // dir stat info is attached to ..
 
@@ -2571,6 +2572,7 @@ void Client::send_request(MetaRequest *request, MetaSession *session,
 
   if (request->mds == -1) {
     request->sent_stamp = ceph_clock_now();
+    request->sent_listing_seq = readdir_listing_seq;
     ldout(cct, 20) << __func__ << " set sent_stamp to " << request->sent_stamp << dendl;
   }
   request->mds = mds;
@@ -5303,7 +5305,6 @@ void Client::handle_quota(const MConstRef<MClientQuota>& m)
     if (in) {
       in->quota = m->quota;
       in->rstat = m->rstat;
-      in->rstat_seq = readdir_listing_seq;
     }
   }
 }
