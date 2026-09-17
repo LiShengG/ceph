@@ -9199,12 +9199,11 @@ int Client::_readdir_cache_cb(dir_result_t *dirp, add_dirent_cb_t cb, void *p,
     int idx = pd - dir->readdir_cache.begin();
     if (dn->inode->is_dir() && rstat_on_dir &&
 	dn->inode->rstat_seq < dirp->listing_seq) {
-      // The cached rstat predates this listing.  Refresh just this entry
-      // instead of abandoning the whole cache pass for the rest of the
-      // directory, mirroring the per-entry handling in readdir_r_cb().
-      ldout(cct, 15) << " rstat of '" << dn->name << "' predates this listing, "
-		     << "refreshing just this entry" << dendl;
-      mask |= rstat_on_dir;
+      // The cached rstat predates this listing.  Rather than a getattr per
+      // dir entry, go on reading from the mds, whose replies refresh the
+      // rstat of all the entries they carry.
+      ldout(cct, 15) << " rstat of '" << dn->name << "' predates this listing" << dendl;
+      return -CEPHFS_EAGAIN;
     }
     int r = _getattr(dn->inode, mask, dirp->perms);
     if (r < 0)
@@ -9291,10 +9290,7 @@ int Client::readdir_r_cb(dir_result_t *d, add_dirent_cb_t cb, void *p,
     uint64_t next_off = 1;
 
     int r;
-    int mask = caps;
-    if (diri->rstat_seq < dirp->listing_seq)
-      mask |= rstat_on_dir;
-    r = _getattr(diri, mask, dirp->perms);
+    r = _getattr(diri, caps | rstat_on_dir, dirp->perms);
     if (r < 0)
       return r;
 
@@ -9327,10 +9323,7 @@ int Client::readdir_r_cb(dir_result_t *d, add_dirent_cb_t cb, void *p,
       in = diri->get_first_parent()->dir->parent_inode;
 
     int r;
-    int mask = caps;
-    if (in->rstat_seq < dirp->listing_seq)
-      mask |= rstat_on_dir;
-    r = _getattr(in, mask, dirp->perms);
+    r = _getattr(in, caps | rstat_on_dir, dirp->perms);
     if (r < 0)
       return r;
 

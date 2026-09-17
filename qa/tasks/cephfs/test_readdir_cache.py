@@ -183,11 +183,11 @@ class TestReaddirCache(CephFSTestCase):
             """, path=path)
         return self._mds_requests()[0] - readdirs
 
-    def test_cached_listing_with_subdir(self):
+    def test_cached_listing_with_subdirs(self):
         """
-        A fragmented directory with a subdirectory is listed from the client's
-        readdir cache again, with only the subdirectory's rstat refreshed,
-        instead of falling back to reading the whole directory from the MDS.
+        Listing a cached, fragmented directory again refreshes the rstat of
+        its subdirectories by reading on from the MDS, whose replies carry
+        many of them each, not by a getattr per subdirectory.
         """
         if not isinstance(self.mount_a, FuseMount):
             self.skipTest("Requires the libcephfs readdir cache (FUSE client)")
@@ -196,8 +196,9 @@ class TestReaddirCache(CephFSTestCase):
             self.skipTest("Requires client_dirsize_rbytes")
 
         split_size = 100
-        nfiles = 500
-        names = ["sub"] + ["file_{0}".format(i) for i in range(nfiles)]
+        nsubdirs, nfiles = 100, 400
+        subdirs = ["sub_{0}".format(i) for i in range(nsubdirs)]
+        names = subdirs + ["file_{0}".format(i) for i in range(nfiles)]
         # one split into 8 frags, none of which gets big enough to split again
         counts = [0] * 8
         for name in names:
@@ -205,7 +206,7 @@ class TestReaddirCache(CephFSTestCase):
         self.assertLessEqual(max(counts), split_size)
 
         self._configure_split(split_size, 3)
-        self.mount_a.run_shell(["mkdir", "-p", "dir/sub"])
+        self.mount_a.run_shell(["mkdir", "-p"] + ["dir/" + d for d in subdirs])
         self.mount_a.create_n_files("dir/file", nfiles)
         self._wait_for_dirfrags("/dir", ["{0:x}/3".format(i << 21) for i in range(8)])
         expected = sorted(names)
@@ -222,9 +223,9 @@ class TestReaddirCache(CephFSTestCase):
         log.info("second listing: %d readdir, %d getattr requests",
                  new_readdirs - readdirs, new_getattrs - getattrs)
 
-        self.assertEqual(new_readdirs, readdirs)
-        # the subdirectory's rstat, plus "." and ".."
-        self.assertGreaterEqual(new_getattrs - getattrs, 1)
+        # at most one reply per frag, and "." and ".." aside no getattr
+        self.assertGreaterEqual(new_readdirs - readdirs, 1)
+        self.assertLessEqual(new_readdirs - readdirs, 8)
         self.assertLessEqual(new_getattrs - getattrs, 5)
 
     def test_resume_next_frag_after_hash_collision(self):
