@@ -1286,6 +1286,12 @@ void Client::clear_dir_complete_and_ordered(Inode *diri, bool complete)
   }
 }
 
+struct dentry_off_lt {
+  bool operator()(const Dentry* dn, int64_t off) const {
+    return dir_result_t::fpos_cmp(dn->offset, off) < 0;
+  }
+};
+
 /*
  * insert results from readdir or lssnap into the metadata cache.
  */
@@ -1385,7 +1391,7 @@ void Client::insert_readdir_results(MetaRequest *request, MetaSession *session, 
     }
 
     auto& pass = dir->readdir_pass;
-    bool pass_ok = pass.active &&
+    bool pass_ok = pass.active && pass.hash_order == hash_order &&
 		   pass.release_count == diri->dir_release_count &&
 		   pass.shared_gen == diri->shared_gen;
     if (diri->snapid == CEPH_SNAPDIR || diri->is_complete_and_ordered()) {
@@ -1394,6 +1400,7 @@ void Client::insert_readdir_results(MetaRequest *request, MetaSession *session, 
 	       !(pass_ok && pass.ordered_count == diri->dir_ordered_count)) {
       ldout(cct, 10) << __func__ << " starting readdir pass on " << *diri << dendl;
       pass.active = true;
+      pass.hash_order = hash_order;
       pass.release_count = diri->dir_release_count;
       pass.ordered_count = diri->dir_ordered_count;
       pass.shared_gen = diri->shared_gen;
@@ -1459,11 +1466,9 @@ void Client::insert_readdir_results(MetaRequest *request, MetaSession *session, 
 	  pass.end = dn->offset + 1;
 	} else if (ordered) {
 	  // already seen by the pass, must be at the same place
-	  auto it = std::lower_bound(
-	    dir->readdir_cache.begin(), dir->readdir_cache.end(), dn->offset,
-	    [](const Dentry *d, int64_t off) {
-	      return dir_result_t::fpos_cmp(d->offset, off) < 0;
-	    });
+	  auto it = std::lower_bound(dir->readdir_cache.begin(),
+				     dir->readdir_cache.end(), dn->offset,
+				     dentry_off_lt());
 	  if (it == dir->readdir_cache.end() || *it != dn) {
 	    ldout(cct, 10) << __func__ << " readdir pass on " << *diri
 			   << " disagrees at '" << dname << "', dropping it" << dendl;
@@ -9152,12 +9157,6 @@ int Client::_readdir_get_frag(dir_result_t *dirp)
   return res;
 }
 
-struct dentry_off_lt {
-  bool operator()(const Dentry* dn, int64_t off) const {
-    return dir_result_t::fpos_cmp(dn->offset, off) < 0;
-  }
-};
-
 int Client::_readdir_cache_cb(dir_result_t *dirp, add_dirent_cb_t cb, void *p,
 			      int caps, bool getref)
 {
@@ -9165,6 +9164,7 @@ int Client::_readdir_cache_cb(dir_result_t *dirp, add_dirent_cb_t cb, void *p,
   ldout(cct, 10) << __func__ << " " << dirp << " on " << dirp->inode->ino
 	   << " last_name " << dirp->last_name << " offset " << hex << dirp->offset << dec
 	   << dendl;
+  int rstat_on_dir = cct->_conf->client_dirsize_rbytes ? CEPH_STAT_RSTAT : 0;
   Dir *dir = dirp->inode->dir;
 
   if (!dir) {
@@ -9197,14 +9197,14 @@ int Client::_readdir_cache_cb(dir_result_t *dirp, add_dirent_cb_t cb, void *p,
     }
 
     int idx = pd - dir->readdir_cache.begin();
-    if (dn->inode->is_dir() && cct->_conf->client_dirsize_rbytes &&
+    if (dn->inode->is_dir() && rstat_on_dir &&
 	dn->inode->rstat_seq < dirp->listing_seq) {
       // The cached rstat predates this listing.  Refresh just this entry
       // instead of abandoning the whole cache pass for the rest of the
       // directory, mirroring the per-entry handling in readdir_r_cb().
       ldout(cct, 15) << " rstat of '" << dn->name << "' predates this listing, "
 		     << "refreshing just this entry" << dendl;
-      mask |= CEPH_STAT_RSTAT;
+      mask |= rstat_on_dir;
     }
     int r = _getattr(dn->inode, mask, dirp->perms);
     if (r < 0)
