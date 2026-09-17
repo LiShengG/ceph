@@ -225,7 +225,8 @@ struct dir_result_t {
   string last_name;      // last entry in previous chunk
 
   // Client::readdir_listing_seq when this listing started: the rstat of a
-  // dir entry received from the auth mds since then needs no refresh
+  // dir entry the auth mds replied with to a request sent since then needs
+  // no refresh
   uint64_t listing_seq = 0;
   UserPerm perms;
 
@@ -796,7 +797,7 @@ public:
 			      utime_t ctime, utime_t mtime, utime_t atime);
 
   Inode *add_update_inode(InodeStat *st, utime_t ttl, MetaSession *session,
-			  const UserPerm& request_perms);
+			  const UserPerm& request_perms, uint64_t listing_seq);
   Dentry *insert_dentry_inode(Dir *dir, const string& dname, LeaseStat *dlease,
 			      Inode *in, utime_t from, MetaSession *session,
 			      Dentry *old_dentry = NULL);

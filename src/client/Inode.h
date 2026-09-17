@@ -210,7 +210,8 @@ struct Inode : RefCountedObject {
   std::map<ceph_tid_t, int> flushing_cap_tids;
   int shared_gen = 0;
   int cache_gen = 0;
-  // Client::readdir_listing_seq when rstat last came from the auth mds
+  // Client::readdir_listing_seq when the request whose reply last brought
+  // rstat from the auth mds was sent
   uint64_t rstat_seq = 0;
   int snap_caps = 0;
   int snap_cap_refs = 0;
