@@ -1359,15 +1359,29 @@ void Client::insert_readdir_results(MetaRequest *request, MetaSession *session, 
 
     // This reply lists every dentry of the directory from 'start' on, in
     // readdir order, up to its last entry.
-    bool from_beginning = fg.is_leftmost() && readdir_offset == 2 &&
-			  !(hash_order && last_hash);
+    bool from_beginning = readdir_start.empty() && fg.is_leftmost() &&
+			  readdir_offset == 2 && !(hash_order && last_hash);
     bool start_known = from_beginning || !readdir_start.empty() ||
 		       !hash_order || (flags & CEPH_READDIR_OFFSET_HASH);
     int64_t start = 0;
-    if (!from_beginning)
+    if (!from_beginning) {
       start = hash_order ?
 	dir_result_t::make_fpos(last_hash, readdir_offset, true) :
 	dir_result_t::make_fpos(fg, readdir_offset, false);
+      if (hash_order) {
+	int64_t frag_start = dir_result_t::make_fpos(fg.value(), 2, true);
+	if (dir_result_t::fpos_cmp(start, frag_start) < 0) {
+	  // resumed from a name in an earlier frag: the reply lists fg from
+	  // its start
+	  start = frag_start;
+	} else if (!readdir_start.empty() && readdir_offset == 2 &&
+		   fg.contains(last_hash)) {
+	  // resumed within the frag last_name ended, e.g. after a merge: the
+	  // position of last_name among its hash collisions is lost
+	  start_known = false;
+	}
+      }
+    }
 
     auto& pass = dir->readdir_pass;
     bool pass_ok = pass.active &&
