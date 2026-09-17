@@ -1508,6 +1508,7 @@ void Client::insert_readdir_results(MetaRequest *request, MetaSession *session, 
       dirp->next_offset = 2;
     else
       dirp->next_offset = readdir_offset;
+    dirp->buffer_next_offset = dirp->next_offset;
 
     if (dir->is_empty())
       close_dir(dir);
@@ -9000,7 +9001,11 @@ void Client::seekdir(dir_result_t *dirp, loff_t offset)
       dir_result_t::fpos_cmp(offset, dirp->buffer.front().offset) >= 0 &&
       dir_result_t::fpos_cmp(offset, dirp->buffer.back().offset + 1) <= 0) {
     // the buffer still holds this position, e.g. an NFS server going back
-    // to the cookie of the last entry its client kept
+    // to the cookie of the last entry its client kept.  Reading from the
+    // readdir cache may have moved on where the mds listing continues, go
+    // on after the buffer again.
+    dirp->last_name = dirp->buffer.back().name;
+    dirp->next_offset = dirp->buffer_next_offset;
   } else if (dirp->hash_order()) {
     if (dirp->offset > offset) {
       _readdir_drop_dirp_buffer(dirp);

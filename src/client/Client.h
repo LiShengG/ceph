@@ -230,6 +230,9 @@ struct dir_result_t {
   UserPerm perms;
 
   frag_t buffer_frag;
+  // next_offset after the mds reply held in buffer, whose last entry was
+  // last_name then
+  unsigned buffer_next_offset = 2;
 
   vector<dentry> buffer;
   struct dirent de;

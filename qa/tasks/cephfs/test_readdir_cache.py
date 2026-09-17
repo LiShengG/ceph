@@ -342,3 +342,59 @@ class TestReaddirCache(CephFSTestCase):
 
         self.assertEqual(res["d"], order[:1] + order[2 * per_frag:])
         self.assertEqual(res["c"], order)
+
+    def test_seekdir_into_kept_buffer(self):
+        """
+        A stream that went on from its buffer to the end of the directory
+        through the readdir cache no longer knows where the MDS would continue
+        after that buffer.  Seeking back into the buffer must still list
+        the rest of the directory.
+        """
+        path = "/pages"
+        names = ["file{0}".format(i) for i in range(self.PAGE_FILES + 3)]
+        self._create(path, names, names)
+        self.assertEqual(self._dirfrags(path), ["0/0"])
+        # a single frag of two pages
+        self.assertEqual(self._readdir_requests_to_list(path), 2)
+
+        res = self._libcephfs("""
+            w = mount()
+            r = mount()
+            r.stat(path)
+
+            # h1 keeps the first page
+            h1 = r.opendir(path)
+            entry(r, h1)
+            entry(r, h1)
+            h1_names = [entry(r, h1)[0]]
+
+            # h2 lists the directory, which becomes complete
+            h2 = r.opendir(path)
+            order = listing(r, h2)
+
+            # h1 reads on to the end from the readdir cache
+            cookies = {}
+            while True:
+                de = entry(r, h1)
+                if de is None:
+                    break
+                h1_names.append(de[0])
+                cookies[de[0]] = de[1]
+
+            # another client drops the directory cache of r
+            w.close(w.open(path + "/tmp", os.O_CREAT | os.O_WRONLY, 0o644))
+            w.unlink(path + "/tmp")
+
+            # back into the first page
+            r.seekdir(h1, cookies[order[2]])
+            print(json.dumps({
+                "order": order,
+                "h1": h1_names,
+                "again": listing(r, h1),
+            }))
+            """, path=path)
+
+        order = res["order"]
+        self.assertEqual(sorted(order), sorted(names))
+        self.assertEqual(res["h1"], order)
+        self.assertEqual(res["again"], order[3:])
