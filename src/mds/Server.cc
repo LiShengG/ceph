@@ -12616,7 +12616,7 @@ bool Server::build_snap_diff(
       // hence need to insert the previous entry if any immediately.
       if (before.dn) {
 	if (!insert_deleted(before)) {
-	  break;
+	  return false;
 	}
       }
 
@@ -12633,7 +12633,7 @@ bool Server::build_snap_diff(
       }
       bool r = add_result_cb(dn, in, exists);
       if (!r) {
-	break;
+	return false;
       }
     } else {
       if (snapid_prev >= dn->first && snapid <= dn->last) {
@@ -12680,7 +12680,7 @@ bool Server::build_snap_diff(
 
         // Preserve hash/name ordering if a deleted entry is pending.
         if (before.valid() && !insert_deleted(before))
-          break;
+          return false;
 
         if (attrs_known) {
           dout(20) << __func__
@@ -12698,7 +12698,7 @@ bool Server::build_snap_diff(
         }
 
         if (!add_result_cb(dn, in, true))
-          break;
+          return false;
         continue;
       } else if (snapid_prev < dn->first && snapid > dn->last) {
 	dout(20) << __func__ << " skipping inner modification " << dn->get_name() << " "
@@ -12707,7 +12707,7 @@ bool Server::build_snap_diff(
       }
       if (before.valid() && before.dn->get_name() != dn->get_name()) {
         if (!insert_deleted(before)) {
-          break;
+          return false;
         }
         before.reset();
       }
@@ -12723,7 +12723,7 @@ bool Server::build_snap_diff(
 		     << dn->first << "/" << dn->last
 		     << dendl;
 	    if (!insert_deleted(before)) {
-	      break;
+	      return false;
 	    }
 	    before.reset();
 	  } else {
@@ -12749,12 +12749,16 @@ bool Server::build_snap_diff(
 	ceph_assert(snapid >= dn->first && snapid <= dn->last);
       }
       if (!add_result_cb(dn, in, true)) {
-	break;
+	return false;
       }
     }
   }
-  if (before.dn) {
-    insert_deleted(before);
+  // The iterator is advanced before an entry is emitted, so it can reach
+  // end() while the last entries are still pending. Only report the end of
+  // the dirfrag once every entry, including a pending deleted one, fit into
+  // the reply.
+  if (before.dn && !insert_deleted(before)) {
+    return false;
   }
-  return it == dir->end();
+  return true;
 }

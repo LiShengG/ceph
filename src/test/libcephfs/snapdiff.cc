@@ -72,6 +72,14 @@ public:
   void set_diff_mask(unsigned mask) {
     diff_mask = mask;
   }
+  // Start a new client session, dropping all caps held by the old one.
+  void remount() {
+    ceph_shutdown(cmount);
+    ceph_create(&cmount, NULL);
+    ceph_conf_read_file(cmount, NULL);
+    ceph_conf_parse_env(cmount, NULL);
+    ceph_assert(0 == ceph_mount(cmount, NULL));
+  }
   int conf_get(const char *option, char *buf, size_t len) {
     return ceph_conf_get(cmount, option, buf, len);
   }
@@ -2617,4 +2625,114 @@ TEST(LibCephFS, SnapDiffStatDelta) {
 
   test_mount.rmsnap("snap1");
   test_mount.rmsnap("snap2");
+}
+
+/*
+ * build_snap_diff() emits a deleted entry only when it reaches the next
+ * dentry with a different name, or after the scan for the last dentry of
+ * the dirfrag. If that last deleted entry does not fit into the reply, the
+ * frag must not be reported as complete, otherwise the deletion is lost.
+ *
+ * Replies are limited to ~(512K + max_xattr_size) bytes and the xattrs of
+ * snapshotted inodes are encoded into them, so with the default 64K
+ * max_xattr_size a 60K xattr per file leaves room for only ~9 entries.
+ * Sweep the number of deleted files per directory so that, for one of the
+ * directories, the last deletion in hash order is exactly the entry that
+ * overflows the reply.
+ */
+TEST(LibCephFS, SnapDiffDeletedEntryAtFragEnd) {
+  TestMount test_mount("snapdiff_deleted_frag_end");
+
+  const int max_files = 24;
+  const string xattr_value(60000, 'x');
+  char path[PATH_MAX];
+  for (int n = 1; n <= max_files; n++) {
+    snprintf(path, sizeof(path), "d%d", n);
+    ASSERT_EQ(0, test_mount.mkdir(path));
+    for (int i = 0; i < n; i++) {
+      snprintf(path, sizeof(path), "d%d/f%d", n, i);
+      ASSERT_LE(0, test_mount.write_full(path, path));
+      ASSERT_EQ(0, test_mount.setxattr(path, "user.big", xattr_value.c_str()));
+    }
+  }
+  ASSERT_EQ(0, test_mount.mksnap("snap1"));
+
+  for (int n = 1; n <= max_files; n++) {
+    for (int i = 0; i < n; i++) {
+      snprintf(path, sizeof(path), "d%d/f%d", n, i);
+      ASSERT_EQ(0, test_mount.unlink(path));
+    }
+  }
+  ASSERT_EQ(0, test_mount.mksnap("snap2"));
+
+  uint64_t snapid1;
+  uint64_t snapid2;
+  ASSERT_EQ(0, test_mount.get_snapid("snap1", &snapid1));
+  ASSERT_EQ(0, test_mount.get_snapid("snap2", &snapid2));
+
+  for (int n = 1; n <= max_files; n++) {
+    vector<pair<string, uint64_t>> expected;
+    for (int i = 0; i < n; i++) {
+      expected.emplace_back("f" + stringify(i), snapid1);
+    }
+    snprintf(path, sizeof(path), "d%d", n);
+    SCOPED_TRACE(path);
+    test_mount.verify_snap_diff(expected, path, "snap1", "snap2");
+  }
+
+  ASSERT_EQ(0, test_mount.rmsnap("snap1"));
+  ASSERT_EQ(0, test_mount.rmsnap("snap2"));
+}
+
+/*
+ * Same as SnapDiffDeletedEntryAtFragEnd, but for entries created between the
+ * snapshots: a new file is emitted from within the scan loop, and a failure
+ * to add the last dentry of the dirfrag must not report the frag as complete
+ * either.
+ *
+ * The diff is read by a new client session: xattrs of a head inode are only
+ * encoded for a client that doesn't hold caps on it.
+ */
+TEST(LibCephFS, SnapDiffCreatedEntryAtFragEnd) {
+  TestMount test_mount("snapdiff_created_frag_end");
+
+  const int max_files = 24;
+  const string xattr_value(60000, 'x');
+  char path[PATH_MAX];
+  for (int n = 1; n <= max_files; n++) {
+    snprintf(path, sizeof(path), "d%d", n);
+    ASSERT_EQ(0, test_mount.mkdir(path));
+  }
+  ASSERT_EQ(0, test_mount.mksnap("snap1"));
+
+  for (int n = 1; n <= max_files; n++) {
+    for (int i = 0; i < n; i++) {
+      snprintf(path, sizeof(path), "d%d/f%d", n, i);
+      ASSERT_LE(0, test_mount.write_full(path, path));
+      ASSERT_EQ(0, test_mount.setxattr(path, "user.big", xattr_value.c_str()));
+    }
+  }
+  // Drop the caps before taking snap2. Flushing them afterwards would COW
+  // the files, and the out-of-range head dentry that follows each COWed one
+  // keeps the failing entry from being the last dentry of the dirfrag.
+  test_mount.remount();
+  ASSERT_EQ(0, test_mount.mksnap("snap2"));
+
+  uint64_t snapid1;
+  uint64_t snapid2;
+  ASSERT_EQ(0, test_mount.get_snapid("snap1", &snapid1));
+  ASSERT_EQ(0, test_mount.get_snapid("snap2", &snapid2));
+
+  for (int n = 1; n <= max_files; n++) {
+    vector<pair<string, uint64_t>> expected;
+    for (int i = 0; i < n; i++) {
+      expected.emplace_back("f" + stringify(i), snapid2);
+    }
+    snprintf(path, sizeof(path), "d%d", n);
+    SCOPED_TRACE(path);
+    test_mount.verify_snap_diff(expected, path, "snap1", "snap2");
+  }
+
+  ASSERT_EQ(0, test_mount.rmsnap("snap1"));
+  ASSERT_EQ(0, test_mount.rmsnap("snap2"));
 }
