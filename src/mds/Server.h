@@ -575,7 +575,12 @@ private:
     unsigned req_flags,
     unsigned diff_mask,
     bufferlist& dirbl);
-  bool build_snap_diff(
+  enum class SnapDiffStatus {
+    MORE,     // the reply stops early, more entries may follow
+    FRAG_END, // every entry of the dirfrag was emitted
+    RETRY,    // the request will be retried, don't reply to it
+  };
+  SnapDiffStatus build_snap_diff(
     const MDRequestRef& mdr,
     CDir* dir,
     int bytes_left,

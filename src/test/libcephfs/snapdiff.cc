@@ -2736,3 +2736,35 @@ TEST(LibCephFS, SnapDiffCreatedEntryAtFragEnd) {
   ASSERT_EQ(0, test_mount.rmsnap("snap1"));
   ASSERT_EQ(0, test_mount.rmsnap("snap2"));
 }
+
+/*
+ * A remote dentry whose inode is not in the MDS cache makes the MDS open the
+ * inode and retry the request. When nothing has been added to the reply yet,
+ * the MDS must not reply before the retry: the client would take an empty
+ * reply for the whole dirfrag and miss the rest of its entries.
+ */
+TEST(LibCephFS, SnapDiffRemoteDentryNotInCache) {
+  TestMount test_mount("snapdiff_remote_dentry");
+
+  ASSERT_EQ(0, test_mount.mkdir("primary"));
+  ASSERT_EQ(0, test_mount.mkdir("links"));
+  ASSERT_LE(0, test_mount.write_full("primary/file", "data"));
+  ASSERT_EQ(0, test_mount.mksnap("snap1"));
+  // the only dentry in "links", so it is the first one the MDS looks at
+  ASSERT_EQ(0, test_mount.link("primary/file", "links/link"));
+  ASSERT_EQ(0, test_mount.mksnap("snap2"));
+
+  // Release our caps, then trim the MDS cache so that the inode behind the
+  // remote dentry has to be opened again.
+  test_mount.remount();
+  ASSERT_FALSE(test_mount.tell_rank0("cache drop").is_null());
+
+  uint64_t snapid2;
+  ASSERT_EQ(0, test_mount.get_snapid("snap2", &snapid2));
+  vector<pair<string, uint64_t>> expected;
+  expected.emplace_back("link", snapid2);
+  test_mount.verify_snap_diff(expected, "links", "snap1", "snap2");
+
+  ASSERT_EQ(0, test_mount.rmsnap("snap1"));
+  ASSERT_EQ(0, test_mount.rmsnap("snap2"));
+}
