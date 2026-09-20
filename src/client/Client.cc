@@ -1405,10 +1405,17 @@ void Client::insert_readdir_results(MetaRequest *request, MetaSession *session, 
     bool pass_ok = pass.active && pass.hash_order == hash_order &&
 		   pass.release_count == diri->dir_release_count &&
 		   pass.shared_gen == diri->shared_gen;
-    if (diri->snapid == CEPH_SNAPDIR || diri->is_complete_and_ordered()) {
+    if (diri->snapid == CEPH_SNAPDIR) {
       pass_ok = false;
     } else if (from_beginning &&
 	       !(pass_ok && pass.ordered_count == diri->dir_ordered_count)) {
+      // This reply lists the directory from its start, so a new pass can
+      // rebuild readdir_cache from it.  An ordered cache in use has to go
+      // first: the pass renumbers the dentries it lists, and nothing may be
+      // listed from the cache until the pass has completed the directory
+      // again.
+      if (diri->is_complete_and_ordered())
+	clear_dir_complete_and_ordered(diri, false);
       ldout(cct, 10) << __func__ << " starting readdir pass on " << *diri << dendl;
       pass.id = ++readdir_pass_seq;
       pass.active = true;
@@ -1419,6 +1426,9 @@ void Client::insert_readdir_results(MetaRequest *request, MetaSession *session, 
       pass.end = 0;
       dir->readdir_cache.clear();
       pass_ok = true;
+    } else if (diri->is_complete_and_ordered()) {
+      // the cache, not this reply, is the ordered listing of the directory
+      pass_ok = false;
     }
     // Dentries inserted before last_name since its offset was counted shift
     // those after it: in the pass's order, next_offset may place the start

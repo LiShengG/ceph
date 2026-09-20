@@ -381,3 +381,35 @@ TEST_F(TestClient, ReaddirCacheDropsReplyNumberedOutsidePass) {
   EXPECT_FALSE(diri->flags & I_DIR_ORDERED);
 }
 
+TEST_F(TestClient, ReaddirCacheRebuiltByRelisting) {
+  std::scoped_lock lock(client->client_lock);
+  MetaSession session(0, {}, {});
+  enable_reply_encoding(&session);
+  InodeRef diri = make_fake_dir(client, &session, myperm);
+  auto cleanup = make_scope_guard([&] { drop_fake_dir(client, diri); });
+  const frag_t fg;
+
+  // One reply lists the whole directory: the pass completes and publishes
+  // its cache as the ordered listing.
+  dir_result_t listing(diri.get(), myperm);
+  inject_readdir_reply(client, &listing, &session, diri.get(), fg, false,
+		       true, {"a", "b", "c"}, myperm);
+  ASSERT_NE(nullptr, diri->dir);
+  ASSERT_TRUE(diri->is_complete_and_ordered());
+  ASSERT_EQ(3u, diri->dir->readdir_cache.size());
+
+  // The directory is listed again from its start, e.g. after the cache path
+  // gave up on a stale rstat, and the mds no longer reports 'b'.  The cache
+  // has to follow the reply: keeping it would go on listing a name the mds
+  // does not have, on ordinals the reply has just renumbered.
+  dir_result_t again(diri.get(), myperm);
+  inject_readdir_reply(client, &again, &session, diri.get(), fg, false,
+		       true, {"a", "c"}, myperm);
+  EXPECT_TRUE(diri->is_complete_and_ordered());
+  const std::vector<std::pair<std::string, int64_t>> expected = {
+    {"a", dir_result_t::make_fpos(fg, 2, false)},
+    {"c", dir_result_t::make_fpos(fg, 3, false)},
+  };
+  EXPECT_EQ(expected, cached_listing(diri.get()));
+}
+
