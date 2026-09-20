@@ -14,6 +14,10 @@
 
 #include <iostream>
 #include <errno.h>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 #include "TestClient.h"
 #include "client/Dentry.h"
 #include "client/Dir.h"
@@ -309,6 +313,7 @@ void enable_reply_encoding(MetaSession *session)
 }
 
 } // anonymous namespace
+
 TEST_F(TestClient, ReaddirCacheDropsFreedDentry) {
   std::scoped_lock lock(client->client_lock);
   MetaSession session(0, {}, {});
@@ -413,3 +418,357 @@ TEST_F(TestClient, ReaddirCacheRebuiltByRelisting) {
   EXPECT_EQ(expected, cached_listing(diri.get()));
 }
 
+namespace {
+
+// Extend the mounted client's map without replacing any real MDS rank.
+class ReaddirTestMDSMap : public MDSMap {
+public:
+  explicit ReaddirTestMDSMap(const MDSMap& original) : MDSMap(original) {}
+
+  void add_rank(mds_rank_t rank) {
+    mds_gid_t gid(mds_info.empty() ? 1 : mds_info.rbegin()->first + 1);
+    auto& info = mds_info[gid];
+    info.global_id = gid;
+    info.rank = rank;
+    info.state = MDSMap::STATE_ACTIVE;
+    in.insert(rank);
+    up[rank] = gid;
+    set_max_mds(rank + 1);
+  }
+};
+
+struct ReaddirReplyState {
+  std::mutex mutex;
+  std::condition_variable changed;
+  ceph::ref_t<MClientRequest> request;
+  bool reader_done = false;
+  bool dispatcher_done = false;
+};
+
+class ReaddirTestConnection : public Connection {
+  ReaddirReplyState& state;
+  const inodeno_t ino;
+
+public:
+  ReaddirTestConnection(CephContext *cct, Messenger *messenger,
+                       ReaddirReplyState& state, inodeno_t ino)
+    : Connection(cct, messenger), state(state), ino(ino) {
+    set_peer_type(CEPH_ENTITY_TYPE_MDS);
+  }
+
+  bool is_connected() override { return true; }
+  entity_addr_t get_peer_socket_addr() const override { return {}; }
+  void send_keepalive() override {}
+  void mark_down() override {}
+  void mark_disposable() override {}
+
+  int send_message(Message *message) override {
+    return send_message2(MessageRef(message, false));
+  }
+
+  int send_message2(MessageRef message) override {
+    // Session renewals and cap releases need no response in this short test.
+    if (message->get_type() != CEPH_MSG_CLIENT_REQUEST)
+      return 0;
+    auto request = ceph::ref_cast<MClientRequest>(message);
+    EXPECT_EQ(CEPH_MDS_OP_GETATTR, request->get_op());
+    EXPECT_EQ(ino, request->get_filepath().get_ino());
+    if (request->get_op() != CEPH_MDS_OP_GETATTR ||
+        request->get_filepath().get_ino() != ino)
+      return -EINVAL;
+    std::lock_guard lock(state.mutex);
+    EXPECT_FALSE(state.request);
+    state.request = std::move(request);
+    state.changed.notify_all();
+    return 0;
+  }
+};
+
+struct ReaddirEntries {
+  std::vector<std::string> names;
+  std::vector<off_t> cookies;
+
+  static int one(void *p, struct dirent *de, struct ceph_statx *,
+                 off_t next, Inode *) {
+    auto& entries = *static_cast<ReaddirEntries *>(p);
+    entries.names.emplace_back(de->d_name);
+    entries.cookies.push_back(next);
+    return 1; // stop after one accepted entry, like a small readdir buffer
+  }
+};
+
+} // anonymous namespace
+
+MetaSession *ClientScaffold::install_readdir_test_session(
+    const ConnectionRef& con, MDSMap *saved_map)
+{
+  ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
+  *saved_map = *mdsmap;
+  mds_rank_t rank = mdsmap->get_max_mds();
+  while (mdsmap->is_in(rank) || mdsmap->is_up(rank) ||
+         mds_sessions.count(rank))
+    ++rank;
+  ReaddirTestMDSMap map(*mdsmap);
+  map.add_rank(rank);
+  *mdsmap = map;
+  auto [it, inserted] = mds_sessions.emplace(
+    std::piecewise_construct, std::forward_as_tuple(rank),
+    std::forward_as_tuple(rank, con, entity_addrvec_t{}));
+  ceph_assert(inserted);
+  auto& session = it->second;
+  session.state = MetaSession::STATE_OPEN;
+  session.mds_state = MDSMap::STATE_ACTIVE;
+  session.cap_ttl = ceph_clock_now() + utime_t(60, 0);
+  enable_reply_encoding(&session);
+  return &session;
+}
+
+void ClientScaffold::remove_readdir_test_session(
+    mds_rank_t rank, const MDSMap& saved_map)
+{
+  ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
+  auto& session = mds_sessions.at(rank);
+  EXPECT_TRUE(session.requests.empty());
+  EXPECT_TRUE(session.unsafe_requests.empty());
+  EXPECT_TRUE(session.caps.empty());
+  mds_sessions.erase(rank);
+  *mdsmap = saved_map;
+}
+
+MetaRequest *ClientScaffold::find_readdir_test_request(Inode *in)
+{
+  ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
+  for (auto& [tid, request] : mds_requests) {
+    if (request->inode() == in)
+      return request;
+  }
+  return nullptr;
+}
+
+void ClientScaffold::cancel_readdir_test_requests(Inode *in)
+{
+  ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
+  for (auto& [tid, request] : mds_requests) {
+    if (request->inode() != in || request->reply)
+      continue;
+    request->abort(-ECANCELED);
+    request->kick = true;
+    if (request->caller_cond)
+      request->caller_cond->notify_all();
+  }
+  // Also cover a request waiting for a map update before it can be sent.
+  signal_cond_list(waiting_for_mdsmap);
+  for (auto& [rank, cap] : in->caps)
+    signal_context_list(cap.session->waiting_for_open);
+}
+
+namespace {
+
+void check_readdir_cache_after_getattr(ClientScaffold *client,
+                                      Messenger *messenger,
+                                      const UserPerm& perms, bool rebuild)
+{
+  SCOPED_TRACE(rebuild ? "partial rebuild" : "no rebuild (control)");
+  std::unique_lock lock(client->client_lock);
+  // All synthetic requests must follow the caps to our extra session.
+  ASSERT_FALSE(client->cct->_conf->client_use_random_mds);
+  ReaddirReplyState state;
+  auto con = ceph::make_ref<ReaddirTestConnection>(
+    client->cct, messenger, state, fake_child_ino("a"));
+  MDSMap saved_map;
+  MetaSession *session = client->install_readdir_test_session(con, &saved_map);
+  const mds_rank_t rank = session->mds_num;
+  auto restore_session = make_scope_guard([&] {
+    client->remove_readdir_test_session(rank, saved_map);
+  });
+  InodeRef diri = make_fake_dir(client, session, perms);
+  auto drop_inodes = make_scope_guard([&] {
+    // No peer owns these caps. Account for their release immediately;
+    // queuing it would leave pinned-cap accounting behind with the session.
+    while (!session->caps.empty())
+      client->remove_cap(*session->caps.begin(), false);
+    drop_fake_dir(client, diri);
+  });
+
+  const frag_t left(0, 1);
+  const frag_t right = left.next();
+  diri->dirfragtree.split(frag_t(), 1);
+  dir_result_t seed(diri.get(), perms);
+  inject_readdir_reply(client, &seed, session, diri.get(), left, false,
+                       true, {"a"}, perms, S_IFDIR | 0755);
+  seed.last_name.clear(); // _readdir_next_frag() starts a new frag this way
+  inject_readdir_reply(client, &seed, session, diri.get(), right, false,
+                       true, {"b"}, perms);
+  ASSERT_NE(nullptr, diri->dir);
+  ASSERT_TRUE(diri->is_complete_and_ordered());
+  const std::vector<std::pair<std::string, int64_t>> complete = {
+    {"a", dir_result_t::make_fpos(left, 2, false)},
+    {"b", dir_result_t::make_fpos(right, 2, false)},
+  };
+  ASSERT_EQ(complete, cached_listing(diri.get()));
+
+  dir_result_t reader(diri.get(), perms);
+  dir_result_t relisting(diri.get(), perms);
+  client->start_readdir_test_listing(&reader);
+  reader.offset = complete.front().second; // skip . and .., resume at a
+  InodeRef a = diri->dir->dentries.at("a")->inode;
+  InodeRef b = diri->dir->dentries.at("b")->inode;
+  ASSERT_TRUE(a->is_dir());
+  a->rstat_seq = reader.listing_seq;
+  const int caps = CEPH_CAP_AUTH_SHARED;
+  client->add_update_cap(a.get(), session, 1, CEPH_CAP_PIN, 0, 1, 0,
+                         diri->ino, CEPH_CAP_FLAG_AUTH, perms);
+  client->add_update_cap(b.get(), session, 2, CEPH_CAP_PIN | caps, 0, 1, 0,
+                         diri->ino, CEPH_CAP_FLAG_AUTH, perms);
+  ASSERT_GE(a->rstat_seq, reader.listing_seq);
+  ASSERT_FALSE(a->caps_issued_mask(caps));
+  ASSERT_TRUE(b->caps_issued_mask(caps));
+
+  ReaddirEntries entries;
+  int result = 0;
+  bool stopping = false; // protected by client_lock, including early cleanup
+  std::thread worker;
+  std::thread dispatcher;
+  auto join_threads = make_scope_guard([&] {
+    if (!lock.owns_lock())
+      lock.lock();
+    stopping = true;
+    client->cancel_readdir_test_requests(a.get());
+    lock.unlock();
+    if (worker.joinable())
+      worker.join();
+    if (dispatcher.joinable())
+      dispatcher.join();
+    lock.lock(); // inode and session destruction require the client lock
+  });
+  worker = std::thread([&] {
+    {
+      std::scoped_lock client_lock(client->client_lock);
+      if (!stopping)
+        result = client->_readdir_cache_cb(&reader, ReaddirEntries::one,
+                                          &entries, caps, false);
+    }
+    std::lock_guard state_lock(state.mutex);
+    state.reader_done = true;
+    state.changed.notify_all();
+  });
+  lock.unlock();
+  ceph::ref_t<MClientRequest> getattr;
+  {
+    std::unique_lock state_lock(state.mutex);
+    ASSERT_TRUE(state.changed.wait_for(state_lock, std::chrono::seconds(10),
+      [&] { return state.request || state.reader_done; }))
+      << "cache reader did not send GETATTR within 10 seconds";
+    getattr = state.request;
+    ASSERT_TRUE(getattr) << "cache reader returned before requesting attributes";
+  }
+
+  // send_message2() ran under client_lock. Acquiring it here proves that A
+  // has reached make_request()'s wait and released the lock, not just that
+  // the mock connection saw the outgoing message.
+  lock.lock();
+  MetaRequest *pending = client->find_readdir_test_request(a.get());
+  ASSERT_NE(nullptr, pending);
+  ASSERT_EQ(getattr->get_tid(), pending->tid);
+  ASSERT_EQ(CEPH_MDS_OP_GETATTR, pending->get_op());
+  ASSERT_EQ(rank, pending->mds);
+  ASSERT_NE(nullptr, pending->caller_cond);
+  ASSERT_FALSE(pending->reply);
+  ASSERT_EQ(caps, (int)getattr->head.args.getattr.mask);
+
+  if (rebuild) {
+    client->start_readdir_test_listing(&relisting);
+    inject_readdir_reply(client, &relisting, session, diri.get(), left, false,
+                         true, {"a"}, perms, S_IFDIR | 0755);
+    ASSERT_FALSE(diri->is_complete_and_ordered());
+    ASSERT_TRUE(diri->dir->readdir_pass.active);
+    ASSERT_EQ((std::vector<std::pair<std::string, int64_t>>{complete.front()}),
+              cached_listing(diri.get()));
+    ASSERT_EQ(1u, diri->dir->dentries.count("b"));
+    ASSERT_EQ(b, diri->dir->dentries.at("b")->inode);
+  }
+
+  // A real safe reply updates a's attributes and wakes make_request(); its
+  // dispatcher waits for the caller's kickback, just as the messenger does.
+  auto reply = ceph::make_message<MClientReply>(*getattr, 0);
+  reply->set_src(entity_name_t::MDS(rank));
+  reply->set_connection(con);
+  reply->head.is_target = 1;
+  ceph_mds_reply_cap cap = {};
+  cap.caps = CEPH_CAP_PIN | caps;
+  cap.cap_id = 1;
+  cap.seq = 2;
+  cap.realm = diri->ino;
+  cap.flags = CEPH_CAP_FLAG_AUTH;
+  bufferlist trace;
+  encode_fake_inodestat(trace, a->ino, a->mode, cap);
+  reply->set_trace(trace);
+  dispatcher = std::thread([&] {
+    client->handle_client_reply(reply);
+    std::lock_guard state_lock(state.mutex);
+    state.dispatcher_done = true;
+    state.changed.notify_all();
+  });
+  lock.unlock();
+  {
+    std::unique_lock state_lock(state.mutex);
+    ASSERT_TRUE(state.changed.wait_for(state_lock, std::chrono::seconds(10),
+      [&] { return state.reader_done && state.dispatcher_done; }))
+      << "GETATTR reply/reader handshake did not finish within 10 seconds";
+  }
+  worker.join();
+  dispatcher.join();
+  lock.lock();
+  ASSERT_EQ(nullptr, client->find_readdir_test_request(a.get()));
+  ASSERT_TRUE(a->caps_issued_mask(caps));
+
+  {
+    SCOPED_TRACE(::testing::Message()
+      << "cache_size=" << diri->dir->readdir_cache.size()
+      << " complete_and_ordered=" << diri->is_complete_and_ordered()
+      << " result=" << result
+      << " cookies=" << ::testing::PrintToString(entries.cookies)
+      << " A.offset=" << reader.offset << " A.at_end=" << reader.at_end());
+    // Being last in a partially rebuilt vector does not make a the last
+    // entry of the directory. Rejecting the cache and retrying is also OK.
+    EXPECT_FALSE(reader.at_end());
+    for (off_t cookie : entries.cookies)
+      EXPECT_EQ(0, cookie & dir_result_t::END);
+    if (result == -EAGAIN) {
+      EXPECT_TRUE(rebuild);
+      EXPECT_TRUE(entries.names.empty());
+      EXPECT_TRUE(entries.cookies.empty());
+      EXPECT_EQ(complete.front().second, reader.offset);
+    } else {
+      EXPECT_EQ(1, result);
+      EXPECT_EQ((std::vector<std::string>{"a"}), entries.names);
+    }
+  }
+
+  if (rebuild) {
+    relisting.last_name.clear();
+    inject_readdir_reply(client, &relisting, session, diri.get(), right, false,
+                         true, {"b"}, perms);
+  }
+  ASSERT_TRUE(diri->is_complete_and_ordered());
+  ASSERT_EQ(complete, cached_listing(diri.get()));
+  // Do not reset A: its saved position must survive B's complete rebuild.
+  for (unsigned i = 0; i < 2 && !reader.at_end(); ++i) {
+    ASSERT_EQ(1, client->_readdir_cache_cb(&reader, ReaddirEntries::one,
+                                         &entries, caps, false));
+  }
+  EXPECT_EQ((std::vector<std::string>{"a", "b"}), entries.names);
+  EXPECT_TRUE(reader.at_end());
+  ASSERT_EQ(2u, entries.cookies.size());
+  EXPECT_EQ(static_cast<off_t>(dir_result_t::END), entries.cookies.back());
+}
+
+} // anonymous namespace
+
+TEST_F(TestClient, ReaddirCacheDoesNotEndAfterPartialRebuild) {
+  ASSERT_TRUE(client->is_mounted());
+  ASSERT_NO_FATAL_FAILURE(
+    check_readdir_cache_after_getattr(client, messenger, myperm, false));
+  ASSERT_NO_FATAL_FAILURE(
+    check_readdir_cache_after_getattr(client, messenger, myperm, true));
+}
