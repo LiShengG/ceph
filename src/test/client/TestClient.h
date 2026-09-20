@@ -31,9 +31,12 @@
 namespace bs = boost::system;
 namespace ca = ceph::async;
 
-class ClientScaffold : public Client {  
+class ClientScaffold : public Client {
 public:
     using Client::client_lock;
+    // the dentry paths a cache trim takes, for the readdir cache tests
+    using Client::unlink;
+    using Client::trim_dentry;
     ClientScaffold(Messenger *m, MonClient *mc, Objecter *objecter_) : Client(m, mc, objecter_) {}
     virtual ~ClientScaffold()
     { }
