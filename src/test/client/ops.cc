@@ -345,3 +345,39 @@ TEST_F(TestClient, ReaddirCacheDropsFreedDentry) {
   EXPECT_TRUE(diri->dir->readdir_cache.empty());
 }
 
+TEST_F(TestClient, ReaddirCacheDropsReplyNumberedOutsidePass) {
+  std::scoped_lock lock(client->client_lock);
+  MetaSession session(0, {}, {});
+  enable_reply_encoding(&session);
+  InodeRef diri = make_fake_dir(client, &session, myperm);
+  auto cleanup = make_scope_guard([&] { drop_fake_dir(client, diri); });
+  const frag_t fg;
+
+  dir_result_t listing(diri.get(), myperm);
+  inject_readdir_reply(client, &listing, &session, diri.get(), fg, false,
+		       false, {"a", "b"}, myperm);
+  ASSERT_NE(nullptr, diri->dir);
+  ASSERT_EQ(2u, diri->dir->readdir_cache.size());
+  const int64_t b_offset = diri->dir->dentries.at("b")->offset;
+
+  // A second stream resumes after 'a' with an ordinal counted in a dentry
+  // order this pass does not follow, e.g. one from an earlier generation of
+  // the directory.  Its reply cannot extend the pass, but it still numbers
+  // the dentries it lists: 'b' is given the ordinal 'a' holds in the cache.
+  dir_result_t stale(diri.get(), myperm);
+  stale.last_name = "a";
+  stale.next_offset = 2;
+  stale.next_offset_pass = 0;
+  inject_readdir_reply(client, &stale, &session, diri.get(), fg, false,
+		       false, {"b"}, myperm);
+  EXPECT_NE(b_offset, diri->dir->dentries.at("b")->offset);
+
+  // With two dentries on one ordinal the cache no longer lists the
+  // directory: a stream resuming at the ordinal after 'a' would skip 'b'.
+  ASSERT_TRUE(diri->dir->readdir_cache.empty());
+
+  inject_readdir_reply(client, &listing, &session, diri.get(), fg, false,
+		       true, {"c"}, myperm);
+  EXPECT_FALSE(diri->flags & I_DIR_ORDERED);
+}
+
