@@ -1281,9 +1281,14 @@ void Client::clear_dir_complete_and_ordered(Inode *diri, bool complete)
 	diri->flags &= ~I_DIR_ORDERED;
       }
     }
-    if (diri->dir)
-      diri->dir->readdir_cache.clear();
   }
+  // readdir_cache holds the dentries a pass has seen, in the order that pass
+  // gave them, which dir_ordered_count pins.  Once the count moves the cache
+  // is neither the ordered listing of the directory nor safe to compare a
+  // reply against: its entries keep no reference, so drop it here, while the
+  // dentries are still alive.
+  if (diri->dir)
+    diri->dir->readdir_cache.clear();
 }
 
 struct dentry_off_lt {
@@ -3554,6 +3559,10 @@ void Client::unlink(Dentry *dn, bool keepdir, bool keepdentry)
 
     // unlink from dir
     Dir *dir = dn->dir;
+    // a readdir pass may hold this dentry in dir->readdir_cache, which keeps
+    // no reference: drop the cache before the dentry goes away
+    if (!dir->readdir_cache.empty())
+      clear_dir_complete_and_ordered(dir->parent_inode, true);
     dn->detach();
 
     // delete den

@@ -309,3 +309,39 @@ void enable_reply_encoding(MetaSession *session)
 }
 
 } // anonymous namespace
+TEST_F(TestClient, ReaddirCacheDropsFreedDentry) {
+  std::scoped_lock lock(client->client_lock);
+  MetaSession session(0, {}, {});
+  enable_reply_encoding(&session);
+  InodeRef diri = make_fake_dir(client, &session, myperm);
+  auto cleanup = make_scope_guard([&] { drop_fake_dir(client, diri); });
+  const frag_t fg;   // one frag: both the leftmost and the rightmost
+
+  // A pass starts at the beginning of the directory and holds 'a' and 'b'.
+  dir_result_t listing(diri.get(), myperm);
+  inject_readdir_reply(client, &listing, &session, diri.get(), fg, false,
+		       false, {"a", "b"}, myperm);
+  ASSERT_NE(nullptr, diri->dir);
+  EXPECT_TRUE(diri->dir->readdir_pass.active);
+  ASSERT_EQ(2u, diri->dir->readdir_cache.size());
+
+  // Trimming 'a' takes the two steps _try_to_trim_inode() does: the inode of
+  // a dentry in another directory's cache goes first, the dentry itself only
+  // once it is null.  Neither bumps dir_release_count or dir_ordered_count,
+  // so nothing but this would tell the pass that its cache lost an entry.
+  Dentry *dn = diri->dir->dentries.at("a");
+  client->unlink(dn, true, true);   // keep dir, keep dentry
+  client->trim_dentry(dn);          // frees dn
+  EXPECT_EQ(1u, diri->dir->dentries.size());
+
+  // readdir_cache holds no reference, so it may not keep the freed dentry:
+  // the pass would compare the offset of an entry that is gone.
+  ASSERT_TRUE(diri->dir->readdir_cache.empty());
+
+  // and the rest of the directory cannot complete that cache either
+  inject_readdir_reply(client, &listing, &session, diri.get(), fg, false,
+		       true, {"c"}, myperm);
+  EXPECT_FALSE(diri->flags & I_DIR_ORDERED);
+  EXPECT_TRUE(diri->dir->readdir_cache.empty());
+}
+
