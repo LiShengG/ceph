@@ -223,6 +223,11 @@ struct dir_result_t {
 
   unsigned next_offset;  // offset of next chunk (last_name's + 1)
   string last_name;      // last entry in previous chunk
+  // Dir::readdir_pass_t::id of the pass in whose dentry order next_offset
+  // places last_name among the dentries with its hash, or in its frag, 0 if
+  // none.  Dentries inserted before last_name since then shift the offsets
+  // of those after it.
+  uint64_t next_offset_pass = 0;
 
   // Client::readdir_listing_seq when this listing started: the rstat of a
   // dir entry the auth mds replied with to a request sent since then needs
@@ -231,9 +236,10 @@ struct dir_result_t {
   UserPerm perms;
 
   frag_t buffer_frag;
-  // next_offset after the mds reply held in buffer, whose last entry was
-  // last_name then
+  // next_offset and next_offset_pass after the mds reply held in buffer,
+  // whose last entry was last_name then
   unsigned buffer_next_offset = 2;
+  uint64_t buffer_next_offset_pass = 0;
 
   vector<dentry> buffer;
   struct dirent de;
@@ -1529,6 +1535,8 @@ private:
   ceph::unordered_set<dir_result_t*> opened_dirs;
   // bumped when a directory listing starts, see dir_result_t::listing_seq
   uint64_t readdir_listing_seq = 0;
+  // bumped when a readdir pass starts, see Dir::readdir_pass_t::id
+  uint64_t readdir_pass_seq = 0;
   uint64_t fd_gen = 1;
 
   bool   mount_aborted = false;

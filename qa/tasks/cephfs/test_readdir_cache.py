@@ -78,7 +78,21 @@ def pick_names(prefix, count, accept):
     return names
 
 
-class TestReaddirCache(CephFSTestCase):
+def pick_collision():
+    """Two names in the lower half of the hash space, in readdir order."""
+    seen = {}
+    for i in range(1 << 18):
+        name = "c{0}".format(i)
+        value = frag_value(name)
+        if 0x400000 <= value < 0x800000:
+            if value in seen:
+                first, last = sorted([seen[value], name])
+                return first, last, value
+            seen[value] = name
+    raise AssertionError("Could not find a directory hash collision")
+
+
+class ReaddirCacheTestCase(CephFSTestCase):
     CLIENTS_REQUIRED = 1
     MDSS_REQUIRED = 1
     maxDiff = None
@@ -130,10 +144,22 @@ class TestReaddirCache(CephFSTestCase):
             import os
             import cephfs
 
-            def mount():
+            def mount(**conf):
                 fs = cephfs.LibCephFS(conffile='')
+                for key, value in conf.items():
+                    fs.conf_set(key, str(value))
                 fs.mount(filesystem_name={fs_name!r})
                 return fs
+
+            def mds_requests(fs, rank=0):
+                command = json.dumps(dict(prefix='perf dump',
+                                          logger='mds_server', format='json'))
+                ret, out, err = fs.mds_command(
+                    {fs_name!r} + ':' + str(rank), command, b'')
+                assert ret == 0, (ret, err)
+                perf = json.loads(out)['mds_server']
+                return (perf['req_readdir_latency']['avgcount'],
+                        perf['req_getattr_latency']['avgcount'])
 
             def entry(fs, dirp):
                 de = fs.readdir(dirp)
@@ -183,6 +209,109 @@ class TestReaddirCache(CephFSTestCase):
             """, path=path)
         return self._mds_requests()[0] - readdirs
 
+    def _test_rbytes_refresh(self, restart, path="/rbytes", ranks=(0,),
+                            readdir_rank=0, create_parent=True):
+        """Check the cached size after readdir without refreshing it by stat."""
+        names = ["sub_{0}".format(i) for i in range(16)]
+        initial_sizes = {name: 4096 * (i + 1) for i, name in enumerate(names)}
+        changed_sizes = {name: (1024 if i % 2 else 8192) * (i + 1)
+                         for i, name in enumerate(names)}
+        res = self._libcephfs("""
+            import time
+
+            def resize(fs, sizes):
+                for name, size in sizes.items():
+                    fd = fs.open(path + '/' + name + '/file',
+                                 os.O_CREAT | os.O_WRONLY, 0o644)
+                    try:
+                        fs.ftruncate(fd, size)
+                    finally:
+                        fs.close(fd)
+                fs.sync_fs()
+                # Only the writer polls: refreshing the reader here would
+                # hide a failure to refresh rstat during the next listing.
+                deadline = time.monotonic() + 90
+                while True:
+                    observed = {name: int(fs.getxattr(path + '/' + name,
+                                                      'ceph.dir.rbytes'))
+                                for name in sizes}
+                    if observed == sizes:
+                        return
+                    if time.monotonic() >= deadline:
+                        raise AssertionError(('rbytes did not propagate',
+                                              observed, sizes))
+                    time.sleep(0.1)
+
+            def cached_size(fs, name):
+                return fs.statx(path + '/' + name, cephfs.CEPH_STATX_SIZE,
+                                cephfs.AT_STATX_DONT_SYNC)['size']
+
+            def sizes_from_listing(fs, handle):
+                result = []
+                while True:
+                    de = entry(fs, handle)
+                    if de is None:
+                        return result
+                    if de[0] not in ('.', '..'):
+                        result.append((de[0], cached_size(fs, de[0])))
+
+            w = mount(client_dirsize_rbytes='true')
+            r = mount(client_dirsize_rbytes='true')
+            handle = None
+            try:
+                if create_parent:
+                    w.mkdir(path, 0o755)
+                for name in names:
+                    w.mkdir(path + '/' + name, 0o755)
+                resize(w, initial_sizes)
+                handle = r.opendir(path)
+                initial = sizes_from_listing(r, handle)
+
+                resize(w, changed_sizes)
+                cached = {name: cached_size(r, name) for name in names}
+                before = {rank: mds_requests(w, rank) for rank in ranks}
+                if restart == 'opendir':
+                    r.closedir(handle)
+                    handle = None
+                    handle = r.opendir(path)
+                elif restart == 'rewinddir':
+                    r.rewinddir(handle)
+                else:
+                    assert restart == 'seekdir'
+                    r.seekdir(handle, 0)
+                refreshed = sizes_from_listing(r, handle)
+                after = {rank: mds_requests(w, rank) for rank in ranks}
+                print(json.dumps(dict(initial=initial, cached=cached,
+                                      refreshed=refreshed,
+                                      before=before, after=after)))
+            finally:
+                if handle is not None:
+                    r.closedir(handle)
+                r.shutdown()
+                w.shutdown()
+            """, path=path, names=names, initial_sizes=initial_sizes,
+            changed_sizes=changed_sizes, restart=restart, ranks=list(ranks),
+            create_parent=create_parent)
+
+        self.assertEqual(sorted(res['initial']),
+                         sorted([name, size] for name, size in initial_sizes.items()))
+        self.assertEqual(res['cached'], initial_sizes)
+        self.assertEqual(sorted(res['refreshed']),
+                         sorted([name, size] for name, size in changed_sizes.items()))
+        getattrs = 0
+        for rank in ranks:
+            before, after = res['before'][str(rank)], res['after'][str(rank)]
+            readdir_delta, getattr_delta = [b - a for a, b in zip(before, after)]
+            log.info("%s on rank %s: %s readdir, %s getattr requests",
+                     restart, rank, readdir_delta, getattr_delta)
+            self.assertEqual(readdir_delta, 1 if rank == readdir_rank else 0)
+            getattrs += getattr_delta
+        # Refresh all 16 directories with one READDIR. The only GETATTRs are
+        # those for '.' and '..', none for a child directory.
+        self.assertLessEqual(getattrs, 2)
+
+
+class TestReaddirCache(ReaddirCacheTestCase):
     def test_cached_listing_with_subdirs(self):
         """
         Listing a cached, fragmented directory again refreshes the rstat of
@@ -237,18 +366,7 @@ class TestReaddirCache(CephFSTestCase):
         """
         path = "/collision"
         # two names with the same hash, the last dentries of frag 0*
-        seen = {}
-        i = 0
-        while True:
-            name = "c{0}".format(i)
-            i += 1
-            v = frag_value(name)
-            if 0x400000 <= v < 0x800000:
-                if v in seen:
-                    first, last = sorted([seen[v], name])
-                    collision = v
-                    break
-                seen[v] = name
+        first, last, collision = pick_collision()
 
         fillers = pick_names("fill", self.PAGE_FILES, lambda v: v < collision)
         tail = pick_names("tail", self.PAGE_FILES + 2, lambda v: v >= 0x800000)
@@ -399,3 +517,219 @@ class TestReaddirCache(CephFSTestCase):
         self.assertEqual(sorted(order), sorted(names))
         self.assertEqual(res["h1"], order)
         self.assertEqual(res["again"], order[3:])
+
+    def _test_stale_collision_cursor(self, seek_into_buffer):
+        path = "/stale_collision"
+        first, last, collision = pick_collision()
+        fillers = pick_names("fill", self.PAGE_FILES, lambda v: v < collision)
+        tail = pick_names("tail", 1, lambda v: v > collision)[0]
+        original = hash_order(fillers + [last, tail])
+        expected = hash_order(fillers + [first, last, tail])
+        # Nine large xattrs and the empty collision dentry fit on the first
+        # page. The large tail dentry must be returned by a second reply.
+        self._create(path, original, fillers + [tail])
+        self.assertEqual(self._dirfrags(path), ["0/0"])
+        self.assertEqual(self._readdir_requests_to_list(path), 2)
+
+        res = self._libcephfs("""
+            w = mount()
+            r = mount()
+            handles = []
+            try:
+                a = r.opendir(path)
+                handles.append(a)
+                before = mds_requests(w)[0]
+                prefix = [entry(r, a) for _ in range(page_files + 3)]
+                first_page_requests = mds_requests(w)[0] - before
+                cookie = prefix[-1][1]
+                assert prefix[-1][0] == last, prefix
+                assert cookie == hash_bit | (collision << shift) | 3, prefix[-1]
+
+                original_again = None
+                old_tail = None
+                if seek_into_buffer:
+                    # Let another handle complete the cache; a reads to EOF
+                    # from that cache while retaining its original first page.
+                    complete = r.opendir(path)
+                    handles.append(complete)
+                    original_again = listing(r, complete)
+                    old_tail = listing(r, a)
+
+                # Invalidate the directory, then make the first page stop
+                # between the two colliding names. Refresh the filler xattrs
+                # too: r has already seen their old versions. Replace them:
+                # otherwise the old value counts against
+                # mds_max_xattr_pairs_size and setxattr fails with ENOSPC.
+                w.close(w.open(path + '/' + first, os.O_CREAT | os.O_WRONLY, 0o644))
+                for name in fillers:
+                    w.setxattr(path + '/' + name, 'user.fill', b'y' * xattr_size,
+                               os.XATTR_REPLACE)
+                w.setxattr(path + '/' + last, 'user.fill', b'y' * xattr_size, 0)
+                w.sync_fs()
+
+                b = r.opendir(path)
+                handles.append(b)
+                before = mds_requests(w)[0]
+                new_prefix = [entry(r, b) for _ in range(page_files + 3)]
+                new_page_requests = mds_requests(w)[0] - before
+                assert new_prefix[-1][0] == first, new_prefix
+                assert new_prefix[-1][1] == cookie, new_prefix[-1]
+
+                if seek_into_buffer:
+                    r.seekdir(a, cookie)
+                before = mds_requests(w)[0]
+                resumed = listing(r, a)
+                resume_requests = mds_requests(w)[0] - before
+
+                # Read c before allowing b to continue: b could otherwise
+                # repair the incomplete cache that a just marked complete.
+                c = r.opendir(path)
+                handles.append(c)
+                fresh = listing(r, c)
+                print(json.dumps(dict(prefix=prefix, new_prefix=new_prefix,
+                                      original_again=original_again, old_tail=old_tail,
+                                      resumed=resumed, fresh=fresh,
+                                      requests=[first_page_requests,
+                                                new_page_requests, resume_requests])))
+            finally:
+                for handle in handles:
+                    r.closedir(handle)
+                r.shutdown()
+                w.shutdown()
+            """, path=path, first=first, last=last, collision=collision,
+            fillers=fillers, page_files=self.PAGE_FILES,
+            hash_bit=FPOS_HASH, shift=FPOS_SHIFT, xattr_size=self.XATTR_SIZE,
+            seek_into_buffer=seek_into_buffer)
+
+        self.assertEqual([de[0] for de in res['prefix']], ['.', '..'] + original[:-1])
+        self.assertEqual([de[0] for de in res['new_prefix']],
+                         ['.', '..'] + hash_order(fillers + [first]))
+        self.assertEqual(res['requests'], [1, 1, 1])
+        if seek_into_buffer:
+            self.assertEqual(res['original_again'], original)
+            self.assertEqual(res['old_tail'], [tail])
+        self.assertEqual(res['resumed'], [tail])
+        self.assertEqual(res['fresh'], expected)
+
+    def test_stale_collision_cursor_does_not_complete_new_pass(self):
+        """An old ordinal must not bridge a gap in a new directory generation."""
+        self._test_stale_collision_cursor(seek_into_buffer=False)
+
+    def test_seekdir_kept_buffer_after_collision_insert(self):
+        """Seeking into an old buffer must not make its cursor current again."""
+        self._test_stale_collision_cursor(seek_into_buffer=True)
+
+    def test_rbytes_refresh_on_opendir(self):
+        self._test_rbytes_refresh('opendir')
+
+    def test_rbytes_refresh_on_rewinddir(self):
+        self._test_rbytes_refresh('rewinddir')
+
+    def test_rbytes_refresh_on_seekdir_zero(self):
+        self._test_rbytes_refresh('seekdir')
+
+    def test_reopen_per_page_across_invalidation(self):
+        """Reopen with an NFS-style cookie after a namespace change."""
+        first, last, collision = pick_collision()
+        fillers = pick_names("fill", self.PAGE_FILES, lambda v: v < collision)
+        tail = pick_names("tail", self.PAGE_FILES + 2, lambda v: v > collision)
+        names = hash_order(fillers + [last] + tail)
+        for mutation in ('create', 'unlink', 'rename'):
+            with self.subTest(mutation=mutation):
+                path = "/reopen_" + mutation
+                self._create(path, names, fillers + tail)
+                self.assertEqual(self._dirfrags(path), ["0/0"])
+                res = self._libcephfs("""
+                    w = mount()
+                    r = mount()
+                    try:
+                        handle = r.opendir(path)
+                        try:
+                            prefix = [entry(r, handle) for _ in range(page_files + 3)]
+                            cookie = prefix[-1][1]
+                            assert prefix[-1][0] == last, prefix
+                        finally:
+                            r.closedir(handle)
+
+                        if mutation == 'create':
+                            w.close(w.open(path + '/' + first,
+                                           os.O_CREAT | os.O_WRONLY, 0o644))
+                        elif mutation == 'unlink':
+                            w.unlink(path + '/' + removed)
+                        else:
+                            w.rename(path + '/' + removed, path + '/' + first)
+                        w.sync_fs()
+
+                        continued = []
+                        # Bound the loop so a repeated cookie fails promptly.
+                        for _ in range(len(names) + 3):
+                            handle = r.opendir(path)
+                            eof = False
+                            previous_cookie = cookie
+                            try:
+                                r.seekdir(handle, cookie)
+                                for _ in range(3):
+                                    de = entry(r, handle)
+                                    if de is None:
+                                        eof = True
+                                        break
+                                    continued.append(de[0])
+                                    cookie = de[1]
+                            finally:
+                                r.closedir(handle)
+                            if eof:
+                                break
+                            assert cookie != previous_cookie, (cookie, continued)
+                        else:
+                            raise AssertionError(('listing did not end', continued))
+
+                        handle = r.opendir(path)
+                        try:
+                            fresh = listing(r, handle)
+                        finally:
+                            r.closedir(handle)
+                        print(json.dumps(dict(prefix=prefix, continued=continued,
+                                              fresh=fresh)))
+                    finally:
+                        r.shutdown()
+                        w.shutdown()
+                    """, path=path, names=names, first=first, last=last,
+                    removed=fillers[0], page_files=self.PAGE_FILES,
+                    mutation=mutation)
+
+                self.assertEqual([de[0] for de in res['prefix']],
+                                 ['.', '..'] + names[:self.PAGE_FILES + 1])
+                # Cookies in the collision group may change during mutation,
+                # so its names may be skipped or returned again. Nothing
+                # before it may come back, and the untouched tail must follow
+                # it, each name exactly once.
+                group = [name for name in res['continued'] if name in (first, last)]
+                self.assertEqual(len(group), len(set(group)))
+                self.assertEqual(res['continued'], group + hash_order(tail))
+                expected = list(names)
+                if mutation in ('unlink', 'rename'):
+                    expected.remove(fillers[0])
+                if mutation in ('create', 'rename'):
+                    expected.append(first)
+                self.assertEqual(res['fresh'], hash_order(expected))
+
+
+class TestReaddirCacheMultimds(ReaddirCacheTestCase):
+    MDSS_REQUIRED = 2
+
+    def test_rbytes_refresh_with_parent_on_other_rank(self):
+        """
+        Refresh directory sizes with the listing and its parent on two ranks.
+        READDIR is served by the auth of the listed frag, so every child
+        directory in its reply comes from its auth MDS. A reply from a
+        non-auth MDS is covered by TestClient.ReaddirRstatReplyProvenance.
+        """
+        self.fs.set_max_mds(2)
+        status = self.fs.wait_for_daemons()
+        self.mount_a.run_shell(['mkdir', '-p', 'rbytes/entries'])
+        self.mount_a.setfattr('rbytes', 'ceph.dir.pin', '1')
+        self._wait_subtrees([('/rbytes', 1)], status=status, rank=1)
+        # /rbytes's inode belongs to rank 0, while entries and the child
+        # inodes returned by READDIR belong to rank 1.
+        self._test_rbytes_refresh('rewinddir', path='/rbytes/entries',
+                                 ranks=(0, 1), readdir_rank=1, create_parent=False)
