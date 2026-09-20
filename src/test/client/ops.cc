@@ -15,9 +15,14 @@
 #include <iostream>
 #include <errno.h>
 #include "TestClient.h"
+#include "client/Dentry.h"
+#include "client/Dir.h"
 #include "client/Inode.h"
+#include "client/MetaRequest.h"
 #include "client/MetaSession.h"
 #include "include/scope_guard.h"
+#include "mds/cephfs_features.h"
+#include "messages/MClientReply.h"
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "gtest/gtest-spi.h"
@@ -122,3 +127,185 @@ TEST_F(TestClient, ReaddirRstatReplyProvenance) {
   EXPECT_EQ(16384, in->rstat.rbytes);
   EXPECT_EQ(23u, in->rstat_seq);
 }
+
+/*
+ * The readdir cache tests below hand the client fabricated readdir replies.
+ * A reply holds a DirStat, the number of dentries, flags, and one (name,
+ * LeaseStat, InodeStat) per dentry; the encoders here mirror
+ * CDir::encode_dirstat() and CInode::encode_inodestat() for a session that
+ * understands CEPHFS_FEATURE_REPLY_ENCODING.
+ */
+namespace {
+
+void encode_fake_dirstat(bufferlist& bl, frag_t fg)
+{
+  using ceph::encode;
+  ENCODE_START(1, 1, bl);
+  encode(fg, bl);
+  encode((__s32)0, bl);				// auth
+  encode(std::set<__s32>{0}, bl);		// dist
+  ENCODE_FINISH(bl);
+}
+
+void encode_fake_lease(bufferlist& bl)
+{
+  using ceph::encode;
+  ENCODE_START(2, 1, bl);
+  encode((__u16)0, bl);				// mask: no lease to honour
+  encode((__u32)0, bl);				// duration_ms
+  encode((__u32)0, bl);				// seq
+  encode(std::string(), bl);			// alternate_name
+  ENCODE_FINISH(bl);
+}
+
+void encode_fake_inodestat(bufferlist& bl, inodeno_t ino, uint32_t mode,
+                          const ceph_mds_reply_cap& cap = {})
+{
+  using ceph::encode;
+  ENCODE_START(6, 1, bl);
+  encode(ino, bl);
+  encode(snapid_t(CEPH_NOSNAP), bl);
+  encode((__u32)0, bl);				// rdev
+  encode((version_t)1, bl);			// version
+  encode((version_t)1, bl);			// xattr_version
+  encode(cap, bl);
+  ceph_file_layout legacy_layout;
+  memset(&legacy_layout, 0, sizeof(legacy_layout));
+  encode(legacy_layout, bl);
+  encode(utime_t(), bl);			// ctime
+  encode(utime_t(), bl);			// mtime
+  encode(utime_t(), bl);			// atime
+  encode((__u32)0, bl);				// time_warp_seq
+  encode((uint64_t)0, bl);			// size
+  encode((uint64_t)0, bl);			// max_size
+  encode((uint64_t)0, bl);			// truncate_size
+  encode((__u32)1, bl);				// truncate_seq
+  encode(mode, bl);
+  encode((__u32)0, bl);				// uid
+  encode((__u32)0, bl);				// gid
+  encode((__u32)1, bl);				// nlink
+  encode((int64_t)0, bl);			// dirstat.nfiles
+  encode((int64_t)0, bl);			// dirstat.nsubdirs
+  encode((int64_t)0, bl);			// rstat.rbytes
+  encode((int64_t)0, bl);			// rstat.rfiles
+  encode((int64_t)0, bl);			// rstat.rsubdirs
+  encode(utime_t(), bl);			// rstat.rctime
+  encode(fragtree_t(), bl);
+  encode(std::string(), bl);			// symlink
+  ceph_dir_layout dir_layout;
+  memset(&dir_layout, 0, sizeof(dir_layout));
+  encode(dir_layout, bl);
+  encode(bufferlist(), bl);			// xattrbl
+  encode((version_t)CEPH_INLINE_NONE, bl);	// inline_version
+  encode(bufferlist(), bl);			// inline_data
+  encode(quota_info_t(), bl);
+  encode(std::string(), bl);			// layout.pool_ns
+  encode(utime_t(), bl);			// btime
+  encode((uint64_t)0, bl);			// change_attr
+  encode((mds_rank_t)-1, bl);			// dir_pin
+  encode(utime_t(), bl);			// snap_btime
+  encode((int64_t)0, bl);			// rstat.rsnaps
+  encode(std::map<std::string,std::string>(), bl);	// snap_metadata
+  encode(false, bl);				// fscrypt
+  ENCODE_FINISH(bl);
+}
+
+uint64_t fake_ino_base()
+{
+  // apart from the mounted filesystem, so these replies cannot disturb it
+  return (1ULL << 63) | ((uint64_t)getpid() << 32);
+}
+
+// the inode of a fabricated child, so a name keeps it across replies
+inodeno_t fake_child_ino(const std::string& name)
+{
+  static std::map<std::string, uint64_t> inos;
+  auto [it, inserted] = inos.emplace(name, 0);
+  if (inserted)
+    it->second = fake_ino_base() + 1 + inos.size();
+  return inodeno_t(it->second);
+}
+
+InodeRef make_fake_dir(ClientScaffold *client, MetaSession *session,
+		       const UserPerm& perms)
+{
+  InodeStat st;
+  st.vino = vinodeno_t(fake_ino_base(), CEPH_NOSNAP);
+  st.version = 2;
+  st.mode = S_IFDIR | 0755;
+  st.nlink = 1;
+  st.dirstat.nfiles = 1;   // an empty dirstat would mark the dir complete
+  st.inline_version = CEPH_INLINE_NONE;
+  st.dir_pin = -1;
+  memset(&st.cap, 0, sizeof(st.cap));
+  memset(&st.dir_layout, 0, sizeof(st.dir_layout));
+  return InodeRef(client->add_update_inode(&st, {}, session, perms, 0));
+}
+
+// Hand the client one readdir reply for 'dirp', as an mds would.
+void inject_readdir_reply(ClientScaffold *client, dir_result_t *dirp,
+			  MetaSession *session, Inode *diri, frag_t fg,
+			  bool hash_order, bool end,
+			  const std::vector<std::string>& names,
+			  const UserPerm& perms,
+			  uint32_t mode = S_IFREG | 0644)
+{
+  using ceph::encode;
+  bufferlist bl;
+  encode_fake_dirstat(bl, fg);
+  encode((__u32)names.size(), bl);
+  __u16 flags = 0;
+  if (end)
+    flags |= CEPH_READDIR_FRAG_END;
+  if (hash_order)
+    flags |= CEPH_READDIR_HASH_ORDER;
+  encode(flags, bl);
+  for (const auto& name : names) {
+    encode(name, bl);
+    encode_fake_lease(bl);
+    encode_fake_inodestat(bl, fake_child_ino(name), mode);
+  }
+
+  auto reply = ceph::make_message<MClientReply>();
+  reply->set_extra_bl(bl);
+
+  MetaRequest *request = new MetaRequest(CEPH_MDS_OP_READDIR);
+  request->head.args.readdir.frag = fg;
+  request->set_caller_perms(perms);
+  request->dirp = dirp;
+  request->reply = reply;
+  client->insert_readdir_results(request, session, diri);
+  // never registered with the client, so drop it here
+  if (request->_put())
+    delete request;
+}
+
+// what readdir_cache holds, as (name, offset) pairs
+std::vector<std::pair<std::string, int64_t>> cached_listing(Inode *diri)
+{
+  std::vector<std::pair<std::string, int64_t>> entries;
+  if (diri->dir) {
+    for (Dentry *dn : diri->dir->readdir_cache)
+      entries.emplace_back(dn->name, dn->offset);
+  }
+  return entries;
+}
+
+// free the fabricated dentries, as trim_cache() would while unmounting
+void drop_fake_dir(ClientScaffold *client, const InodeRef& diri)
+{
+  while (diri->dir && !diri->dir->dentries.empty())
+    client->unlink(diri->dir->dentries.begin()->second, false, false);
+}
+
+// so the client decodes the replies below with the newest encoding, rather
+// than asking a connection these fabricated replies do not have
+void enable_reply_encoding(MetaSession *session)
+{
+  // std::vector, or the bits would be taken for a value
+  session->mds_features =
+    feature_bitset_t(std::vector<size_t>{CEPHFS_FEATURE_REPLY_ENCODING});
+  ceph_assert(session->mds_features.test(CEPHFS_FEATURE_REPLY_ENCODING));
+}
+
+} // anonymous namespace
