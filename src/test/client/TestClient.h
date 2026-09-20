@@ -37,6 +37,16 @@ public:
     // the dentry paths a cache trim takes, for the readdir cache tests
     using Client::unlink;
     using Client::trim_dentry;
+    using Client::_readdir_cache_cb;
+    using Client::handle_client_reply;
+    MetaSession *install_readdir_test_session(const ConnectionRef& con,
+                                             MDSMap *saved_map);
+    void remove_readdir_test_session(mds_rank_t rank, const MDSMap& saved_map);
+    MetaRequest *find_readdir_test_request(Inode *in);
+    void cancel_readdir_test_requests(Inode *in);
+    void start_readdir_test_listing(dir_result_t *dirp) {
+      dirp->listing_seq = ++readdir_listing_seq;
+    }
     ClientScaffold(Messenger *m, MonClient *mc, Objecter *objecter_) : Client(m, mc, objecter_) {}
     virtual ~ClientScaffold()
     { }

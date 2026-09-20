@@ -9271,8 +9271,15 @@ int Client::_readdir_cache_cb(dir_result_t *dirp, add_dirent_cb_t cb, void *p,
     uint64_t next_off = dn->offset + 1;
     fill_dirent(&de, dn->name.c_str(), stx.stx_mode, stx.stx_ino, next_off);
     ++pd;
-    if (pd == dir->readdir_cache.end())
+    if (pd == dir->readdir_cache.end()) {
+      // The cache ends here, but _getattr() gave up the lock: a pass may have
+      // dropped it meanwhile and be filling it again, and being last in what
+      // it has rebuilt so far says nothing about the end of the directory.
+      // Only a cache that still lists the whole directory ends the listing.
+      if (!dirp->inode->is_complete_and_ordered())
+	return -CEPHFS_EAGAIN;
       next_off = dir_result_t::END;
+    }
 
     Inode *in = NULL;
     if (getref) {

@@ -256,6 +256,7 @@ public:
   friend class C_Deleg_Timeout; // Asserts on client_lock, called when a delegation is unreturned
   friend class C_Client_CacheRelease; // Asserts on client_lock
   friend class SyntheticClient;
+  friend class ClientScaffold;
   friend void intrusive_ptr_release(Inode *in);
   template <typename T> friend struct RWRefState;
   template <typename T> friend class RWRef;
