@@ -19,6 +19,9 @@ class Dir {
   // Offsets in hash order and in frag order do not compare, so a pass only
   // goes on with replies in the order it started with.
   struct readdir_pass_t {
+    // unique among all passes of the client, see
+    // dir_result_t::next_offset_pass
+    uint64_t id = 0;
     bool active = false;
     bool hash_order = false;
     uint64_t release_count = 0;

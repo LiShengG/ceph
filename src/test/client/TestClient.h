@@ -33,6 +33,7 @@ namespace ca = ceph::async;
 
 class ClientScaffold : public Client {  
 public:
+    using Client::client_lock;
     ClientScaffold(Messenger *m, MonClient *mc, Objecter *objecter_) : Client(m, mc, objecter_) {}
     virtual ~ClientScaffold()
     { }

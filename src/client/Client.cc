@@ -1371,6 +1371,10 @@ void Client::insert_readdir_results(MetaRequest *request, MetaSession *session, 
     bool start_known = from_beginning || !readdir_start.empty() ||
 		       !hash_order || (flags & CEPH_READDIR_OFFSET_HASH);
     int64_t start = 0;
+    // the offsets given to the dentries of this reply go on from
+    // next_offset, which counts in the dentry order of cursor_pass
+    bool from_cursor = !readdir_start.empty();
+    uint64_t cursor_pass = dirp->next_offset_pass;
     if (!from_beginning) {
       start = hash_order ?
 	dir_result_t::make_fpos(last_hash, readdir_offset, true) :
@@ -1381,11 +1385,13 @@ void Client::insert_readdir_results(MetaRequest *request, MetaSession *session, 
 	  // resumed from a name in an earlier frag: the reply lists fg from
 	  // its start
 	  start = frag_start;
+	  from_cursor = false;
 	} else if (!readdir_start.empty() && readdir_offset == 2 &&
 		   fg.contains(last_hash)) {
 	  // resumed within the frag last_name ended, e.g. after a merge: the
 	  // position of last_name among its hash collisions is lost
 	  start_known = false;
+	  cursor_pass = 0;
 	}
       }
     }
@@ -1399,6 +1405,7 @@ void Client::insert_readdir_results(MetaRequest *request, MetaSession *session, 
     } else if (from_beginning &&
 	       !(pass_ok && pass.ordered_count == diri->dir_ordered_count)) {
       ldout(cct, 10) << __func__ << " starting readdir pass on " << *diri << dendl;
+      pass.id = ++readdir_pass_seq;
       pass.active = true;
       pass.hash_order = hash_order;
       pass.release_count = diri->dir_release_count;
@@ -1408,6 +1415,11 @@ void Client::insert_readdir_results(MetaRequest *request, MetaSession *session, 
       dir->readdir_cache.clear();
       pass_ok = true;
     }
+    // Dentries inserted before last_name since its offset was counted shift
+    // those after it: in the pass's order, next_offset may place the start
+    // of this reply before dentries the reply leaves out.
+    if (from_cursor && cursor_pass != pass.id)
+      start_known = false;
     // may this reply extend the pass, and keep readdir_cache in order?
     bool extend = pass_ok && start_known &&
 		  dir_result_t::fpos_cmp(start, pass.end) <= 0;
@@ -1451,8 +1463,10 @@ void Client::insert_readdir_results(MetaRequest *request, MetaSession *session, 
       update_dentry_lease(dn, &dlease, request->sent_stamp, session);
       if (hash_order) {
 	unsigned hash = ceph_frag_value(diri->hash_dentry_name(dname));
-	if (hash != last_hash)
+	if (hash != last_hash) {
 	  readdir_offset = 2;
+	  from_cursor = false;
+	}
 	last_hash = hash;
 	dn->offset = dir_result_t::make_fpos(hash, readdir_offset++, true);
       } else {
@@ -1514,7 +1528,13 @@ void Client::insert_readdir_results(MetaRequest *request, MetaSession *session, 
       dirp->next_offset = 2;
     else
       dirp->next_offset = readdir_offset;
+    // offsets counted from the start of a hash or frag follow the current
+    // dentry order, which is the pass's while it is ok
+    if (!from_cursor)
+      cursor_pass = pass_ok ? pass.id : 0;
+    dirp->next_offset_pass = cursor_pass;
     dirp->buffer_next_offset = dirp->next_offset;
+    dirp->buffer_next_offset_pass = dirp->next_offset_pass;
 
     if (dir->is_empty())
       close_dir(dir);
@@ -9012,6 +9032,7 @@ void Client::seekdir(dir_result_t *dirp, loff_t offset)
     // on after the buffer again.
     dirp->last_name = dirp->buffer.back().name;
     dirp->next_offset = dirp->buffer_next_offset;
+    dirp->next_offset_pass = dirp->buffer_next_offset_pass;
   } else if (dirp->hash_order()) {
     if (dirp->offset > offset) {
       _readdir_drop_dirp_buffer(dirp);
@@ -9231,6 +9252,8 @@ int Client::_readdir_cache_cb(dir_result_t *dirp, add_dirent_cb_t cb, void *p,
     }
 
     dn_name = dn->name; // fill in name while we have lock
+    // the pass that completed the directory ordered readdir_cache
+    uint64_t pass_id = dir->readdir_pass.id;
 
     client_lock.unlock();
     r = cb(p, &de, &stx, next_off, in);  // _next_ offset
@@ -9247,6 +9270,7 @@ int Client::_readdir_cache_cb(dir_result_t *dirp, add_dirent_cb_t cb, void *p,
     else
       dirp->next_offset = dirp->offset_low();
     dirp->last_name = dn_name; // we successfully returned this one; update!
+    dirp->next_offset_pass = pass_id;
     if (r > 0)
       return r;
   }
