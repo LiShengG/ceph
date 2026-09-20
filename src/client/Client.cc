@@ -1429,6 +1429,16 @@ void Client::insert_readdir_results(MetaRequest *request, MetaSession *session, 
     bool extend = pass_ok && start_known &&
 		  dir_result_t::fpos_cmp(start, pass.end) <= 0;
     bool ordered = extend && pass.ordered_count == diri->dir_ordered_count;
+    // The offsets below number the dentries of this reply, and may land among
+    // the ones readdir_cache holds.  Unless the pass numbers them itself, the
+    // cache can be left out of order, so it may no longer list the directory.
+    if (numdn && !ordered &&
+	(!dir->readdir_cache.empty() || diri->is_complete_and_ordered())) {
+      ldout(cct, 10) << __func__ << " reply numbers dentries of " << *diri
+		     << " outside its readdir pass, dropping readdir_cache"
+		     << dendl;
+      clear_dir_complete_and_ordered(diri, false);
+    }
 
     dirp->buffer_frag = fg;
 
