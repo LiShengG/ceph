@@ -240,8 +240,6 @@ public:
       }
       ceph_fsync(cmount, fd, 0);
     }
-    return r;
-
     ceph_close(cmount, fd);
     return r;
   }
