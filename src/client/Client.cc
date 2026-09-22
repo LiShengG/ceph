@@ -1405,6 +1405,8 @@ void Client::insert_readdir_results(MetaRequest *request, MetaSession *session, 
     bool pass_ok = pass.active && pass.hash_order == hash_order &&
 		   pass.release_count == diri->dir_release_count &&
 		   pass.shared_gen == diri->shared_gen;
+    // check this reply against readdir_cache, see below
+    bool verify = false;
     if (diri->snapid == CEPH_SNAPDIR) {
       pass_ok = false;
     } else if (from_beginning &&
@@ -1429,20 +1431,30 @@ void Client::insert_readdir_results(MetaRequest *request, MetaSession *session, 
     } else if (diri->is_complete_and_ordered()) {
       // the cache, not this reply, is the ordered listing of the directory
       pass_ok = false;
+      // Nothing has changed since the pass that completed the cache.  A reply
+      // resuming in its dentry order, e.g. once the cache path went back to
+      // the mds for a stale rstat, numbers the dentries just as the cache
+      // does: check the reply against the cache instead of dropping it.
+      verify = pass.hash_order == hash_order &&
+	       pass.release_count == diri->dir_release_count &&
+	       pass.ordered_count == diri->dir_ordered_count &&
+	       pass.shared_gen == diri->shared_gen;
     }
     // Dentries inserted before last_name since its offset was counted shift
     // those after it: in the pass's order, next_offset may place the start
     // of this reply before dentries the reply leaves out.
     if (from_cursor && cursor_pass != pass.id)
       start_known = false;
+    verify = verify && start_known;
     // may this reply extend the pass, and keep readdir_cache in order?
     bool extend = pass_ok && start_known &&
 		  dir_result_t::fpos_cmp(start, pass.end) <= 0;
     bool ordered = extend && pass.ordered_count == diri->dir_ordered_count;
     // The offsets below number the dentries of this reply, and may land among
-    // the ones readdir_cache holds.  Unless the pass numbers them itself, the
-    // cache can be left out of order, so it may no longer list the directory.
-    if (numdn && !ordered &&
+    // the ones readdir_cache holds.  Unless the pass numbers them itself, or
+    // they are checked to be those of the cache, the cache can be left out of
+    // order, so it may no longer list the directory.
+    if (numdn && !ordered && !verify &&
 	(!dir->readdir_cache.empty() || diri->is_complete_and_ordered())) {
       ldout(cct, 10) << __func__ << " reply numbers dentries of " << *diri
 		     << " outside its readdir pass, dropping readdir_cache"
@@ -1454,6 +1466,20 @@ void Client::insert_readdir_results(MetaRequest *request, MetaSession *session, 
 
     _readdir_drop_dirp_buffer(dirp);
     dirp->buffer.reserve(numdn);
+
+    // where the dentry the reply goes on with has to be in readdir_cache
+    size_t verify_pos = 0;
+    if (verify) {
+      verify_pos = std::lower_bound(dir->readdir_cache.begin(),
+				    dir->readdir_cache.end(), start,
+				    dentry_off_lt()) - dir->readdir_cache.begin();
+    }
+    auto drop_verified = [&](const string& at) {
+      ldout(cct, 10) << __func__ << " reply disagrees with readdir_cache of "
+		     << *diri << " at '" << at << "', dropping it" << dendl;
+      clear_dir_complete_and_ordered(diri, false);
+      verify = false;
+    };
 
     string dname;
     LeaseStat dlease;
@@ -1486,6 +1512,7 @@ void Client::insert_readdir_results(MetaRequest *request, MetaSession *session, 
       dn->alternate_name = std::move(dlease.alternate_name);
 
       update_dentry_lease(dn, &dlease, request->sent_stamp, session);
+      int64_t offset;
       if (hash_order) {
 	unsigned hash = ceph_frag_value(diri->hash_dentry_name(dname));
 	if (hash != last_hash) {
@@ -1493,10 +1520,19 @@ void Client::insert_readdir_results(MetaRequest *request, MetaSession *session, 
 	  from_cursor = false;
 	}
 	last_hash = hash;
-	dn->offset = dir_result_t::make_fpos(hash, readdir_offset++, true);
+	offset = dir_result_t::make_fpos(hash, readdir_offset++, true);
       } else {
-	dn->offset = dir_result_t::make_fpos(fg, readdir_offset++, false);
+	offset = dir_result_t::make_fpos(fg, readdir_offset++, false);
       }
+      if (verify) {
+	// the next dentry of the cache, at the offset the cache gave it
+	if (verify_pos < dir->readdir_cache.size() &&
+	    dir->readdir_cache[verify_pos] == dn && dn->offset == offset)
+	  ++verify_pos;
+	else
+	  drop_verified(dname);
+      }
+      dn->offset = offset;
       // add to readdir cache
       if (extend) {
 	if (dir_result_t::fpos_cmp(dn->offset, pass.end) >= 0) {
@@ -1521,6 +1557,22 @@ void Client::insert_readdir_results(MetaRequest *request, MetaSession *session, 
       ldout(cct, 15) << __func__ << "  " << hex << dn->offset << dec << ": '" << dname << "' -> " << in->ino << dendl;
     }
 
+    // where the listing goes on after fg
+    auto next_frag_start = [&]() {
+      return hash_order ?
+	dir_result_t::make_fpos(fg.next().value(), 2, true) :
+	dir_result_t::make_fpos(diri->dirfragtree[fg.next().value()], 2, false);
+    };
+
+    if (verify && end) {
+      // nor may the cache hold more of fg than the reply
+      if (verify_pos < dir->readdir_cache.size() &&
+	  (fg.is_rightmost() ||
+	   dir_result_t::fpos_cmp(dir->readdir_cache[verify_pos]->offset,
+				  next_frag_start()) < 0))
+	drop_verified(dir->readdir_cache[verify_pos]->name);
+    }
+
     if (extend && end) {
       if (fg.is_rightmost()) {
 	// the pass has seen the whole directory
@@ -1539,9 +1591,7 @@ void Client::insert_readdir_results(MetaRequest *request, MetaSession *session, 
       } else {
 	// the pass goes on with the next frag, unless replies to other
 	// streams already took it further
-	int64_t next = hash_order ?
-	  dir_result_t::make_fpos(fg.next().value(), 2, true) :
-	  dir_result_t::make_fpos(diri->dirfragtree[fg.next().value()], 2, false);
+	int64_t next = next_frag_start();
 	if (dir_result_t::fpos_cmp(next, pass.end) > 0)
 	  pass.end = next;
       }
@@ -1554,9 +1604,10 @@ void Client::insert_readdir_results(MetaRequest *request, MetaSession *session, 
     else
       dirp->next_offset = readdir_offset;
     // offsets counted from the start of a hash or frag follow the current
-    // dentry order, which is the pass's while it is ok
+    // dentry order, which is the pass's while it is ok, or while the cache
+    // it completed agrees with this reply
     if (!from_cursor)
-      cursor_pass = pass_ok ? pass.id : 0;
+      cursor_pass = (pass_ok || verify) ? pass.id : 0;
     dirp->next_offset_pass = cursor_pass;
     dirp->buffer_next_offset = dirp->next_offset;
     dirp->buffer_next_offset_pass = dirp->next_offset_pass;
@@ -9497,6 +9548,16 @@ int Client::readdir_r_cb(dir_result_t *d, add_dirent_cb_t cb, void *p,
       dirp->offset = next_off;
       if (r > 0)
 	return r;
+    }
+
+    // Reading from the readdir cache may have moved last_name and next_offset
+    // off the end of the buffer, see seekdir(): unless it went further, the
+    // listing goes on after the buffer.
+    if (!dirp->buffer.empty() &&
+	dir_result_t::fpos_cmp(dirp->offset, dirp->buffer.back().offset + 1) <= 0) {
+      dirp->last_name = dirp->buffer.back().name;
+      dirp->next_offset = dirp->buffer_next_offset;
+      dirp->next_offset_pass = dirp->buffer_next_offset_pass;
     }
 
     if (dirp->next_offset > 2) {
