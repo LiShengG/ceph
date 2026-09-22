@@ -2885,6 +2885,445 @@ class TestMirroring(CephFSTestCase):
         self.remove_directory(self.primary_fs_name, self.primary_fs_id, f'/{dir_name}')
         self.disable_mirroring(self.primary_fs_name, self.primary_fs_id)
 
+    def test_cephfs_mirror_metadata_only_change(self):
+        """Incremental sync of a permission/ownership change.
+
+        A chmod or chown moves ctime but leaves mtime and size alone.  The
+        mirror opens its snapdiff streams with mask 0, which the MDS turns
+        into CEPH_SNAPDIFF_MTIME alone, so such an entry is never reported
+        and never reaches should_sync_entry() -- which would have caught it
+        through its ctime comparison.
+        """
+        self.setup_mount_b(mds_perm='rw')
+        peer_spec = "client.mirror_remote@ceph"
+        dir_name = 'd0'
+
+        def remote_mode(snap_name, file_name):
+            return self.mount_b.run_shell(
+                ['stat', '-c', '%a',
+                 f'{dir_name}/.snap/{snap_name}/{file_name}']
+            ).stdout.getvalue().strip()
+
+        self.enable_mirroring(self.primary_fs_name, self.primary_fs_id)
+        self.peer_add(self.primary_fs_name, self.primary_fs_id, peer_spec,
+                      self.secondary_fs_name)
+        self.mount_a.run_shell(['mkdir', dir_name])
+        self.mount_a.write_file(f'{dir_name}/file', data='unchanged contents')
+        self.mount_a.run_shell(['chmod', '644', f'{dir_name}/file'])
+        self.mount_a.run_shell(['touch', '-m', '-d', '2020-01-01 00:00:00 UTC',
+                                f'{dir_name}/file'])
+        self.add_directory(self.primary_fs_name, self.primary_fs_id,
+                           f'/{dir_name}')
+
+        self.mount_a.run_shell(['mkdir', f'{dir_name}/.snap/snap_a'])
+        self.check_peer_status(self.primary_fs_name, self.primary_fs_id,
+                               peer_spec, f'/{dir_name}', 'snap_a', 1)
+        self.verify_snapshot(dir_name, 'snap_a')
+        self.assertEqual('644', remote_mode('snap_a', 'file'))
+
+        # Only the mode changes; contents, size and mtime stay put.
+        self.mount_a.run_shell(['chmod', '600', f'{dir_name}/file'])
+        self.mount_a.run_shell(['touch', '-m', '-d', '2020-01-01 00:00:00 UTC',
+                                f'{dir_name}/file'])
+        self.mount_a.run_shell(['mkdir', f'{dir_name}/.snap/snap_b'])
+        self.check_peer_status(self.primary_fs_name, self.primary_fs_id,
+                               peer_spec, f'/{dir_name}', 'snap_b', 2)
+        self.assertIn('snap_b', self.mount_b.ls(path=f'{dir_name}/.snap'))
+
+        observed = remote_mode('snap_b', 'file')
+        log.info('metadata only change: remote mode=%s', observed)
+
+        self.remove_directory(self.primary_fs_name, self.primary_fs_id,
+                              f'/{dir_name}')
+        self.disable_mirroring(self.primary_fs_name, self.primary_fs_id)
+        self.assertEqual('600', observed)
+
+    def test_cephfs_mirror_file_replaced_by_rename(self):
+        """Incremental sync when a path is rebound to a different inode.
+
+        Renaming over an existing regular file replaces the inode behind a
+        path that exists in both snapshots.  Client::file_blockdiff_init_state()
+        refuses such a pair with -EINVAL, and
+        SnapDiffSync::get_changed_blocks() falls back to a full copy only on
+        -ENOENT -- every other error fails the whole directory sync.  The
+        files are sized above cephfs_mirror_blockdiff_min_file_size so the
+        blockdiff path is the one exercised.
+        """
+        self.setup_mount_b(mds_perm='rw')
+        self.config_set('client.mirror',
+                        'cephfs_mirror_blockdiff_min_file_size', 16777216)
+        peer_spec = "client.mirror_remote@ceph"
+        dir_name = 'd0'
+
+        def snapshot_file_state(mount, snap_name, file_name):
+            path = f'{dir_name}/.snap/{snap_name}/{file_name}'
+            size = mount.run_shell(
+                ['stat', '-c', '%s', path]).stdout.getvalue().strip()
+            digest = mount.run_shell(
+                ['sha256sum', path]).stdout.getvalue().split()[0]
+            return int(size), digest
+
+        self.enable_mirroring(self.primary_fs_name, self.primary_fs_id)
+        self.peer_add(self.primary_fs_name, self.primary_fs_id, peer_spec,
+                      self.secondary_fs_name)
+        self.mount_a.run_shell(['mkdir', dir_name])
+        for name, seed in (('target', '/dev/zero'), ('source', '/dev/urandom')):
+            self.mount_a.run_shell(['dd', f'if={seed}',
+                                    f'of={dir_name}/{name}', 'bs=1M',
+                                    'count=64', 'conv=fsync'])
+        self.mount_a.run_shell(['touch', '-m', '-d', '2020-01-01 00:00:00 UTC',
+                                f'{dir_name}/target'])
+        self.add_directory(self.primary_fs_name, self.primary_fs_id,
+                           f'/{dir_name}')
+
+        self.mount_a.run_shell(['mkdir', f'{dir_name}/.snap/snap_a'])
+        self.check_peer_status(self.primary_fs_name, self.primary_fs_id,
+                               peer_spec, f'/{dir_name}', 'snap_a', 1)
+        self.verify_snapshot(dir_name, 'snap_a')
+
+        # No unlink at the target path -- the rename does the replacement.
+        self.mount_a.run_shell(['mv', f'{dir_name}/source',
+                                f'{dir_name}/target'])
+        self.mount_a.run_shell(['touch', '-m', '-d', '2020-01-01 00:00:02 UTC',
+                                f'{dir_name}/target'])
+        self.mount_a.run_shell(['mkdir', f'{dir_name}/.snap/snap_b'])
+        self.check_peer_status(self.primary_fs_name, self.primary_fs_id,
+                               peer_spec, f'/{dir_name}', 'snap_b', 2)
+        self.assertIn('snap_b', self.mount_b.ls(path=f'{dir_name}/.snap'))
+
+        source_state = snapshot_file_state(self.mount_a, 'snap_b', 'target')
+        destination_state = snapshot_file_state(self.mount_b, 'snap_b', 'target')
+        remote_names = self.mount_b.ls(path=f'{dir_name}/.snap/snap_b')
+        log.info('replaced by rename: source=%s destination=%s remote=%s',
+                 source_state, destination_state, remote_names)
+
+        self.remove_directory(self.primary_fs_name, self.primary_fs_id,
+                              f'/{dir_name}')
+        self.disable_mirroring(self.primary_fs_name, self.primary_fs_id)
+        self.assertEqual(source_state, destination_state)
+        self.assertNotIn('source', remote_names)
+
+    def test_cephfs_mirror_hardlink_relinked_dentry(self):
+        """Incremental sync of a hardlink that was dropped and re-created.
+
+        Unlike an unchanged hardlink dentry spanning both snapshots, the
+        remote dentry is COWed here, so the directory holds an old and a new
+        version of the same name.  build_snap_diff() dereferences both to the
+        same head CInode, so its pairwise attribute comparison sees head
+        against head and can conclude nothing changed.
+        """
+        self.setup_mount_b(mds_perm='rw')
+        self.config_set('client.mirror',
+                        'cephfs_mirror_blockdiff_min_file_size', 134217728)
+        peer_spec = "client.mirror_remote@ceph"
+        dir_name = 'd0'
+        file_names = ('file', 'link')
+
+        def snapshot_file_state(mount, snap_name, file_name):
+            path = f'{dir_name}/.snap/{snap_name}/{file_name}'
+            size = mount.run_shell(
+                ['stat', '-c', '%s', path]).stdout.getvalue().strip()
+            digest = mount.run_shell(
+                ['sha256sum', path]).stdout.getvalue().split()[0]
+            return int(size), digest
+
+        self.enable_mirroring(self.primary_fs_name, self.primary_fs_id)
+        self.peer_add(self.primary_fs_name, self.primary_fs_id, peer_spec,
+                      self.secondary_fs_name)
+        self.mount_a.run_shell(['mkdir', dir_name])
+        self.mount_a.run_shell(['dd', 'if=/dev/zero',
+                                f'of={dir_name}/{file_names[0]}', 'bs=1M',
+                                'count=64', 'conv=fsync'])
+        self.mount_a.run_shell(['ln', f'{dir_name}/{file_names[0]}',
+                                f'{dir_name}/{file_names[1]}'])
+        self.mount_a.run_shell(['touch', '-m', '-d', '2020-01-01 00:00:00 UTC',
+                                f'{dir_name}/{file_names[0]}'])
+        self.add_directory(self.primary_fs_name, self.primary_fs_id,
+                           f'/{dir_name}')
+
+        self.mount_a.run_shell(['mkdir', f'{dir_name}/.snap/snap_a'])
+        self.check_peer_status(self.primary_fs_name, self.primary_fs_id,
+                               peer_spec, f'/{dir_name}', 'snap_a', 1)
+        self.verify_snapshot(dir_name, 'snap_a')
+
+        # Drop the link, re-create it under the same name and change the
+        # shared contents.  Both dentry versions point at the same inode.
+        self.mount_a.run_shell(['rm', f'{dir_name}/{file_names[1]}'])
+        self.mount_a.run_shell(['ln', f'{dir_name}/{file_names[0]}',
+                                f'{dir_name}/{file_names[1]}'])
+        self.mount_a.run_shell(['dd', 'if=/dev/urandom',
+                                f'of={dir_name}/{file_names[0]}', 'bs=1M',
+                                'count=1', 'seek=32',
+                                'conv=notrunc,fsync'])
+        self.mount_a.run_shell(['touch', '-m', '-d', '2020-01-01 00:00:02 UTC',
+                                f'{dir_name}/{file_names[0]}'])
+        self.mount_a.run_shell(['mkdir', f'{dir_name}/.snap/snap_b'])
+        self.check_peer_status(self.primary_fs_name, self.primary_fs_id,
+                               peer_spec, f'/{dir_name}', 'snap_b', 2)
+        self.assertIn('snap_b', self.mount_b.ls(path=f'{dir_name}/.snap'))
+
+        mismatches = []
+        for name in file_names:
+            source_state = snapshot_file_state(self.mount_a, 'snap_b', name)
+            destination_state = snapshot_file_state(self.mount_b, 'snap_b', name)
+            log.info('relinked hardlink %s: source=%s destination=%s',
+                     name, source_state, destination_state)
+            if source_state != destination_state:
+                mismatches.append((name, source_state, destination_state))
+
+        self.remove_directory(self.primary_fs_name, self.primary_fs_id,
+                              f'/{dir_name}')
+        self.disable_mirroring(self.primary_fs_name, self.primary_fs_id)
+        self.assertEqual([], mismatches)
+
+    def test_cephfs_mirror_striped_file_sync(self):
+        """Incremental sync of a file with a non-default striping layout.
+
+        With stripe_count > 1 an object maps non-contiguously into the file,
+        so every object offset blockdiff reports has to be reverse mapped
+        through the striper.  Covers writes crossing a stripe-unit boundary,
+        a full stripe row and a stripe-set boundary, plus growth past the
+        object count of the older snapshot.
+        """
+        self.setup_mount_b(mds_perm='rw')
+        self.config_set('client.mirror',
+                        'cephfs_mirror_blockdiff_min_file_size', 4194304)
+        peer_spec = "client.mirror_remote@ceph"
+        dir_name = 'd0'
+        layout = ('stripe_unit=1048576 stripe_count=4 object_size=4194304'
+                  f' pool={self.fs.get_data_pool_name()}')
+
+        self.enable_mirroring(self.primary_fs_name, self.primary_fs_id)
+        self.peer_add(self.primary_fs_name, self.primary_fs_id, peer_spec,
+                      self.secondary_fs_name)
+        self.mount_a.run_shell(['mkdir', dir_name])
+        self.mount_a.setfattr(dir_name, 'ceph.dir.layout', layout)
+        self.mount_a.run_shell(['dd', 'if=/dev/urandom',
+                                f'of={dir_name}/striped', 'bs=1M',
+                                'count=32', 'conv=fsync'])
+        self.mount_a.run_shell(['touch', '-m', '-d', '2020-01-01 00:00:00 UTC',
+                                f'{dir_name}/striped'])
+        self.add_directory(self.primary_fs_name, self.primary_fs_id,
+                           f'/{dir_name}')
+
+        self.mount_a.run_shell(['mkdir', f'{dir_name}/.snap/snap_a'])
+        self.check_peer_status(self.primary_fs_name, self.primary_fs_id,
+                               peer_spec, f'/{dir_name}', 'snap_a', 1)
+        self.verify_snapshot(dir_name, 'snap_a')
+
+        # 1M stripe unit, 4 units per row, 4M per object, 16M per stripe set.
+        for seek, count in ((0, 2), (3, 2), (15, 2), (30, 4)):
+            self.mount_a.run_shell(['dd', 'if=/dev/urandom',
+                                    f'of={dir_name}/striped', 'bs=1M',
+                                    f'seek={seek}', f'count={count}',
+                                    'conv=notrunc,fsync'])
+        self.mount_a.run_shell(['touch', '-m', '-d', '2020-01-01 00:00:02 UTC',
+                                f'{dir_name}/striped'])
+        self.mount_a.run_shell(['mkdir', f'{dir_name}/.snap/snap_b'])
+        self.check_peer_status(self.primary_fs_name, self.primary_fs_id,
+                               peer_spec, f'/{dir_name}', 'snap_b', 2)
+        self.verify_snapshot(dir_name, 'snap_b')
+
+        # Grow past the object count of snap_b so the diff has to fall back
+        # to the EOF extent, which derives a file offset from an object
+        # number without going through the striper.
+        self.mount_a.run_shell(['dd', 'if=/dev/urandom',
+                                f'of={dir_name}/striped', 'bs=1M',
+                                'seek=34', 'count=30', 'conv=notrunc,fsync'])
+        self.mount_a.run_shell(['touch', '-m', '-d', '2020-01-01 00:00:04 UTC',
+                                f'{dir_name}/striped'])
+        self.mount_a.run_shell(['mkdir', f'{dir_name}/.snap/snap_c'])
+        self.check_peer_status(self.primary_fs_name, self.primary_fs_id,
+                               peer_spec, f'/{dir_name}', 'snap_c', 3)
+        self.verify_snapshot(dir_name, 'snap_c')
+
+        self.remove_directory(self.primary_fs_name, self.primary_fs_id,
+                              f'/{dir_name}')
+        self.disable_mirroring(self.primary_fs_name, self.primary_fs_id)
+
+    def test_cephfs_mirror_deletion_at_reply_boundary(self):
+        """Incremental sync of deletions that land on a readdir reply boundary.
+
+        build_snap_diff() advances its directory iterator before handing the
+        dentry to the encoder, so when the last dentry of a fragment is the
+        first one that does not fit in the reply, the iterator already sits
+        at end() -- the entry is rolled back but the reply is still marked as
+        covering the whole fragment.  The deferred deleted entry is flushed
+        on that same path without its result being looked at.  A deletion
+        dropped there leaves the file on the remote forever.
+
+        How many entries fit in one reply is not something the caller can
+        set, so every entry carries a large xattr to make its share of the
+        MDS reply budget (512KB plus mds_max_xattr_size) large and
+        predictable, and the entry count is swept past two full replies so
+        one of the directories has its last dentry exactly on the boundary.
+        """
+        self.setup_mount_b(mds_perm='rw')
+        peer_spec = "client.mirror_remote@ceph"
+        dir_name = 'd0'
+        max_entries = 30
+        xattr_size = 48 * 1024
+
+        self.enable_mirroring(self.primary_fs_name, self.primary_fs_id)
+        self.peer_add(self.primary_fs_name, self.primary_fs_id, peer_spec,
+                      self.secondary_fs_name)
+        self.mount_a.run_shell(['mkdir', dir_name])
+        self.mount_a.run_shell_payload(f"""
+set -eu
+cd {dir_name}
+pad=$(printf '%*s' {xattr_size} '' | tr ' ' x)
+for n in $(seq 1 {max_entries}); do
+  mkdir "d${{n}}"
+  for i in $(seq 1 "$n"); do
+    echo x > "d${{n}}/f${{i}}"
+    setfattr -n user.pad -v "$pad" "d${{n}}/f${{i}}"
+  done
+done
+""")
+        self.mount_a.run_shell(['sync'])
+        self.add_directory(self.primary_fs_name, self.primary_fs_id,
+                           f'/{dir_name}')
+
+        self.mount_a.run_shell(['mkdir', f'{dir_name}/.snap/snap_a'])
+        self.check_peer_status_idle(self.primary_fs_name, self.primary_fs_id,
+                                    peer_spec, f'/{dir_name}', 'snap_a', 1)
+        self.verify_snapshot(dir_name, 'snap_a')
+
+        self.mount_a.run_shell_payload(
+            f"set -eu; cd {dir_name}; rm -f d*/f*")
+        self.mount_a.run_shell(['sync'])
+        self.mount_a.run_shell(['mkdir', f'{dir_name}/.snap/snap_b'])
+        self.check_peer_status_idle(self.primary_fs_name, self.primary_fs_id,
+                                    peer_spec, f'/{dir_name}', 'snap_b', 2)
+
+        leftover = {}
+        for n in range(1, max_entries + 1):
+            names = self.mount_b.ls(path=f'{dir_name}/.snap/snap_b/d{n}')
+            if names:
+                leftover[n] = names
+        log.info('reply boundary deletion: leftover on the remote=%s',
+                 leftover)
+
+        self.remove_directory(self.primary_fs_name, self.primary_fs_id,
+                              f'/{dir_name}')
+        self.disable_mirroring(self.primary_fs_name, self.primary_fs_id)
+        self.assertEqual({}, leftover)
+
+    def test_cephfs_mirror_truncate_to_zero_and_regrow(self):
+        """Incremental sync when every object is removed and recreated.
+
+        Both snapshots report the same size and the same object count, so
+        nothing in the inode metadata says the contents were replaced --
+        only the clone lists do.
+        """
+        self.setup_mount_b(mds_perm='rw')
+        self.config_set('client.mirror',
+                        'cephfs_mirror_blockdiff_min_file_size', 16777216)
+        peer_spec = "client.mirror_remote@ceph"
+        dir_name = 'd0'
+
+        def snapshot_file_state(mount, snap_name, file_name):
+            path = f'{dir_name}/.snap/{snap_name}/{file_name}'
+            size = mount.run_shell(
+                ['stat', '-c', '%s', path]).stdout.getvalue().strip()
+            digest = mount.run_shell(
+                ['sha256sum', path]).stdout.getvalue().split()[0]
+            return int(size), digest
+
+        self.enable_mirroring(self.primary_fs_name, self.primary_fs_id)
+        self.peer_add(self.primary_fs_name, self.primary_fs_id, peer_spec,
+                      self.secondary_fs_name)
+        self.mount_a.run_shell(['mkdir', dir_name])
+        self.mount_a.run_shell(['dd', 'if=/dev/urandom',
+                                f'of={dir_name}/regrown', 'bs=1M',
+                                'count=64', 'conv=fsync'])
+        self.mount_a.run_shell(['touch', '-m', '-d', '2020-01-01 00:00:00 UTC',
+                                f'{dir_name}/regrown'])
+        self.add_directory(self.primary_fs_name, self.primary_fs_id,
+                           f'/{dir_name}')
+
+        self.mount_a.run_shell(['mkdir', f'{dir_name}/.snap/snap_a'])
+        self.check_peer_status(self.primary_fs_name, self.primary_fs_id,
+                               peer_spec, f'/{dir_name}', 'snap_a', 1)
+        self.verify_snapshot(dir_name, 'snap_a')
+
+        self.mount_a.run_shell(['truncate', '-s', '0',
+                                f'{dir_name}/regrown'])
+        self.mount_a.run_shell(['sync'])
+        self.mount_a.run_shell(['dd', 'if=/dev/urandom',
+                                f'of={dir_name}/regrown', 'bs=1M',
+                                'count=64', 'conv=notrunc,fsync'])
+        self.mount_a.run_shell(['touch', '-m', '-d', '2020-01-01 00:00:02 UTC',
+                                f'{dir_name}/regrown'])
+        self.mount_a.run_shell(['mkdir', f'{dir_name}/.snap/snap_b'])
+        self.check_peer_status(self.primary_fs_name, self.primary_fs_id,
+                               peer_spec, f'/{dir_name}', 'snap_b', 2)
+        self.assertIn('snap_b', self.mount_b.ls(path=f'{dir_name}/.snap'))
+
+        source_state = snapshot_file_state(self.mount_a, 'snap_b', 'regrown')
+        destination_state = snapshot_file_state(self.mount_b, 'snap_b', 'regrown')
+        log.info('truncate to zero and regrow: source=%s destination=%s',
+                 source_state, destination_state)
+
+        self.remove_directory(self.primary_fs_name, self.primary_fs_id,
+                              f'/{dir_name}')
+        self.disable_mirroring(self.primary_fs_name, self.primary_fs_id)
+        self.assertEqual(source_state, destination_state)
+
+    def test_cephfs_mirror_sync_after_intermediate_snapshot_removal(self):
+        """Incremental sync across a snapshot that was removed before syncing.
+
+        Dropping the intermediate snapshot lets the OSD merge the clone it
+        was holding into its successor, so the snap_a to snap_c diff has to
+        pick up both writes from a shortened clone list.
+        """
+        self.setup_mount_b(mds_perm='rw')
+        self.config_set('client.mirror',
+                        'cephfs_mirror_blockdiff_min_file_size', 16777216)
+        peer_spec = "client.mirror_remote@ceph"
+        dir_name = 'd0'
+
+        self.mount_a.run_shell(['mkdir', dir_name])
+        self.mount_a.run_shell(['dd', 'if=/dev/urandom',
+                                f'of={dir_name}/merged', 'bs=1M',
+                                'count=64', 'conv=fsync'])
+        self.mount_a.run_shell(['touch', '-m', '-d', '2020-01-01 00:00:00 UTC',
+                                f'{dir_name}/merged'])
+        self.mount_a.run_shell(['mkdir', f'{dir_name}/.snap/snap_a'])
+
+        self.mount_a.run_shell(['dd', 'if=/dev/urandom',
+                                f'of={dir_name}/merged', 'bs=1M',
+                                'seek=20', 'count=1', 'conv=notrunc,fsync'])
+        self.mount_a.run_shell(['touch', '-m', '-d', '2020-01-01 00:00:02 UTC',
+                                f'{dir_name}/merged'])
+        self.mount_a.run_shell(['mkdir', f'{dir_name}/.snap/snap_b'])
+
+        self.mount_a.run_shell(['dd', 'if=/dev/urandom',
+                                f'of={dir_name}/merged', 'bs=1M',
+                                'seek=21', 'count=1', 'conv=notrunc,fsync'])
+        self.mount_a.run_shell(['touch', '-m', '-d', '2020-01-01 00:00:04 UTC',
+                                f'{dir_name}/merged'])
+        self.mount_a.run_shell(['mkdir', f'{dir_name}/.snap/snap_c'])
+
+        # snap_b never reaches the remote; the mirror goes straight from
+        # snap_a to snap_c over a merged clone list.
+        self.mount_a.run_shell(['rmdir', f'{dir_name}/.snap/snap_b'])
+
+        self.enable_mirroring(self.primary_fs_name, self.primary_fs_id)
+        self.peer_add(self.primary_fs_name, self.primary_fs_id, peer_spec,
+                      self.secondary_fs_name)
+        self.add_directory(self.primary_fs_name, self.primary_fs_id,
+                           f'/{dir_name}')
+
+        self.check_peer_status(self.primary_fs_name, self.primary_fs_id,
+                               peer_spec, f'/{dir_name}', 'snap_c', 2)
+        self.verify_snapshot(dir_name, 'snap_a')
+        self.verify_snapshot(dir_name, 'snap_c')
+
+        self.remove_directory(self.primary_fs_name, self.primary_fs_id,
+                              f'/{dir_name}')
+        self.disable_mirroring(self.primary_fs_name, self.primary_fs_id)
+
     def test_cephfs_mirror_incremental_sync_with_type_mixup(self):
         """ Test incremental snapshot synchronization with file type changes.
 
