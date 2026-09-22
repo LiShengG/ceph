@@ -9258,8 +9258,11 @@ int Client::_readdir_cache_cb(dir_result_t *dirp, add_dirent_cb_t cb, void *p,
     int r = _getattr(dn->inode, mask, dirp->perms);
     if (r < 0)
       return r;
-    
-    // the content of readdir_cache may change after _getattr(), so pd may be invalid iterator    
+
+    // _getattr() may give up the lock: the Dir may have been closed, and the
+    // content of readdir_cache may change, so pd may be an invalid iterator
+    if (dirp->inode->dir != dir)
+      return -CEPHFS_EAGAIN;
     pd = dir->readdir_cache.begin() + idx;
     if (pd >= dir->readdir_cache.end() || *pd != dn)
       return -CEPHFS_EAGAIN;
@@ -9288,13 +9291,15 @@ int Client::_readdir_cache_cb(dir_result_t *dirp, add_dirent_cb_t cb, void *p,
     }
 
     dn_name = dn->name; // fill in name while we have lock
+    int64_t dn_offset = dn->offset;
     // the pass that completed the directory ordered readdir_cache
     uint64_t pass_id = dir->readdir_pass.id;
 
     client_lock.unlock();
     r = cb(p, &de, &stx, next_off, in);  // _next_ offset
     client_lock.lock();
-    ldout(cct, 15) << " de " << de.d_name << " off " << hex << dn->offset << dec
+    // dn may be gone by now, see below
+    ldout(cct, 15) << " de " << de.d_name << " off " << hex << dn_offset << dec
 		   << " = " << r << dendl;
     if (r < 0) {
       return r;
@@ -9309,6 +9314,18 @@ int Client::_readdir_cache_cb(dir_result_t *dirp, add_dirent_cb_t cb, void *p,
     dirp->next_offset_pass = pass_id;
     if (r > 0)
       return r;
+    if (dirp->at_end())
+      break;
+
+    // cb() gave up the lock as well.  Meanwhile a pass may have dropped
+    // readdir_cache, filled it again and completed the directory, leaving pd
+    // past its end or on another dentry, or the Dir may have been closed:
+    // look for the entry after the one returned anew.
+    dir = dirp->inode->dir;
+    if (!dir)
+      return -CEPHFS_EAGAIN;
+    pd = std::lower_bound(dir->readdir_cache.begin(), dir->readdir_cache.end(),
+			  dirp->offset, dentry_off_lt());
   }
 
   ldout(cct, 10) << __func__ << " " << dirp << " on " << dirp->inode->ino << " at end" << dendl;

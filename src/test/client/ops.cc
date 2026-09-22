@@ -420,6 +420,66 @@ TEST_F(TestClient, ReaddirCacheRebuiltByRelisting) {
 
 namespace {
 
+// Hands each entry of a cached listing over, and relists the directory from
+// its start while it has client_lock given up for 'rebuild_at'.
+struct RelistingReader {
+  ClientScaffold *client;
+  MetaSession *session;
+  Inode *diri;
+  UserPerm perms;
+  std::string rebuild_at;
+  std::vector<std::string> relisted;
+  std::vector<std::string> names;
+
+  static int cb(void *p, struct dirent *de, struct ceph_statx *, off_t,
+		Inode *) {
+    auto& reader = *static_cast<RelistingReader *>(p);
+    reader.names.emplace_back(de->d_name);
+    if (reader.names.back() == reader.rebuild_at) {
+      std::scoped_lock lock(reader.client->client_lock);
+      dir_result_t again(reader.diri, reader.perms);
+      inject_readdir_reply(reader.client, &again, reader.session, reader.diri,
+			   frag_t(), false, true, reader.relisted, reader.perms);
+    }
+    return 0; // go on
+  }
+};
+
+} // anonymous namespace
+
+TEST_F(TestClient, ReaddirCacheRefindsEntryAfterCallback) {
+  std::scoped_lock lock(client->client_lock);
+  MetaSession session(0, {}, {});
+  enable_reply_encoding(&session);
+  InodeRef diri = make_fake_dir(client, &session, myperm);
+  auto cleanup = make_scope_guard([&] { drop_fake_dir(client, diri); });
+  const frag_t fg;
+
+  dir_result_t listing(diri.get(), myperm);
+  inject_readdir_reply(client, &listing, &session, diri.get(), fg, false,
+		       true, {"a", "b", "c"}, myperm);
+  ASSERT_NE(nullptr, diri->dir);
+  ASSERT_TRUE(diri->is_complete_and_ordered());
+
+  // While 'b' is handed over, the directory is listed again and now holds
+  // 'a' only: readdir_cache shrinks to one entry, and is complete and ordered
+  // again by the time the reader takes the lock back.  An iterator kept
+  // across the callback would point past the end of the vector.
+  RelistingReader reader{client, &session, diri.get(), myperm, "b", {"a"}};
+  dir_result_t reading(diri.get(), myperm);
+  reading.offset = dir_result_t::make_fpos(fg, 2, false); // skip . and ..
+  EXPECT_EQ(0, client->_readdir_cache_cb(&reading, RelistingReader::cb,
+					 &reader, 0, false));
+  EXPECT_EQ((std::vector<std::string>{"a", "b"}), reader.names);
+  EXPECT_TRUE(reading.at_end());
+  ASSERT_TRUE(diri->is_complete_and_ordered());
+  EXPECT_EQ((std::vector<std::pair<std::string, int64_t>>{
+	      {"a", dir_result_t::make_fpos(fg, 2, false)}}),
+	    cached_listing(diri.get()));
+}
+
+namespace {
+
 // Extend the mounted client's map without replacing any real MDS rank.
 class ReaddirTestMDSMap : public MDSMap {
 public:
