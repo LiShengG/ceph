@@ -536,7 +536,8 @@ TEST_F(TestClient, ReaddirCacheCheckedAfterRemoval) {
     ASSERT_NE(nullptr, diri->dir);
     ASSERT_TRUE(diri->is_complete_and_ordered());
 
-    // removed here: a null dentry, still in the cache, which skips it
+    // its inode was trimmed, and the name is gone: a null dentry, still in
+    // the cache, which skips it
     client->unlink(diri->dir->dentries.at(removed), true, true);
     ASSERT_TRUE(diri->is_complete_and_ordered());
     names.erase(std::find(names.begin(), names.end(), removed));
@@ -570,14 +571,56 @@ TEST_F(TestClient, ReaddirCacheTrimsNullDentryKeepingComplete) {
   ASSERT_NE(nullptr, diri->dir);
   ASSERT_TRUE(diri->is_complete_and_ordered());
 
-  // 'a' was removed here, and the lru trims its null dentry later: the
-  // cache, which holds it, has to go, but the directory is still complete
+  // 'a' is a null dentry, e.g. its inode was trimmed, and the lru trims
+  // it: the cache, which holds it, has to go, but the directory is still
+  // complete
   Dentry *dn = diri->dir->dentries.at("a");
   client->unlink(dn, true, true);
   client->trim_dentry(dn);
   EXPECT_TRUE(diri->dir->readdir_cache.empty());
   EXPECT_FALSE(diri->flags & I_DIR_ORDERED);
   EXPECT_TRUE(diri->flags & I_COMPLETE);
+}
+
+TEST_F(TestClient, ReaddirPassGoesOnWithOverlappingListing) {
+  for (bool agree : {true, false}) {
+    SCOPED_TRACE(agree ? "listings agree" : "second listing misses 'a'");
+    std::scoped_lock lock(client->client_lock);
+    MetaSession session(0, {}, {});
+    enable_reply_encoding(&session);
+    InodeRef diri = make_fake_dir(client, &session, myperm);
+    auto cleanup = make_scope_guard([&] { drop_fake_dir(client, diri); });
+    const frag_t fg;
+
+    dir_result_t first(diri.get(), myperm);
+    inject_readdir_reply(client, &first, &session, diri.get(), fg, false,
+			 false, {"a", "b"}, myperm);
+    ASSERT_NE(nullptr, diri->dir);
+    ASSERT_TRUE(diri->dir->readdir_pass.active);
+
+    // A second stream lists the directory from its start as well: what
+    // the pass has seen has to come again, one after the other, at the
+    // offsets the pass gave, before the reply takes the pass further.
+    dir_result_t second(diri.get(), myperm);
+    std::vector<std::string> names = {"a", "b", "c"};
+    if (!agree)
+      names.erase(names.begin());
+    inject_readdir_reply(client, &second, &session, diri.get(), fg, false,
+			 true, names, myperm);
+    if (agree) {
+      EXPECT_TRUE(diri->is_complete_and_ordered());
+      EXPECT_EQ((std::vector<std::pair<std::string, int64_t>>{
+		  {"a", dir_result_t::make_fpos(fg, 2, false)},
+		  {"b", dir_result_t::make_fpos(fg, 3, false)},
+		  {"c", dir_result_t::make_fpos(fg, 4, false)}}),
+		cached_listing(diri.get()));
+    } else {
+      // the client holds 'a', which the mds no longer lists
+      EXPECT_FALSE(diri->flags & I_COMPLETE);
+      EXPECT_TRUE(diri->dir->readdir_cache.empty());
+      EXPECT_FALSE(diri->dir->readdir_pass.active);
+    }
+  }
 }
 
 TEST_F(TestClient, ReaddirCacheKeptByReplyPastPass) {

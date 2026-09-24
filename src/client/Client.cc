@@ -1505,8 +1505,9 @@ void Client::insert_readdir_results(MetaRequest *request, MetaSession *session, 
 				    dir->readdir_cache.end(), start,
 				    dentry_off_lt()) - dir->readdir_cache.begin();
     }
-    // The cache path skips null dentries, e.g. names removed here since the
-    // cache was completed, which the mds no longer lists.
+    // The cache path skips null dentries, e.g. one whose inode was trimmed,
+    // see _try_to_trim_inode(): the mds lists its name again if it is still
+    // there, which links the dentry again above.
     auto skip_null = [&]() {
       while (verify_pos < dir->readdir_cache.size() &&
 	     !dir->readdir_cache[verify_pos]->inode)
@@ -1515,14 +1516,19 @@ void Client::insert_readdir_results(MetaRequest *request, MetaSession *session, 
     // Where the mds lists another dentry than the cache, although nothing
     // the client knows of has changed the directory since the cache listed
     // all of it, what the client holds of the directory is stale, not only
-    // its order.  The same dentry at another offset, e.g. after a removal
-    // shifted the ordinals of its hash, only leaves the cache out of order.
+    // its order.  The same dentries in the same order at other offsets, as
+    // when the mds no longer lists a null dentry before them, only leave
+    // the cache out of order.
     auto drop_verified = [&](const string& at, bool stale) {
       ldout(cct, 10) << __func__ << " reply disagrees with readdir_cache of "
 		     << *diri << " at '" << at << "', dropping it" << dendl;
       clear_dir_complete_and_ordered(diri, stale);
       verify = false;
     };
+
+    // where the next dentry of this reply the pass has already seen has to
+    // be in readdir_cache, once one was found
+    size_t seen_pos = SIZE_MAX;
 
     string dname;
     LeaseStat dlease;
@@ -1591,6 +1597,7 @@ void Client::insert_readdir_results(MetaRequest *request, MetaSession *session, 
 	  beyond = false;
 	}
       }
+      int64_t prev_offset = dn->offset;
       dn->offset = offset;
       // add to readdir cache
       if (extend) {
@@ -1599,11 +1606,27 @@ void Client::insert_readdir_results(MetaRequest *request, MetaSession *session, 
 	    dir->readdir_cache.push_back(dn);
 	  pass.end = dn->offset + 1;
 	} else if (ordered) {
-	  // already seen by the pass, must be at the same place
-	  auto it = std::lower_bound(dir->readdir_cache.begin(),
-				     dir->readdir_cache.end(), dn->offset,
-				     dentry_off_lt());
-	  if (it == dir->readdir_cache.end() || *it != dn) {
+	  // Already seen by the pass, so at the same offset, and after the
+	  // one of this reply before it, null dentries aside, see skip_null.
+	  if (seen_pos == SIZE_MAX)
+	    seen_pos = std::lower_bound(dir->readdir_cache.begin(),
+					dir->readdir_cache.end(), offset,
+					dentry_off_lt()) - dir->readdir_cache.begin();
+	  while (seen_pos < dir->readdir_cache.size() &&
+		 !dir->readdir_cache[seen_pos]->inode)
+	    ++seen_pos;
+	  if (seen_pos < dir->readdir_cache.size() &&
+	      dir->readdir_cache[seen_pos] == dn) {
+	    ++seen_pos;
+	    if (prev_offset != offset) {
+	      // as with drop_verified(): the dentries agree, their order not
+	      ldout(cct, 10) << __func__ << " readdir pass on " << *diri
+			     << " renumbers '" << dname << "', dropping its order"
+			     << dendl;
+	      clear_dir_complete_and_ordered(diri, false);
+	      ordered = false;
+	    }
+	  } else {
 	    // as with drop_verified(): the directory changed behind the
 	    // client's back, so neither may the pass complete it, nor may
 	    // I_COMPLETE stay
@@ -9501,7 +9524,13 @@ int Client::_readdir_cache_cb(dir_result_t *dirp, add_dirent_cb_t cb, void *p,
     // cb() gave up the lock as well.  Meanwhile a pass may have dropped
     // readdir_cache, filled it again and completed the directory, leaving pd
     // past its end or on another dentry, or the Dir may have been closed:
-    // look for the entry after the one returned anew.
+    // look for the entry after the one returned anew, unless the pass that
+    // completed the cache still holds it, which leaves it as it was.
+    if (dirp->inode->dir == dir && dir->readdir_pass.id == pass_id &&
+	dirp->inode->is_complete_and_ordered()) {
+      pd = dir->readdir_cache.begin() + idx + 1;
+      continue;
+    }
     dir = dirp->inode->dir;
     if (!dir || !cursor_in_cache_order())
       return -CEPHFS_EAGAIN;
