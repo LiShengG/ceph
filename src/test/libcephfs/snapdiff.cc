@@ -2246,6 +2246,28 @@ TEST(LibCephFS, SnapDiffHardlinkReplicaInode)
             std::find(replica_diff.begin(), replica_diff.end(),
                       std::make_pair(std::string("link"), snapid2)));
 
+  // Also exercise two remote dentry versions pointing at the same
+  // replica. Its cached attributes cannot establish snapshot equality.
+  ASSERT_EQ(0, test_mount.unlink("replica/link"));
+  ASSERT_EQ(0, test_mount.link("primary/file", "replica/link"));
+  ASSERT_EQ(0, test_mount.chmod("primary/file", 0640));
+  ASSERT_EQ(0, test_mount.sync());
+  ASSERT_EQ(0, test_mount.mksnap("snap3"));
+  uint64_t snapid3;
+  ASSERT_EQ(0, test_mount.get_snapid("snap3", &snapid3));
+  for (bool reverse : {false, true}) {
+    replica_diff.clear();
+    ASSERT_EQ(0, test_mount.for_each_readdir_snapdiff2(
+      "replica", reverse ? "snap3" : "snap2", reverse ? "snap2" : "snap3",
+      [&](const dirent* dire, uint64_t snapid) {
+        replica_diff.emplace_back(dire->d_name, snapid);
+        return true;
+      }));
+    EXPECT_EQ(1, std::count(replica_diff.begin(), replica_diff.end(),
+                           std::make_pair(std::string("link"), snapid3)));
+  }
+  ASSERT_EQ(0, test_mount.rmsnap("snap3"));
+
   ASSERT_EQ(0, test_mount.purge_dir(""));
   ASSERT_EQ(0, test_mount.rmsnap("snap1"));
   ASSERT_EQ(0, test_mount.rmsnap("snap2"));
@@ -2859,6 +2881,7 @@ TEST(LibCephFS, SnapDiffHardlinkRelinkedDentry)
   ASSERT_EQ(0, test_mount.link("fileA", "linkA"));
   ASSERT_EQ(0, test_mount.sync());
   ASSERT_EQ(0, test_mount.utimes("fileA", before_times));
+  ASSERT_EQ(0, test_mount.sync());
   ASSERT_EQ(0, test_mount.mksnap("snap1"));
 
   // Drop and re-create the hardlink under the same name. Unlike the
@@ -2873,6 +2896,7 @@ TEST(LibCephFS, SnapDiffHardlinkRelinkedDentry)
   ASSERT_LE(0, test_mount.write_full("fileA", "after the relink"));
   ASSERT_EQ(0, test_mount.sync());
   ASSERT_EQ(0, test_mount.utimes("fileA", after_times));
+  ASSERT_EQ(0, test_mount.sync());
   ASSERT_EQ(0, test_mount.mksnap("snap2"));
 
   uint64_t snapid1;
@@ -2881,22 +2905,78 @@ TEST(LibCephFS, SnapDiffHardlinkRelinkedDentry)
   ASSERT_EQ(0, test_mount.get_snapid("snap2", &snapid2));
   ASSERT_LT(snapid1, snapid2);
 
-  vector<pair<string, uint64_t>> diff;
-  ASSERT_EQ(0, test_mount.for_each_readdir_snapdiff(
-    "", "snap1", "snap2",
-    [&](const dirent* dire, uint64_t snapid) {
-      diff.emplace_back(dire->d_name, snapid);
-      return true;
-    }));
+  const vector<pair<string, uint64_t>> expected = {
+    {"fileA", snapid2}, {"linkA", snapid2}};
+  // Only the v2 API passes a diff mask; the v1 one always compares mtime.
+  auto verify = [&](const vector<pair<string, uint64_t>>& expected,
+                    unsigned mask) {
+    test_mount.set_diff_mask(mask);
+    for (bool reverse : {false, true}) {
+      vector<pair<string, uint64_t>> diff;
+      auto collect = [&](const dirent* dire, uint64_t snapid) {
+        diff.emplace_back(dire->d_name, snapid);
+        return true;
+      };
+      const char* snap_from = reverse ? "snap2" : "snap1";
+      const char* snap_to = reverse ? "snap1" : "snap2";
+      ASSERT_EQ(0, mask ?
+        test_mount.for_each_readdir_snapdiff2("", snap_from, snap_to, collect) :
+        test_mount.for_each_readdir_snapdiff("", snap_from, snap_to, collect));
+      std::sort(diff.begin(), diff.end());
+      EXPECT_EQ(expected, diff) << "reverse=" << reverse << " mask=" << mask;
+    }
+  };
+  verify(expected, 0);
+  verify({}, CEPH_SNAPDIFF_MODE);
 
-  EXPECT_NE(diff.end(),
-            std::find(diff.begin(), diff.end(),
-                      std::make_pair(std::string("fileA"), snapid2)));
-  EXPECT_NE(diff.end(),
-            std::find(diff.begin(), diff.end(),
-                      std::make_pair(std::string("linkA"), snapid2)))
-    << "the re-created hardlink path kept stale contents in snap2 and was"
-       " not reported";
+  // Neither endpoint is head now. In particular, using head for snap2
+  // would hide the change because its mtime equals snap1's again.
+  ASSERT_LE(0, test_mount.write_full("fileA", "head after both snapshots"));
+  ASSERT_EQ(0, test_mount.sync());
+  ASSERT_EQ(0, test_mount.utimes("fileA", before_times));
+  ASSERT_EQ(0, test_mount.sync());
+  verify(expected, 0);
+  verify({}, CEPH_SNAPDIFF_MODE);
+
+  ASSERT_EQ(0, test_mount.purge_dir(""));
+  ASSERT_EQ(0, test_mount.rmsnap("snap1"));
+  ASSERT_EQ(0, test_mount.rmsnap("snap2"));
+}
+
+TEST(LibCephFS, SnapDiffHardlinkRelinkedDentryUnchanged)
+{
+  TestMount test_mount("SnapDiffHardlinkRelinkedDentryUnchanged");
+  struct timeval before_times[2] = {{1577836800, 0}, {1577836800, 0}};
+  struct timeval head_times[2] = {{1577836804, 0}, {1577836804, 0}};
+
+  ASSERT_LE(0, test_mount.write_full("fileA", "unchanged contents"));
+  ASSERT_EQ(0, test_mount.link("fileA", "linkA"));
+  ASSERT_EQ(0, test_mount.utimes("fileA", before_times));
+  ASSERT_EQ(0, test_mount.sync());
+  ASSERT_EQ(0, test_mount.mksnap("snap1"));
+  ASSERT_EQ(0, test_mount.unlink("linkA"));
+  ASSERT_EQ(0, test_mount.link("fileA", "linkA"));
+  ASSERT_EQ(0, test_mount.sync());
+  ASSERT_EQ(0, test_mount.mksnap("snap2"));
+
+  auto verify_unchanged = [&] {
+    for (bool reverse : {false, true}) {
+      vector<pair<string, uint64_t>> diff;
+      ASSERT_EQ(0, test_mount.for_each_readdir_snapdiff(
+        "", reverse ? "snap2" : "snap1", reverse ? "snap1" : "snap2",
+        [&](const dirent* dire, uint64_t snapid) {
+          diff.emplace_back(dire->d_name, snapid);
+          return true;
+        }));
+      EXPECT_TRUE(diff.empty()) << "reverse=" << reverse;
+    }
+  };
+  verify_unchanged();
+  ASSERT_LE(0, test_mount.write_full("fileA", "only head changed"));
+  ASSERT_EQ(0, test_mount.sync());
+  ASSERT_EQ(0, test_mount.utimes("fileA", head_times));
+  ASSERT_EQ(0, test_mount.sync());
+  verify_unchanged();
 
   ASSERT_EQ(0, test_mount.purge_dir(""));
   ASSERT_EQ(0, test_mount.rmsnap("snap1"));
