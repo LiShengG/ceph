@@ -211,6 +211,7 @@ struct dir_result_t {
     last_name.clear();
     next_offset = 2;
     offset = 0;
+    offset_pass = 0;
     buffer.clear();
   }
 
@@ -220,6 +221,13 @@ struct dir_result_t {
 			 //   (the nth entry has hash collision);
 			 // frag+name order;
 			 //   ((frag value) << 28) | (the nth entry in frag);
+  // Dir::readdir_pass_t::id of the pass in whose dentry order offset counts
+  // its ordinal among the dentries with its hash, or in its frag, 0 if none.
+  // An offset given to seekdir() from elsewhere, e.g. an NFS cookie, is
+  // SEEK_PASS: nothing tells in which order it was counted, and it is taken
+  // at its word, just as the mds path takes it.
+  uint64_t offset_pass = 0;
+  static constexpr uint64_t SEEK_PASS = UINT64_MAX;
 
   unsigned next_offset;  // offset of next chunk (last_name's + 1)
   string last_name;      // last entry in previous chunk
@@ -240,6 +248,8 @@ struct dir_result_t {
   // whose last entry was last_name then
   unsigned buffer_next_offset = 2;
   uint64_t buffer_next_offset_pass = 0;
+  // offset_pass of the offsets of all the entries in buffer, 0 if none
+  uint64_t buffer_offset_pass = 0;
 
   vector<dentry> buffer;
   struct dirent de;
