@@ -9195,9 +9195,7 @@ void Client::seekdir(dir_result_t *dirp, loff_t offset)
     // to the cookie of the last entry its client kept.  Reading from the
     // readdir cache may have moved on where the mds listing continues, go
     // on after the buffer again.
-    dirp->last_name = dirp->buffer.back().name;
-    dirp->next_offset = dirp->buffer_next_offset;
-    dirp->next_offset_pass = dirp->buffer_next_offset_pass;
+    dirp->resume_after_buffer();
     dirp->offset_pass = dirp->buffer_offset_pass;
   } else if (dirp->hash_order()) {
     if (dirp->offset > offset) {
@@ -9687,11 +9685,8 @@ int Client::readdir_r_cb(dir_result_t *d, add_dirent_cb_t cb, void *p,
     // off the end of the buffer, see seekdir(): unless it went further, the
     // listing goes on after the buffer.
     if (!dirp->buffer.empty() &&
-	dir_result_t::fpos_cmp(dirp->offset, dirp->buffer.back().offset + 1) <= 0) {
-      dirp->last_name = dirp->buffer.back().name;
-      dirp->next_offset = dirp->buffer_next_offset;
-      dirp->next_offset_pass = dirp->buffer_next_offset_pass;
-    }
+	dir_result_t::fpos_cmp(dirp->offset, dirp->buffer.back().offset + 1) <= 0)
+      dirp->resume_after_buffer();
 
     if (dirp->next_offset > 2) {
       ldout(cct, 10) << " fetching next chunk of this frag" << dendl;
