@@ -487,6 +487,30 @@ TEST_F(TestClient, ReaddirCacheRebuiltByRelisting) {
   EXPECT_EQ(expected, cached_listing(diri.get()));
 }
 
+TEST_F(TestClient, ReaddirCacheTrimsNullDentryKeepingComplete) {
+  std::scoped_lock lock(client->client_lock);
+  MetaSession session(0, {}, {});
+  enable_reply_encoding(&session);
+  InodeRef diri = make_fake_dir(client, &session, myperm);
+  auto cleanup = make_scope_guard([&] { drop_fake_dir(client, diri); });
+  const frag_t fg;
+
+  dir_result_t listing(diri.get(), myperm);
+  inject_readdir_reply(client, &listing, &session, diri.get(), fg, false,
+		       true, {"a", "b"}, myperm);
+  ASSERT_NE(nullptr, diri->dir);
+  ASSERT_TRUE(diri->is_complete_and_ordered());
+
+  // 'a' was removed here, and the lru trims its null dentry later: the
+  // cache, which holds it, has to go, but the directory is still complete
+  Dentry *dn = diri->dir->dentries.at("a");
+  client->unlink(dn, true, true);
+  client->trim_dentry(dn);
+  EXPECT_TRUE(diri->dir->readdir_cache.empty());
+  EXPECT_FALSE(diri->flags & I_DIR_ORDERED);
+  EXPECT_TRUE(diri->flags & I_COMPLETE);
+}
+
 namespace {
 
 // Hands each entry of a cached listing over, and relists the directory from

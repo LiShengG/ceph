@@ -3675,10 +3675,14 @@ void Client::unlink(Dentry *dn, bool keepdir, bool keepdentry)
 
     // unlink from dir
     Dir *dir = dn->dir;
-    // a readdir pass may hold this dentry in dir->readdir_cache, which keeps
-    // no reference: drop the cache before the dentry goes away
+    // A readdir pass may hold this dentry in dir->readdir_cache, which keeps
+    // no reference: drop the cache before the dentry goes away.  Whether
+    // the directory stays complete is up to the caller, as it was before
+    // the cache: a null dentry, or the old name of a rename within the
+    // directory, leaves it so, and trim_dentry() drops I_COMPLETE for a
+    // dentry with an inode.
     if (!dir->readdir_cache.empty())
-      clear_dir_complete_and_ordered(dir->parent_inode, true);
+      clear_dir_complete_and_ordered(dir->parent_inode, false);
     dn->detach();
 
     // delete den
