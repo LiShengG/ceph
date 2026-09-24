@@ -1423,11 +1423,21 @@ void Client::insert_readdir_results(MetaRequest *request, MetaSession *session, 
     bool pass_ok = pass.active && pass.hash_order == hash_order &&
 		   pass.release_count == diri->dir_release_count &&
 		   pass.shared_gen == diri->shared_gen;
+    // Nothing has changed since the pass that completed readdir_cache.  A
+    // reply from the start of the directory, or resuming in the dentry order
+    // of that pass, e.g. once the cache path went back to the mds for a
+    // stale rstat, numbers the dentries just as the cache does: check the
+    // reply against the cache instead of dropping it.
+    bool cache_current = diri->is_complete_and_ordered() &&
+			 pass.hash_order == hash_order &&
+			 pass.release_count == diri->dir_release_count &&
+			 pass.ordered_count == diri->dir_ordered_count &&
+			 pass.shared_gen == diri->shared_gen;
     // check this reply against readdir_cache, see below
     bool verify = false;
     if (diri->snapid == CEPH_SNAPDIR) {
       pass_ok = false;
-    } else if (from_beginning &&
+    } else if (from_beginning && !cache_current &&
 	       !(pass_ok && pass.ordered_count == diri->dir_ordered_count)) {
       // This reply lists the directory from its start, so a new pass can
       // rebuild readdir_cache from it.  An ordered cache in use has to go
@@ -1449,14 +1459,7 @@ void Client::insert_readdir_results(MetaRequest *request, MetaSession *session, 
     } else if (diri->is_complete_and_ordered()) {
       // the cache, not this reply, is the ordered listing of the directory
       pass_ok = false;
-      // Nothing has changed since the pass that completed the cache.  A reply
-      // resuming in its dentry order, e.g. once the cache path went back to
-      // the mds for a stale rstat, numbers the dentries just as the cache
-      // does: check the reply against the cache instead of dropping it.
-      verify = pass.hash_order == hash_order &&
-	       pass.release_count == diri->dir_release_count &&
-	       pass.ordered_count == diri->dir_ordered_count &&
-	       pass.shared_gen == diri->shared_gen;
+      verify = cache_current;
     }
     // Dentries inserted before last_name since its offset was counted shift
     // those after it: in the pass's order, next_offset may place the start
@@ -1502,13 +1505,22 @@ void Client::insert_readdir_results(MetaRequest *request, MetaSession *session, 
 				    dir->readdir_cache.end(), start,
 				    dentry_off_lt()) - dir->readdir_cache.begin();
     }
-    // Nothing the client knows of has changed the directory since the
-    // cache listed all of it, yet the mds lists something else: what the
-    // client holds of the directory is stale, not only its order.
-    auto drop_verified = [&](const string& at) {
+    // The cache path skips null dentries, e.g. names removed here since the
+    // cache was completed, which the mds no longer lists.
+    auto skip_null = [&]() {
+      while (verify_pos < dir->readdir_cache.size() &&
+	     !dir->readdir_cache[verify_pos]->inode)
+	++verify_pos;
+    };
+    // Where the mds lists another dentry than the cache, although nothing
+    // the client knows of has changed the directory since the cache listed
+    // all of it, what the client holds of the directory is stale, not only
+    // its order.  The same dentry at another offset, e.g. after a removal
+    // shifted the ordinals of its hash, only leaves the cache out of order.
+    auto drop_verified = [&](const string& at, bool stale) {
       ldout(cct, 10) << __func__ << " reply disagrees with readdir_cache of "
 		     << *diri << " at '" << at << "', dropping it" << dendl;
-      clear_dir_complete_and_ordered(diri, true);
+      clear_dir_complete_and_ordered(diri, stale);
       verify = false;
     };
 
@@ -1557,11 +1569,14 @@ void Client::insert_readdir_results(MetaRequest *request, MetaSession *session, 
       }
       if (verify) {
 	// the next dentry of the cache, at the offset the cache gave it
-	if (verify_pos < dir->readdir_cache.size() &&
-	    dir->readdir_cache[verify_pos] == dn && dn->offset == offset)
-	  ++verify_pos;
+	skip_null();
+	if (verify_pos >= dir->readdir_cache.size() ||
+	    dir->readdir_cache[verify_pos] != dn)
+	  drop_verified(dname, true);
+	else if (dn->offset != offset)
+	  drop_verified(dname, false);
 	else
-	  drop_verified(dname);
+	  ++verify_pos;
       }
       if (beyond) {
 	auto it = std::lower_bound(dir->readdir_cache.begin(),
@@ -1614,11 +1629,12 @@ void Client::insert_readdir_results(MetaRequest *request, MetaSession *session, 
 
     if (verify && end) {
       // nor may the cache hold more of fg than the reply
+      skip_null();
       if (verify_pos < dir->readdir_cache.size() &&
 	  (fg.is_rightmost() ||
 	   dir_result_t::fpos_cmp(dir->readdir_cache[verify_pos]->offset,
 				  next_frag_start()) < 0))
-	drop_verified(dir->readdir_cache[verify_pos]->name);
+	drop_verified(dir->readdir_cache[verify_pos]->name, true);
     }
 
     if (extend && end) {

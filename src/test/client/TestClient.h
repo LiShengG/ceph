@@ -37,6 +37,7 @@ public:
     // the dentry paths a cache trim takes, for the readdir cache tests
     using Client::unlink;
     using Client::trim_dentry;
+    using Client::clear_dir_complete_and_ordered;
     using Client::_readdir_cache_cb;
     using Client::handle_client_reply;
     MetaSession *install_readdir_test_session(const ConnectionRef& con,

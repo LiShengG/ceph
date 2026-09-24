@@ -487,6 +487,74 @@ TEST_F(TestClient, ReaddirCacheRebuiltByRelisting) {
   EXPECT_EQ(expected, cached_listing(diri.get()));
 }
 
+TEST_F(TestClient, ReaddirCacheCheckedByListingFromStart) {
+  std::scoped_lock lock(client->client_lock);
+  MetaSession session(0, {}, {});
+  enable_reply_encoding(&session);
+  InodeRef diri = make_fake_dir(client, &session, myperm);
+  auto cleanup = make_scope_guard([&] { drop_fake_dir(client, diri); });
+  const frag_t fg;
+
+  dir_result_t listing(diri.get(), myperm);
+  inject_readdir_reply(client, &listing, &session, diri.get(), fg, false,
+		       true, {"a", "b", "c"}, myperm);
+  ASSERT_NE(nullptr, diri->dir);
+  ASSERT_TRUE(diri->is_complete_and_ordered());
+  const auto complete = cached_listing(diri.get());
+  const uint64_t pass_id = diri->dir->readdir_pass.id;
+
+  // Nothing changed since: a new listing, page by page, numbers the
+  // dentries as the cache does, and leaves it to streams reading from it.
+  dir_result_t again(diri.get(), myperm);
+  inject_readdir_reply(client, &again, &session, diri.get(), fg, false,
+		       false, {"a", "b"}, myperm);
+  EXPECT_TRUE(diri->is_complete_and_ordered());
+  EXPECT_EQ(complete, cached_listing(diri.get()));
+  EXPECT_EQ(pass_id, again.next_offset_pass);
+  inject_readdir_reply(client, &again, &session, diri.get(), fg, false,
+		       true, {"c"}, myperm);
+  EXPECT_TRUE(diri->is_complete_and_ordered());
+  EXPECT_EQ(complete, cached_listing(diri.get()));
+  EXPECT_EQ(pass_id, diri->dir->readdir_pass.id);
+}
+
+TEST_F(TestClient, ReaddirCacheCheckedAfterRemoval) {
+  for (const std::string removed : {"c", "a"}) {
+    SCOPED_TRACE("removed " + removed);
+    std::scoped_lock lock(client->client_lock);
+    MetaSession session(0, {}, {});
+    enable_reply_encoding(&session);
+    InodeRef diri = make_fake_dir(client, &session, myperm);
+    auto cleanup = make_scope_guard([&] { drop_fake_dir(client, diri); });
+    const frag_t fg;
+
+    std::vector<std::string> names = {"a", "b", "c"};
+    dir_result_t listing(diri.get(), myperm);
+    inject_readdir_reply(client, &listing, &session, diri.get(), fg, false,
+			 true, names, myperm);
+    ASSERT_NE(nullptr, diri->dir);
+    ASSERT_TRUE(diri->is_complete_and_ordered());
+
+    // removed here: a null dentry, still in the cache, which skips it
+    client->unlink(diri->dir->dentries.at(removed), true, true);
+    ASSERT_TRUE(diri->is_complete_and_ordered());
+    names.erase(std::find(names.begin(), names.end(), removed));
+
+    dir_result_t again(diri.get(), myperm);
+    inject_readdir_reply(client, &again, &session, diri.get(), fg, false,
+			 true, names, myperm);
+    // the directory is still what the client holds
+    EXPECT_TRUE(diri->flags & I_COMPLETE);
+    if (removed == "c") {
+      // nothing after the null dentry to renumber
+      EXPECT_TRUE(diri->is_complete_and_ordered());
+    } else {
+      // the ordinals after it in the frag moved
+      EXPECT_FALSE(diri->flags & I_DIR_ORDERED);
+    }
+  }
+}
+
 TEST_F(TestClient, ReaddirCacheTrimsNullDentryKeepingComplete) {
   std::scoped_lock lock(client->client_lock);
   MetaSession session(0, {}, {});
@@ -683,6 +751,8 @@ void check_cursor_of_old_pass(ClientScaffold *client, const UserPerm& perms,
 	relisted.end())
       client->unlink(dn, true, false);
   }
+  // as a create does, see insert_dentry_inode()
+  client->clear_dir_complete_and_ordered(diri.get(), false);
   dir_result_t again(diri.get(), perms);
   inject_readdir_reply(client, &again, &session, diri.get(), fg, false,
 		       true, relisted, perms);
@@ -980,6 +1050,8 @@ void check_readdir_cache_after_getattr(ClientScaffold *client,
   ASSERT_EQ(caps, (int)getattr->head.args.getattr.mask);
 
   if (rebuild) {
+    // e.g. a dentry was created: the next listing rebuilds the cache
+    client->clear_dir_complete_and_ordered(diri.get(), false);
     client->start_readdir_test_listing(&relisting);
     inject_readdir_reply(client, &relisting, session, diri.get(), left, false,
                          true, {"a"}, perms, S_IFDIR | 0755);
