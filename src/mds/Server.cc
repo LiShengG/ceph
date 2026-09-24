@@ -12676,10 +12676,12 @@ bool Server::build_snap_diff(
         }
 
         // A replica's first can lag the inode auth MDS, so only use the
-        // range as a fast path when it is authoritative.
+        // range as a fast path when it is authoritative. Check @in itself:
+        // a separate historical CInode can outlive its head in the cache,
+        // e.g. once the file is unlinked.
         const bool inode_state_authoritative = head && head->is_auth();
         bool inode_spans_both =
-          inode_state_authoritative &&
+          in->is_auth() &&
           snapid_prev >= in->first && snapid <= in->last;
 
         unsigned res_mask = 0;
