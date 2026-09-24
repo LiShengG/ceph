@@ -2205,7 +2205,7 @@ TEST(LibCephFS, SnapDiffHardlinkReplicaInode)
   ASSERT_LT(snapid1, snapid2);
 
   vector<pair<string, uint64_t>> primary_diff;
-  ASSERT_EQ(0, test_mount.for_each_readdir_snapdiff(
+  ASSERT_EQ(0, test_mount.for_each_readdir_snapdiff2(
     "primary", "snap1", "snap2",
     [&](const dirent* dire, uint64_t snapid) {
       primary_diff.emplace_back(dire->d_name, snapid);
@@ -2216,7 +2216,7 @@ TEST(LibCephFS, SnapDiffHardlinkReplicaInode)
                       std::make_pair(std::string("file"), snapid2)));
 
   vector<pair<string, uint64_t>> replica_diff;
-  ASSERT_EQ(0, test_mount.for_each_readdir_snapdiff(
+  ASSERT_EQ(0, test_mount.for_each_readdir_snapdiff2(
     "replica", "snap1", "snap2",
     [&](const dirent* dire, uint64_t snapid) {
       replica_diff.emplace_back(dire->d_name, snapid);
