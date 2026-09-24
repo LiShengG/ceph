@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <iostream>
+#include <limits>
 #include <errno.h>
 #include <chrono>
 #include <condition_variable>
@@ -808,6 +809,12 @@ public:
     up[rank] = gid;
     set_max_mds(rank + 1);
   }
+
+  // newer than any map the monitors send: Client::handle_mds_map() ignores
+  // them, which would otherwise close the session of the added rank
+  void outdate_real_maps() {
+    epoch = std::numeric_limits<epoch_t>::max();
+  }
 };
 
 struct ReaddirReplyState {
@@ -883,6 +890,7 @@ MetaSession *ClientScaffold::install_readdir_test_session(
     ++rank;
   ReaddirTestMDSMap map(*mdsmap);
   map.add_rank(rank);
+  map.outdate_real_maps();
   *mdsmap = map;
   auto [it, inserted] = mds_sessions.emplace(
     std::piecewise_construct, std::forward_as_tuple(rank),
@@ -905,6 +913,8 @@ void ClientScaffold::remove_readdir_test_session(
   EXPECT_TRUE(session.unsafe_requests.empty());
   EXPECT_TRUE(session.caps.empty());
   mds_sessions.erase(rank);
+  // The last map the client took, as none have been since the test map.
+  // The next one the monitors send replaces it.
   *mdsmap = saved_map;
 }
 
