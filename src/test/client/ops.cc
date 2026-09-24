@@ -511,6 +511,47 @@ TEST_F(TestClient, ReaddirCacheTrimsNullDentryKeepingComplete) {
   EXPECT_TRUE(diri->flags & I_COMPLETE);
 }
 
+TEST_F(TestClient, ReaddirCacheKeptByReplyPastPass) {
+  for (bool moved : {false, true}) {
+    SCOPED_TRACE(moved ? "reply moves a cached dentry" : "reply past the pass");
+    std::scoped_lock lock(client->client_lock);
+    MetaSession session(0, {}, {});
+    enable_reply_encoding(&session);
+    InodeRef diri = make_fake_dir(client, &session, myperm);
+    auto cleanup = make_scope_guard([&] { drop_fake_dir(client, diri); });
+    const frag_t fg;
+
+    dir_result_t listing(diri.get(), myperm);
+    inject_readdir_reply(client, &listing, &session, diri.get(), fg, false,
+			 false, {"a", "b"}, myperm);
+    ASSERT_NE(nullptr, diri->dir);
+    ASSERT_TRUE(diri->dir->readdir_pass.active);
+    const auto seen = cached_listing(diri.get());
+    ASSERT_EQ(2u, seen.size());
+
+    // Another stream went on after 'c', in the order of this pass, and gets
+    // the next page: it starts past what the pass has seen so far.
+    dir_result_t ahead(diri.get(), myperm);
+    ahead.last_name = "c";
+    ahead.next_offset = 5;
+    ahead.next_offset_pass = diri->dir->readdir_pass.id;
+    inject_readdir_reply(client, &ahead, &session, diri.get(), fg, false,
+			 false, {moved ? "b" : "d"}, myperm);
+    if (moved) {
+      // 'b' cannot be both where the pass saw it and after 'c'
+      EXPECT_TRUE(diri->dir->readdir_cache.empty());
+      continue;
+    }
+    EXPECT_EQ(seen, cached_listing(diri.get()));
+
+    // and the pass completes the cache as if the page had not been read
+    inject_readdir_reply(client, &listing, &session, diri.get(), fg, false,
+			 true, {"c", "d"}, myperm);
+    EXPECT_TRUE(diri->is_complete_and_ordered());
+    EXPECT_EQ(4u, diri->dir->readdir_cache.size());
+  }
+}
+
 namespace {
 
 // Hands each entry of a cached listing over, and relists the directory from

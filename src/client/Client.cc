@@ -1472,11 +1472,17 @@ void Client::insert_readdir_results(MetaRequest *request, MetaSession *session, 
     bool extend = pass_ok && start_known &&
 		  dir_result_t::fpos_cmp(start, pass.end) <= 0;
     bool ordered = extend && pass.ordered_count == diri->dir_ordered_count;
+    // A reply starting past the end of the pass, e.g. to an NFS client
+    // seeking forward, numbers its dentries just as the pass will, and gives
+    // none of them an offset readdir_cache holds, unless a dentry the pass
+    // saw has moved there, see below.
+    bool beyond = pass_ok && start_known && !extend &&
+		  pass.ordered_count == diri->dir_ordered_count;
     // The offsets below number the dentries of this reply, and may land among
     // the ones readdir_cache holds.  Unless the pass numbers them itself, or
     // they are checked to be those of the cache, the cache can be left out of
     // order, so it may no longer list the directory.
-    if (numdn && !ordered && !verify &&
+    if (numdn && !ordered && !verify && !beyond &&
 	(!dir->readdir_cache.empty() || diri->is_complete_and_ordered())) {
       ldout(cct, 10) << __func__ << " reply numbers dentries of " << *diri
 		     << " outside its readdir pass, dropping readdir_cache"
@@ -1556,6 +1562,19 @@ void Client::insert_readdir_results(MetaRequest *request, MetaSession *session, 
 	  ++verify_pos;
 	else
 	  drop_verified(dname);
+      }
+      if (beyond) {
+	auto it = std::lower_bound(dir->readdir_cache.begin(),
+				   dir->readdir_cache.end(), dn->offset,
+				   dentry_off_lt());
+	if (it != dir->readdir_cache.end() && *it == dn) {
+	  // renumbering it would leave the cache out of order
+	  ldout(cct, 10) << __func__ << " reply past the readdir pass on "
+			 << *diri << " moves '" << dname << "', dropping it"
+			 << dendl;
+	  clear_dir_complete_and_ordered(diri, false);
+	  beyond = false;
+	}
       }
       dn->offset = offset;
       // add to readdir cache
