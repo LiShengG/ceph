@@ -137,9 +137,13 @@ class ReaddirCacheTestCase(CephFSTestCase):
     def _libcephfs(self, script, **args):
         """
         Run a python script against libcephfs, with mount() giving a new
-        client instance, and return what it prints as json.
+        client instance, and return what it prints as json.  The instances
+        are shut down as the script exits, unless it did so: a client that
+        just goes away keeps its session, and its caps, until the MDS times
+        it out, which stalls the next client that needs them.
         """
         prelude = dedent("""
+            import atexit
             import json
             import os
             import cephfs
@@ -149,6 +153,7 @@ class ReaddirCacheTestCase(CephFSTestCase):
                 for key, value in conf.items():
                     fs.conf_set(key, str(value))
                 fs.mount(filesystem_name={fs_name!r})
+                atexit.register(fs.shutdown)
                 return fs
 
             def mds_requests(fs, rank=0):
