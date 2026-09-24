@@ -10458,8 +10458,10 @@ int Client::file_blockdiff_init_state(const char* path1, const char* path2,
 		 << inode2->snapid << "," << std::hex << inode2->ino << std::dec
 		 << "," << inode2->size << ")" << dendl;
   if (inode1->ino != inode2->ino) {
+    // The path was rebound to a different file between snapshots.  There is
+    // no block diff to compute; let callers fall back to a full copy.
     cleanup_state(this, sst);
-    return -EINVAL;
+    return -ENOENT;
   }
 
   sst->index = 0;

@@ -701,7 +701,9 @@ struct ceph_file_blockdiff_changedblocks
  * @param snap2 the second snapshot name
  * @param out_info resulting blockdiff stream handle to be used for blokdiff results
                    retrieval via ceph_file_blockdiff().
- * @returns 0 on success and negative error code otherwise
+ * @returns 0 on success, -ENOENT if either snapshot path is absent or the
+ *          paths resolve to different inodes, and another negative error code
+ *          otherwise.
  */
 int ceph_file_blockdiff_init(struct ceph_mount_info* cmount,
                              const char* root_path,
