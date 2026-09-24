@@ -1464,6 +1464,10 @@ void Client::insert_readdir_results(MetaRequest *request, MetaSession *session, 
     if (from_cursor && cursor_pass != pass.id)
       start_known = false;
     verify = verify && start_known;
+    // the ordinals of the dentries with the hash, or in the frag, the reply
+    // starts with count from next_offset in the order of first_pass
+    const bool first_from_cursor = from_cursor;
+    const uint64_t first_pass = cursor_pass;
     // may this reply extend the pass, and keep readdir_cache in order?
     bool extend = pass_ok && start_known &&
 		  dir_result_t::fpos_cmp(start, pass.end) <= 0;
@@ -1639,11 +1643,19 @@ void Client::insert_readdir_results(MetaRequest *request, MetaSession *session, 
     // offsets counted from the start of a hash or frag follow the current
     // dentry order, which is the pass's while it is ok, or while the cache
     // it completed agrees with this reply
+    uint64_t fresh_pass = (pass_ok || verify) ? pass.id : 0;
     if (!from_cursor)
-      cursor_pass = (pass_ok || verify) ? pass.id : 0;
+      cursor_pass = fresh_pass;
     dirp->next_offset_pass = cursor_pass;
     dirp->buffer_next_offset = dirp->next_offset;
     dirp->buffer_next_offset_pass = dirp->next_offset_pass;
+    // the first hash of the reply may count in another order than the rest
+    if (from_cursor)
+      dirp->buffer_offset_pass = cursor_pass;
+    else if (!first_from_cursor || first_pass == fresh_pass)
+      dirp->buffer_offset_pass = fresh_pass;
+    else
+      dirp->buffer_offset_pass = 0;
 
     if (dir->is_empty())
       close_dir(dir);
@@ -9136,9 +9148,10 @@ void Client::seekdir(dir_result_t *dirp, loff_t offset)
   if (offset == 0)
     dirp->listing_seq = ++readdir_listing_seq;  // a new listing
 
-  if (offset != 0 && !dirp->buffer.empty() &&
-      dir_result_t::fpos_cmp(offset, dirp->buffer.front().offset) >= 0 &&
-      dir_result_t::fpos_cmp(offset, dirp->buffer.back().offset + 1) <= 0) {
+  bool in_buffer = offset != 0 && !dirp->buffer.empty() &&
+    dir_result_t::fpos_cmp(offset, dirp->buffer.front().offset) >= 0 &&
+    dir_result_t::fpos_cmp(offset, dirp->buffer.back().offset + 1) <= 0;
+  if (in_buffer) {
     // the buffer still holds this position, e.g. an NFS server going back
     // to the cookie of the last entry its client kept.  Reading from the
     // readdir cache may have moved on where the mds listing continues, go
@@ -9146,6 +9159,7 @@ void Client::seekdir(dir_result_t *dirp, loff_t offset)
     dirp->last_name = dirp->buffer.back().name;
     dirp->next_offset = dirp->buffer_next_offset;
     dirp->next_offset_pass = dirp->buffer_next_offset_pass;
+    dirp->offset_pass = dirp->buffer_offset_pass;
   } else if (dirp->hash_order()) {
     if (dirp->offset > offset) {
       _readdir_drop_dirp_buffer(dirp);
@@ -9161,6 +9175,8 @@ void Client::seekdir(dir_result_t *dirp, loff_t offset)
   }
 
   dirp->offset = offset;
+  if (!in_buffer)
+    dirp->offset_pass = dir_result_t::SEEK_PASS;  // see offset_pass
 }
 
 
@@ -9307,6 +9323,49 @@ int Client::_readdir_cache_cb(dir_result_t *dirp, add_dirent_cb_t cb, void *p,
     return 0;
   }
 
+  // Among the dentries with its hash, or in its frag, the offset of the
+  // cursor counts its ordinal in the order of dirp->offset_pass.  A pass that
+  // rebuilt readdir_cache since then may have numbered them otherwise, e.g.
+  // once one before the cursor was removed: looking the offset up would skip
+  // a dentry, or return one again.
+  auto cursor_in_cache_order = [&]() {
+    if (dir_result_t::fpos_low(dirp->offset) <= 2 ||
+	dirp->offset_pass == dir_result_t::SEEK_PASS ||
+	dirp->offset_pass == dir->readdir_pass.id)
+      return true;
+    // Like the mds path, go on after last_name then, if the cursor is right
+    // after it and the cache holds it: the offset the cache gave it places
+    // the cursor in the order of the cache.
+    if (dirp->last_name.empty() ||
+	dir->readdir_pass.hash_order != dirp->hash_order() ||
+	dirp->next_offset_pass != dirp->offset_pass ||
+	dirp->next_offset != dirp->offset_low())
+      return false;
+    auto it = dir->dentries.find(dirp->last_name);
+    if (it == dir->dentries.end())
+      return false;
+    Dentry *last = it->second;
+    auto at = std::lower_bound(dir->readdir_cache.begin(),
+			       dir->readdir_cache.end(), last->offset,
+			       dentry_off_lt());
+    if (at == dir->readdir_cache.end() || *at != last ||
+	dir_result_t::fpos_high(last->offset) != dirp->offset_high())
+      return false;
+    ldout(cct, 15) << " moving offset " << hex << dirp->offset << " after '"
+		   << last->name << "' at " << last->offset << dec
+		   << " in readdir_cache" << dendl;
+    dirp->offset = last->offset + 1;
+    dirp->next_offset = dirp->offset_low();
+    dirp->offset_pass = dirp->next_offset_pass = dir->readdir_pass.id;
+    // the buffer counts in the old order, which the offset no longer does
+    _readdir_drop_dirp_buffer(dirp);
+    return true;
+  };
+  if (!cursor_in_cache_order()) {
+    ldout(cct, 10) << " offset counts in the order of pass " << dirp->offset_pass
+		   << ", not in that of readdir_cache" << dendl;
+    return -CEPHFS_EAGAIN;
+  }
   vector<Dentry*>::iterator pd = std::lower_bound(dir->readdir_cache.begin(),
 						  dir->readdir_cache.end(),
 						  dirp->offset, dentry_off_lt());
@@ -9395,6 +9454,7 @@ int Client::_readdir_cache_cb(dir_result_t *dirp, add_dirent_cb_t cb, void *p,
     else
       dirp->next_offset = dirp->offset_low();
     dirp->last_name = dn_name; // we successfully returned this one; update!
+    dirp->offset_pass = pass_id;
     dirp->next_offset_pass = pass_id;
     if (r > 0)
       return r;
@@ -9406,7 +9466,7 @@ int Client::_readdir_cache_cb(dir_result_t *dirp, add_dirent_cb_t cb, void *p,
     // past its end or on another dentry, or the Dir may have been closed:
     // look for the entry after the one returned anew.
     dir = dirp->inode->dir;
-    if (!dir)
+    if (!dir || !cursor_in_cache_order())
       return -CEPHFS_EAGAIN;
     pd = std::lower_bound(dir->readdir_cache.begin(), dir->readdir_cache.end(),
 			  dirp->offset, dentry_off_lt());
@@ -9579,6 +9639,7 @@ int Client::readdir_r_cb(dir_result_t *d, add_dirent_cb_t cb, void *p,
 	return r;
 
       dirp->offset = next_off;
+      dirp->offset_pass = dirp->buffer_offset_pass;
       if (r > 0)
 	return r;
     }

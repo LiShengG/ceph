@@ -539,11 +539,13 @@ TEST_F(TestClient, ReaddirCacheRefindsEntryAfterCallback) {
   ASSERT_NE(nullptr, diri->dir);
   ASSERT_TRUE(diri->is_complete_and_ordered());
 
-  // While 'b' is handed over, 'b' and 'c' are removed and the directory is
+  // While 'b' is handed over, 'a' and 'c' are removed and the directory is
   // listed again: readdir_cache shrinks to one entry, and is complete and
   // ordered again by the time the reader takes the lock back.  An iterator
-  // kept across the callback would point past the end of the vector.
-  RelistingReader reader{client, &session, diri.get(), myperm, "b", {"a"}};
+  // kept across the callback would point past the end of the vector.  The
+  // offset after 'b' counts in the order of the old pass, 'b' now has the
+  // first ordinal: the reader goes on after where the cache has 'b'.
+  RelistingReader reader{client, &session, diri.get(), myperm, "b", {"b"}};
   dir_result_t reading(diri.get(), myperm);
   reading.offset = dir_result_t::make_fpos(fg, 2, false); // skip . and ..
   EXPECT_EQ(0, client->_readdir_cache_cb(&reading, RelistingReader::cb,
@@ -552,8 +554,106 @@ TEST_F(TestClient, ReaddirCacheRefindsEntryAfterCallback) {
   EXPECT_TRUE(reading.at_end());
   ASSERT_TRUE(diri->is_complete_and_ordered());
   EXPECT_EQ((std::vector<std::pair<std::string, int64_t>>{
-	      {"a", dir_result_t::make_fpos(fg, 2, false)}}),
+	      {"b", dir_result_t::make_fpos(fg, 2, false)}}),
 	    cached_listing(diri.get()));
+}
+
+namespace {
+
+struct CachedNames {
+  std::vector<std::string> names;
+
+  static int cb(void *p, struct dirent *de, struct ceph_statx *, off_t,
+		Inode *) {
+    static_cast<CachedNames *>(p)->names.emplace_back(de->d_name);
+    return 0; // go on
+  }
+};
+
+// A stream has returned the cached listing up to 'last' when a pass rebuilds
+// readdir_cache for the directory now holding 'relisted', and goes on from
+// the cache.  'moved' tells whether the cursor stands right after last_name,
+// as it does when it came from the cache path; otherwise it stands inside an
+// mds reply that last_name ends.
+void check_cursor_of_old_pass(ClientScaffold *client, const UserPerm& perms,
+			      const std::vector<std::string>& listed,
+			      const std::string& last,
+			      const std::vector<std::string>& relisted,
+			      bool moved,
+			      const std::vector<std::string>& expected)
+{
+  SCOPED_TRACE(::testing::Message() << "relisted "
+	       << ::testing::PrintToString(relisted) << " moved " << moved);
+  std::scoped_lock lock(client->client_lock);
+  MetaSession session(0, {}, {});
+  enable_reply_encoding(&session);
+  InodeRef diri = make_fake_dir(client, &session, perms);
+  auto cleanup = make_scope_guard([&] { drop_fake_dir(client, diri); });
+  const frag_t fg;
+
+  dir_result_t listing(diri.get(), perms);
+  inject_readdir_reply(client, &listing, &session, diri.get(), fg, false,
+		       true, listed, perms);
+  ASSERT_NE(nullptr, diri->dir);
+  ASSERT_TRUE(diri->is_complete_and_ordered());
+  const uint64_t old_pass = diri->dir->readdir_pass.id;
+
+  // where the cache path leaves a stream that returned 'last'
+  dir_result_t reading(diri.get(), perms);
+  reading.offset = diri->dir->dentries.at(last)->offset + 1;
+  reading.offset_pass = old_pass;
+  reading.last_name = last;
+  reading.next_offset = dir_result_t::fpos_low(reading.offset);
+  reading.next_offset_pass = old_pass;
+  if (!moved)
+    ++reading.next_offset;
+  // an mds reply numbered in the old order
+  reading.buffer.emplace_back(reading.offset, "d", "",
+			      diri->dir->dentries.at(listed.back())->inode);
+
+  for (auto it = diri->dir->dentries.begin();
+       it != diri->dir->dentries.end(); ) {
+    Dentry *dn = (it++)->second;
+    if (std::find(relisted.begin(), relisted.end(), dn->name) ==
+	relisted.end())
+      client->unlink(dn, true, false);
+  }
+  dir_result_t again(diri.get(), perms);
+  inject_readdir_reply(client, &again, &session, diri.get(), fg, false,
+		       true, relisted, perms);
+  ASSERT_TRUE(diri->is_complete_and_ordered());
+  ASSERT_NE(old_pass, diri->dir->readdir_pass.id);
+
+  CachedNames names;
+  int r = client->_readdir_cache_cb(&reading, CachedNames::cb, &names, 0,
+				    false);
+  if (moved) {
+    EXPECT_EQ(0, r);
+    EXPECT_TRUE(reading.at_end());
+    // nothing may go on from it in the order of the new pass
+    EXPECT_TRUE(reading.buffer.empty());
+  } else {
+    // the mds path goes on from last_name
+    EXPECT_EQ(-EAGAIN, r);
+    EXPECT_FALSE(reading.at_end());
+    EXPECT_EQ(last, reading.last_name);
+  }
+  EXPECT_EQ(expected, names.names);
+}
+
+} // anonymous namespace
+
+TEST_F(TestClient, ReaddirCacheCursorOfOldPass) {
+  // 'b' goes: 'd' gets the ordinal after 'c', where the cursor stands
+  check_cursor_of_old_pass(client, myperm, {"b", "c", "d"}, "c", {"c", "d"},
+			   true, {"d"});
+  // 'a' comes before 'b': 'b' gets the ordinal after it, where the cursor
+  // stands
+  check_cursor_of_old_pass(client, myperm, {"b", "c"}, "b", {"a", "b", "c"},
+			   true, {"c"});
+  // nowhere to tell where the cursor stands in the new order
+  check_cursor_of_old_pass(client, myperm, {"b", "c", "d"}, "c", {"c", "d"},
+			   false, {});
 }
 
 namespace {
