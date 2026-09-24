@@ -12,6 +12,7 @@
  *
  */
 
+#include <algorithm>
 #include <iostream>
 #include <errno.h>
 #include <chrono>
@@ -423,8 +424,10 @@ void check_resumed_reply(ClientScaffold *client, const UserPerm& perms,
     EXPECT_EQ(complete, cached_listing(diri.get()));
     EXPECT_EQ(pass_id, resumed.next_offset_pass);
   } else {
-    // the cache lists another directory than the mds does
+    // the cache lists another directory than the mds does, so what the
+    // client holds of it is stale: neither is it complete any more
     EXPECT_FALSE(diri->flags & I_DIR_ORDERED);
+    EXPECT_FALSE(diri->flags & I_COMPLETE);
     EXPECT_TRUE(diri->dir->readdir_cache.empty());
   }
 }
@@ -461,9 +464,20 @@ TEST_F(TestClient, ReaddirCacheRebuiltByRelisting) {
   // The directory is listed again from its start, e.g. after the cache path
   // gave up on a stale rstat, and the mds no longer reports 'b'.  The cache
   // has to follow the reply: keeping it would go on listing a name the mds
-  // does not have, on ordinals the reply has just renumbered.
+  // does not have, on ordinals the reply has just renumbered.  Nor may the
+  // directory be complete while the client still holds 'b': readdir would
+  // leave out a name lookup finds.
   dir_result_t again(diri.get(), myperm);
   inject_readdir_reply(client, &again, &session, diri.get(), fg, false,
+		       true, {"a", "c"}, myperm);
+  EXPECT_FALSE(diri->flags & I_COMPLETE);
+  EXPECT_TRUE(diri->dir->readdir_cache.empty());
+
+  // Once 'b' is gone from the client too, the next listing completes the
+  // directory, on the ordinals it gives.
+  client->unlink(diri->dir->dentries.at("b"), true, false);
+  dir_result_t third(diri.get(), myperm);
+  inject_readdir_reply(client, &third, &session, diri.get(), fg, false,
 		       true, {"a", "c"}, myperm);
   EXPECT_TRUE(diri->is_complete_and_ordered());
   const std::vector<std::pair<std::string, int64_t>> expected = {
@@ -492,6 +506,15 @@ struct RelistingReader {
     reader.names.emplace_back(de->d_name);
     if (reader.names.back() == reader.rebuild_at) {
       std::scoped_lock lock(reader.client->client_lock);
+      // what the mds no longer lists is gone from the client as well
+      std::vector<Dentry *> gone;
+      for (auto& [name, dn] : reader.diri->dir->dentries) {
+	if (std::find(reader.relisted.begin(), reader.relisted.end(), name) ==
+	    reader.relisted.end())
+	  gone.push_back(dn);
+      }
+      for (Dentry *dn : gone)
+	reader.client->unlink(dn, true, false);
       dir_result_t again(reader.diri, reader.perms);
       inject_readdir_reply(reader.client, &again, reader.session, reader.diri,
 			   frag_t(), false, true, reader.relisted, reader.perms);
@@ -516,10 +539,10 @@ TEST_F(TestClient, ReaddirCacheRefindsEntryAfterCallback) {
   ASSERT_NE(nullptr, diri->dir);
   ASSERT_TRUE(diri->is_complete_and_ordered());
 
-  // While 'b' is handed over, the directory is listed again and now holds
-  // 'a' only: readdir_cache shrinks to one entry, and is complete and ordered
-  // again by the time the reader takes the lock back.  An iterator kept
-  // across the callback would point past the end of the vector.
+  // While 'b' is handed over, 'b' and 'c' are removed and the directory is
+  // listed again: readdir_cache shrinks to one entry, and is complete and
+  // ordered again by the time the reader takes the lock back.  An iterator
+  // kept across the callback would point past the end of the vector.
   RelistingReader reader{client, &session, diri.get(), myperm, "b", {"a"}};
   dir_result_t reading(diri.get(), myperm);
   reading.offset = dir_result_t::make_fpos(fg, 2, false); // skip . and ..

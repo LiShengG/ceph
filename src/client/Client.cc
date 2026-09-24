@@ -1297,6 +1297,24 @@ struct dentry_off_lt {
   }
 };
 
+// Does the directory hold a dentry of the current shared_gen that is not in
+// readdir_cache?  The cache holds each dentry at most once.
+static bool readdir_cache_misses_dentries(Dir *dir)
+{
+  int gen = dir->parent_inode->shared_gen;
+  auto live = [gen](const Dentry *dn) {
+    return dn->inode && dn->cap_shared_gen == gen;
+  };
+  size_t cached = std::count_if(dir->readdir_cache.begin(),
+				dir->readdir_cache.end(), live);
+  size_t held = 0;
+  for (const auto& [name, dn] : dir->dentries) {
+    if (live(dn) && ++held > cached)
+      return true;
+  }
+  return false;
+}
+
 /*
  * insert results from readdir or lssnap into the metadata cache.
  */
@@ -1474,10 +1492,13 @@ void Client::insert_readdir_results(MetaRequest *request, MetaSession *session, 
 				    dir->readdir_cache.end(), start,
 				    dentry_off_lt()) - dir->readdir_cache.begin();
     }
+    // Nothing the client knows of has changed the directory since the
+    // cache listed all of it, yet the mds lists something else: what the
+    // client holds of the directory is stale, not only its order.
     auto drop_verified = [&](const string& at) {
       ldout(cct, 10) << __func__ << " reply disagrees with readdir_cache of "
 		     << *diri << " at '" << at << "', dropping it" << dendl;
-      clear_dir_complete_and_ordered(diri, false);
+      clear_dir_complete_and_ordered(diri, true);
       verify = false;
     };
 
@@ -1545,8 +1566,12 @@ void Client::insert_readdir_results(MetaRequest *request, MetaSession *session, 
 				     dir->readdir_cache.end(), dn->offset,
 				     dentry_off_lt());
 	  if (it == dir->readdir_cache.end() || *it != dn) {
+	    // as with drop_verified(): the directory changed behind the
+	    // client's back, so neither may the pass complete it, nor may
+	    // I_COMPLETE stay
 	    ldout(cct, 10) << __func__ << " readdir pass on " << *diri
 			   << " disagrees at '" << dname << "', dropping it" << dendl;
+	    clear_dir_complete_and_ordered(diri, true);
 	    pass.active = false;
 	    extend = ordered = false;
 	  }
@@ -1578,7 +1603,15 @@ void Client::insert_readdir_results(MetaRequest *request, MetaSession *session, 
 	// the pass has seen the whole directory
 	if (pass.release_count == diri->dir_release_count &&
 	    pass.shared_gen == diri->shared_gen) {
-	  if (ordered && pass.ordered_count == diri->dir_ordered_count) {
+	  if (ordered && pass.ordered_count == diri->dir_ordered_count &&
+	      readdir_cache_misses_dentries(dir)) {
+	    // No dentry was linked since the pass started, see
+	    // insert_dentry_inode(), yet the mds left out some the client
+	    // holds: what the client holds of the directory is stale.
+	    ldout(cct, 10) << " readdir pass on " << *diri << " left out dentries"
+			   << " the client holds, not marking it complete" << dendl;
+	    clear_dir_complete_and_ordered(diri, true);
+	  } else if (ordered && pass.ordered_count == diri->dir_ordered_count) {
 	    ldout(cct, 10) << " marking (I_COMPLETE|I_DIR_ORDERED) on " << *diri << dendl;
 	    diri->flags |= I_COMPLETE | I_DIR_ORDERED;
 	  } else {
