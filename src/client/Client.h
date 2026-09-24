@@ -251,6 +251,13 @@ struct dir_result_t {
   // offset_pass of the offsets of all the entries in buffer, 0 if none
   uint64_t buffer_offset_pass = 0;
 
+  // go on with the mds listing after the reply held in buffer
+  void resume_after_buffer() {
+    last_name = buffer.back().name;
+    next_offset = buffer_next_offset;
+    next_offset_pass = buffer_next_offset_pass;
+  }
+
   vector<dentry> buffer;
   struct dirent de;
 };
