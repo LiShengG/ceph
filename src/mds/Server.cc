@@ -12575,6 +12575,35 @@ bool Server::build_snap_diff(
     return &it->second.inode;
   };
 
+  // Compare @in, the inode behind a dentry visible at @snapid, with the
+  // inode behind the older dentry version held in @before. A relinked
+  // hardlink leaves two remote dentry versions that resolve to the same
+  // head CInode, which then no longer carries the attributes visible at
+  // snapid_prev. When either CInode does not cover its snapshot, compare
+  // the versions visible at each snapshot instead; these are authoritative
+  // only on the inode auth MDS, so report the entry if they are unknown.
+  auto snap_meta_differs = [&](CInode* in, unsigned& res_mask) -> bool {
+    if (before.in->first <= snapid_prev && snapid_prev <= before.in->last &&
+        in->first <= snapid && snapid <= in->last)
+      return before.meta_differs(in, diff_mask, res_mask);
+
+    CInode* head = in->is_head() ? in : mdcache->get_inode(in->ino());
+    const CInode::mempool_inode* prev_inode = nullptr;
+    const CInode::mempool_inode* snap_inode = nullptr;
+    if (head && head->is_auth()) {
+      prev_inode = inode_at_snap(head, snapid_prev);
+      snap_inode = inode_at_snap(head, snapid);
+    }
+    if (!prev_inode || !snap_inode) {
+      dout(10) << __func__ << " unknown snapshot attrs, reporting " << *in
+               << " snap " << snapid_prev << " vs. " << snapid << dendl;
+      res_mask = 0;
+      return true;
+    }
+    return EntryInfo::meta_differs(*prev_inode, *snap_inode, diff_mask,
+                                   res_mask);
+  };
+
   auto it = !skip_key ? dir->begin() : dir->upper_bound(*skip_key);
 
   diff_mask = diff_mask != 0 ? diff_mask : CEPH_SNAPDIFF_MTIME; // to preserve backward compatibility with the original impl.
@@ -12768,7 +12797,7 @@ bool Server::build_snap_diff(
 	    before.reset();
 	  } else {
 	    unsigned res_mask = 0;
-	    if (before.meta_differs(in, diff_mask, res_mask) ) {
+	    if (snap_meta_differs(in, res_mask) ) {
 	      dout(30) << __func__ << " attrs changed " << dn->get_name() << " "
 		<< dn->first << "/" << dn->last
 		<< " result mask: 0x" << std::hex << res_mask << std::dec
@@ -12786,7 +12815,7 @@ bool Server::build_snap_diff(
            */
           if (!rdlock_file_start(in))
             return false;
-          bool differs = before.meta_differs(in, diff_mask, res_mask);
+          bool differs = snap_meta_differs(in, res_mask);
           rdlock_file_finish(in);
           if (differs) {
             dout(30) << __func__ << " attrs changed " << dn->get_name() << " "
