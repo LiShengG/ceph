@@ -254,6 +254,8 @@ void Objecter::handle_conf_change(const ConfigProxy& conf,
   if (changed.count("osd_min_split_replica_read_size")) {
     min_split_replica_read_size
       = conf.get_val<uint64_t>("osd_min_split_replica_read_size");
+    ceph_assert(min_split_replica_read_size >= SplitOp::REPLICA_MIN_SPLIT_SIZE ||
+                min_split_replica_read_size == 0);
   }
   if (changed.count("rados_replica_read_policy")) {
     auto read_policy = conf.get_val<std::string>("rados_replica_read_policy");
@@ -2400,7 +2402,7 @@ void Objecter::op_post_split_op_complete(Op* op, bs::error_code ec, int rc) {
   op->get();  // Keep alive during async operation
 
   boost::asio::post(service, [this, op, ec, rc]() {
-    shunique_lock rl(rwlock, ceph::acquire_shared);
+    shunique_lock sul(rwlock, ceph::acquire_shared);
 
     bool freed = op->get_nref() == 1;
     op->put();
@@ -2413,6 +2415,7 @@ void Objecter::op_post_split_op_complete(Op* op, bs::error_code ec, int rc) {
     unique_lock sl(op->session->lock);
 
     if (rc != -EAGAIN) {
+      sul.unlock();
       op->trace.event("post op complete");
       // This removes from session and unlocks sl.
       complete_op_reply(op, ec, op->session, sl, rc);
@@ -2421,7 +2424,7 @@ void Objecter::op_post_split_op_complete(Op* op, bs::error_code ec, int rc) {
       sl.unlock();
       op->split_op_tids.reset();
       ceph_tid_t tid = 0;
-      _op_submit(op, rl, &tid);
+      _op_submit(op, sul, &tid);
     }
   });
 }
@@ -3146,6 +3149,13 @@ int Objecter::_calc_target(op_target_t *t, bool any_change)
       t->osd = -1;
       return RECALC_OP_TARGET_POOL_DNE;
     }
+  }
+
+  // Strip balanced and localized read flags if the target pool does not support non-primary reads.
+  // This ensures that even when flags are added via global configuration (e.g. rados_replica_read_policy),
+  // ops targeting a tiered or deduped pool will not attempt replica/balanced reads.
+  if (!pi->allows_nonprimary_reads()) {
+    t->flags &= ~(CEPH_OSD_FLAG_BALANCE_READS | CEPH_OSD_FLAG_LOCALIZE_READS);
   }
 
   pg_t pgid;
@@ -5484,6 +5494,8 @@ Objecter::Objecter(CephContext *cct,
   osd_timeout = cct->_conf.get_val<std::chrono::seconds>("rados_osd_op_timeout");
   min_split_replica_read_size
     = cct->_conf.get_val<uint64_t>("osd_min_split_replica_read_size");
+  ceph_assert(min_split_replica_read_size >= SplitOp::REPLICA_MIN_SPLIT_SIZE ||
+              min_split_replica_read_size == 0);
 
   auto read_policy = cct->_conf.get_val<std::string>("rados_replica_read_policy");
   if (read_policy == "localize") {

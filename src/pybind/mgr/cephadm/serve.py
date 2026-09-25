@@ -25,7 +25,7 @@ from ceph.utils import datetime_now
 import orchestrator
 from orchestrator import OrchestratorError, set_exception_subject, OrchestratorEvent, \
     DaemonDescriptionStatus, daemon_type_to_service
-from cephadm.services.cephadmservice import CephadmDaemonDeploySpec
+from cephadm.services.cephadmservice import CephadmDaemonDeploySpec, DaemonDeployContext
 from cephadm.schedule import HostAssignment, HostSelector
 from cephadm.autotune import MemoryAutotuner
 from cephadm.utils import forall_hosts, cephadmNoImage, is_repo_digest, \
@@ -1105,7 +1105,7 @@ class CephadmServe:
                     slot.daemon_type, daemon_id, slot.hostname))
 
                 try:
-                    daemon_spec = svc.prepare_create(daemon_spec)
+                    daemon_spec = svc.prepare_create(DaemonDeployContext(daemon_spec, spec))
                     with self.mgr.async_timeout_handler(slot.hostname, f'cephadm deploy ({daemon_spec.daemon_type} type dameon)'):
                         self.mgr.wait_async(self._create_daemon(daemon_spec))
                     r = True
@@ -1345,6 +1345,25 @@ class CephadmServe:
             if action:
                 if scheduled_action == 'redeploy' and action == 'reconfig':
                     action = 'redeploy'
+                # For OSD redeploy/reconfig that was NOT explicitly scheduled by
+                # the user (i.e. scheduled_action was None), check ok-to-stop
+                # before proceeding.  A redeploy/reconfig stops the OSD; running
+                # it when the cluster cannot afford to lose that OSD risks data
+                # unavailability.  If the OSD is not safe to stop right now,
+                # defer the action to the next serve-loop iteration.
+                if (
+                    dd.daemon_type == 'osd'
+                    and action in ('redeploy', 'reconfig')
+                    and not scheduled_action
+                ):
+                    r = svc_obj.ok_to_stop([dd.daemon_id])
+                    if r.retval:
+                        self.log.info(
+                            'Skipping %s of %s (not ok-to-stop: %s); '
+                            'will retry next serve loop',
+                            action, dd.name(), r.stderr,
+                        )
+                        continue
                 try:
                     daemon_spec = CephadmDaemonDeploySpec.from_daemon_description(dd)
                     reconfig_extras: dict[str, Any] = {}

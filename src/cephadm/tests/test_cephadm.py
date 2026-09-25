@@ -448,14 +448,23 @@ class TestCephAdm(object):
         ctx.initial_dashboard_password = 'password'
         ctx.initial_dashboard_user = 'User'
         with pytest.raises(Exception):
-            _cephadm.prepare_dashboard(ctx, 0, 0, lambda _, extra_mounts=None, ___=None : '5', lambda : None)
+            _cephadm.prepare_dashboard(
+                ctx, 0, 0,
+                lambda _, extra_mounts=None, ___=None: '5',
+                lambda module_names=None: None)
 
         ctx.skip_firewalld = True
-        _cephadm.prepare_dashboard(ctx, 0, 0, lambda _, extra_mounts=None, ___=None : '5', lambda : None)
+        _cephadm.prepare_dashboard(
+            ctx, 0, 0,
+            lambda _, extra_mounts=None, ___=None: '5',
+            lambda module_names=None: None)
 
         ctx.skip_firewalld = False
         with pytest.raises(Exception):
-            _cephadm.prepare_dashboard(ctx, 0, 0, lambda _, extra_mounts=None, ___=None : '5', lambda : None)
+            _cephadm.prepare_dashboard(
+                ctx, 0, 0,
+                lambda _, extra_mounts=None, ___=None: '5',
+                lambda module_names=None: None)
 
     def test_to_deployment_container(self, funkypatch):
         """
@@ -3063,6 +3072,16 @@ class TestPull:
         assert err not in str(e.value)
 
         _call.return_value = ('', 'net/http: TLS handshake timeout', 1)
+        with pytest.raises(_cephadm.Error) as e:
+            _cephadm.command_pull(ctx)
+        assert err in str(e.value)
+
+        _call.return_value = (
+            '',
+            'failed to copy: httpReadSeeker: failed open: failed to do request: '
+            'Get "https://cdn01.quay.io/quayio-production-s3/sha256/f8/f8a4970c": EOF',
+            1,
+        )
         with pytest.raises(_cephadm.Error) as e:
             _cephadm.command_pull(ctx)
         assert err in str(e.value)

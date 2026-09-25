@@ -13,7 +13,11 @@ from orchestrator import (
     DaemonDescriptionStatus,
     HostSpec,
 )
-from .cephadmservice import CephadmDaemonDeploySpec, CephService
+from ceph.cephadm.constants import (
+    NVMEOF_ENCRYPTION_KEY_CONTAINER_PATH,
+    NVMEOF_ENCRYPTION_KEY_PATH_FILE,
+)
+from .cephadmservice import CephadmDaemonDeploySpec, CephService, DaemonDeployContext
 from .service_registry import register_cephadm_service
 from .. import utils
 
@@ -116,10 +120,16 @@ class NvmeofService(CephService):
             'root_ca_cert': tls_creds.ca_cert,
         })
 
-    def prepare_create(self, daemon_spec: CephadmDaemonDeploySpec) -> CephadmDaemonDeploySpec:
+    def prepare_create(
+            self,
+            deploy_ctx: DaemonDeployContext,
+    ) -> CephadmDaemonDeploySpec:
+        daemon_spec = deploy_ctx.daemon_spec
+        spec = deploy_ctx.service_spec
         assert self.TYPE == daemon_spec.daemon_type
 
         spec = cast(NvmeofServiceSpec, self.mgr.spec_store[daemon_spec.service_name].spec)
+        deploy_ctx.service_spec = spec
         nvmeof_gw_id = daemon_spec.daemon_id
         host_ip = self.mgr.inventory.get_addr(daemon_spec.host)
         map_addr = spec.addr_map.get(daemon_spec.host) if spec.addr_map else None
@@ -146,6 +156,7 @@ class NvmeofService(CephService):
         self.mgr.log.info(f"gateway address: {addr} from {map_addr=} {spec.addr=} {host_ip=}")
         discovery_addr = map_discovery_addr or spec.discovery_addr or host_ip
         self.mgr.log.info(f"discovery address: {discovery_addr} from {map_discovery_addr=} {spec.discovery_addr=} {host_ip=}")
+        encryption_key_path = self._get_encryption_key_path(spec)
         context = {
             'spec': spec,
             'name': name,
@@ -157,7 +168,8 @@ class NvmeofService(CephService):
             'rpc_socket_name': 'spdk.sock',
             'transport_tcp_options': transport_tcp_options,
             'iobuf_options': iobuf_options,
-            'rados_id': rados_id
+            'rados_id': rados_id,
+            'encryption_key_path': encryption_key_path,
         }
         gw_conf = self.mgr.template.render('services/nvmeof/ceph-nvmeof.conf.j2', context)
 
@@ -181,7 +193,10 @@ class NvmeofService(CephService):
         if spec.encryption_key:
             daemon_spec.extra_files['encryption_key'] = spec.encryption_key
 
-        daemon_spec.final_config, _ = self.generate_config(daemon_spec)
+        if spec.enable_encryption and spec.encryption_key_path:
+            daemon_spec.extra_files[NVMEOF_ENCRYPTION_KEY_PATH_FILE] = spec.encryption_key_path
+
+        daemon_spec.final_config, _ = self.generate_config(deploy_ctx)
         daemon_spec.deps = self.get_dependencies(self.mgr, spec, daemon_spec.daemon_type)
         return daemon_spec
 
@@ -469,3 +484,9 @@ class NvmeofService(CephService):
                 server_key=server_key,
                 ca_cert=ca_cert
             )
+
+    def _get_encryption_key_path(self, spec: NvmeofServiceSpec) -> Optional[str]:
+        if spec.encryption_key_path or spec.encryption_key:
+            return NVMEOF_ENCRYPTION_KEY_CONTAINER_PATH
+
+        return None
