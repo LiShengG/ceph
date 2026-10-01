@@ -505,8 +505,14 @@ public:
   int for_each_file_blockdiff(const char* relpath,
 			      const char* snap1,
 			      const char* snap2,
-			      interval_set<uint64_t> *expected=nullptr)
+			      interval_set<uint64_t> *expected=nullptr,
+                              interval_set<uint64_t> *actual=nullptr)
   {
+    // Preserve expected-set subtraction for existing callers; exact-result
+    // tests can collect the returned extents separately.
+    if (actual) {
+      actual->clear();
+    }
     auto s1 = make_snap_name(snap1);
     auto s2 = make_snap_name(snap2);
     ceph_file_blockdiff_info info;
@@ -537,6 +543,9 @@ public:
 	if (expected) {
 	  expected->erase(b->offset, b->len);
 	}
+	if (actual) {
+	  actual->union_insert(b->offset, b->len);
+	}
 	++b;
 	--nr_blocks;
       }
@@ -551,6 +560,21 @@ public:
                 << std::endl;
     }
 
+    return r;
+  }
+
+  int read_range(const char* relpath, uint64_t offset, uint64_t len,
+                 std::string* out)
+  {
+    auto file_path = make_file_path(relpath);
+    int fd = ceph_open(cmount, file_path.c_str(), O_RDONLY, 0);
+    if (fd < 0) {
+      return fd;
+    }
+    out->resize(len);
+    int r = ceph_read(cmount, fd, out->data(), len, offset);
+    ceph_close(cmount, fd);
+    out->resize(std::max(r, 0));
     return r;
   }
 
@@ -2446,4 +2470,144 @@ TEST(LibCephFS, SnapDiffStatDelta) {
 
   test_mount.rmsnap("snap1");
   test_mount.rmsnap("snap2");
+}
+
+// Removes the snapshots when leaving the test, also after a failed
+// assertion: a test directory left behind with snapshots in it makes the
+// next test fail to create its own.
+struct SnapCleanup {
+  TestMount& test_mount;
+  std::vector<const char*> snaps;
+  ~SnapCleanup() {
+    for (auto snap : snaps) {
+      test_mount.rmsnap(snap);
+    }
+  }
+};
+
+// An object first written after the newer snapshot -- a hole filled once
+// both snapshots exist -- is absent from both snapshots. Its clone list
+// holds nothing but head, the same as an object created between the
+// snapshots, so blockdiff must use snapset.seq to tell the two apart
+// rather than report it. Collect the returned extents: the expected-set
+// check of the tests above cannot see extents that are reported in excess.
+TEST(LibCephFS, BlockDiffHoleFilledAfterNewerSnapshot)
+{
+  TestMount test_mount;
+  SnapCleanup cleanup{test_mount, {"snap1", "snap2"}};
+  // default file layout: 4M objects, no striping
+  const uint64_t obj = 4 * 1024 * 1024;
+  const uint64_t blk = 1024 * 1024;
+
+  // objects 0 and 4 exist, 1-3 are holes
+  ASSERT_LE(0, test_mount.write_random("fileA", 1, obj, 0));
+  ASSERT_LE(0, test_mount.write_random("fileA", 1, obj, 4 * obj));
+  ASSERT_EQ(0, test_mount.mksnap("snap1"));
+
+  // change the file between the snapshots so that they refer to different
+  // inode versions
+  ASSERT_LE(0, test_mount.write_random("fileA", 1, blk, 0));
+  ASSERT_EQ(0, test_mount.mksnap("snap2"));
+
+  // fill the hole in object 2 once both snapshots exist
+  ASSERT_LE(0, test_mount.write_random("fileA", 1, obj, 2 * obj));
+
+  // object 2 is still a hole in snap2...
+  std::string data;
+  auto snap2_file = test_mount.make_snap_path("snap2", "fileA");
+  ASSERT_EQ((int)obj, test_mount.read_range(snap2_file.c_str(), 2 * obj, obj, &data));
+  ASSERT_EQ(std::string::npos, data.find_first_not_of('\0'));
+
+  // ...so the only change between the snapshots is the one to object 0
+  interval_set<uint64_t> changed;
+  ASSERT_EQ(0, test_mount.for_each_file_blockdiff("fileA", "snap1", "snap2",
+                                                  nullptr, &changed));
+  std::cout << "changed=" << changed << std::endl;
+  ASSERT_TRUE(changed.contains(0, blk)) << "changed=" << changed;
+  interval_set<uint64_t> unchanged;
+  unchanged.insert(obj, 4 * obj);
+  unchanged.intersection_of(changed);
+  ASSERT_TRUE(unchanged.empty()) << "unchanged extents reported: " << unchanged;
+}
+
+// Holes filled on both sides of the newer snapshot in one file: objects
+// created between the snapshots are reported whole, whether or not they
+// are written again later, while the one created after the newer snapshot
+// is not reported.
+TEST(LibCephFS, BlockDiffHolesFilledAroundNewerSnapshot)
+{
+  TestMount test_mount;
+  SnapCleanup cleanup{test_mount, {"snap1", "snap2"}};
+  const uint64_t obj = 4 * 1024 * 1024;
+  const uint64_t blk = 1024 * 1024;
+
+  // objects 0 and 5 exist, 1-4 are holes
+  ASSERT_LE(0, test_mount.write_random("fileA", 1, obj, 0));
+  ASSERT_LE(0, test_mount.write_random("fileA", 1, obj, 5 * obj));
+  ASSERT_EQ(0, test_mount.mksnap("snap1"));
+
+  // between the snapshots: change object 0, create objects 1 and 3
+  ASSERT_LE(0, test_mount.write_random("fileA", 1, blk, 0));
+  ASSERT_LE(0, test_mount.write_random("fileA", 1, obj, obj));
+  ASSERT_LE(0, test_mount.write_random("fileA", 1, obj, 3 * obj));
+  ASSERT_EQ(0, test_mount.mksnap("snap2"));
+
+  // after snap2: create object 2, rewrite the start of object 3
+  ASSERT_LE(0, test_mount.write_random("fileA", 1, obj, 2 * obj));
+  ASSERT_LE(0, test_mount.write_random("fileA", 1, blk, 3 * obj));
+
+  interval_set<uint64_t> changed;
+  ASSERT_EQ(0, test_mount.for_each_file_blockdiff("fileA", "snap1", "snap2",
+                                                  nullptr, &changed));
+  std::cout << "changed=" << changed << std::endl;
+  interval_set<uint64_t> expected;
+  expected.insert(0, blk);
+  expected.insert(obj, obj);
+  expected.insert(3 * obj, obj);
+  ASSERT_TRUE(changed.contains(expected))
+    << "expected=" << expected << " changed=" << changed;
+  // object 2 appeared after snap2, object 4 never existed, object 5 was
+  // not touched
+  interval_set<uint64_t> unchanged;
+  unchanged.insert(2 * obj, obj);
+  unchanged.insert(4 * obj, 2 * obj);
+  unchanged.intersection_of(changed);
+  ASSERT_TRUE(unchanged.empty()) << "unchanged extents reported: " << unchanged;
+}
+
+// A hole filled after a later snapshot: snapset.seq is then beyond the
+// newer snapshot of every pair, not just equal to it.
+TEST(LibCephFS, BlockDiffHoleFilledAfterLaterSnapshot)
+{
+  TestMount test_mount;
+  SnapCleanup cleanup{test_mount, {"snap1", "snap2", "snap3"}};
+  const uint64_t obj = 4 * 1024 * 1024;
+  const uint64_t blk = 1024 * 1024;
+
+  // objects 0 and 4 exist, 1-3 are holes; object 0 changes between each
+  // pair of snapshots
+  ASSERT_LE(0, test_mount.write_random("fileA", 1, obj, 0));
+  ASSERT_LE(0, test_mount.write_random("fileA", 1, obj, 4 * obj));
+  ASSERT_EQ(0, test_mount.mksnap("snap1"));
+  ASSERT_LE(0, test_mount.write_random("fileA", 1, blk, 0));
+  ASSERT_EQ(0, test_mount.mksnap("snap2"));
+  ASSERT_LE(0, test_mount.write_random("fileA", 1, blk, blk));
+  ASSERT_EQ(0, test_mount.mksnap("snap3"));
+
+  ASSERT_LE(0, test_mount.write_random("fileA", 1, obj, 2 * obj));
+
+  const std::pair<const char*, const char*> snap_pairs[] = {
+    {"snap1", "snap2"}, {"snap2", "snap3"}, {"snap1", "snap3"}};
+  for (auto& [older, newer] : snap_pairs) {
+    interval_set<uint64_t> changed;
+    ASSERT_EQ(0, test_mount.for_each_file_blockdiff("fileA", older, newer,
+                                                    nullptr, &changed));
+    std::cout << older << ".." << newer << " changed=" << changed << std::endl;
+    ASSERT_FALSE(changed.empty()) << older << ".." << newer;
+    interval_set<uint64_t> unchanged;
+    unchanged.insert(obj, 4 * obj);
+    unchanged.intersection_of(changed);
+    ASSERT_TRUE(unchanged.empty())
+      << older << ".." << newer << " unchanged extents reported: " << unchanged;
+  }
 }
