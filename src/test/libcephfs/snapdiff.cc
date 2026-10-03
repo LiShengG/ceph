@@ -2853,8 +2853,10 @@ TEST(LibCephFS, BlockDiffStripedTruncateRegrowBoundaries)
     ASSERT_GE(fd, 0);
     auto close_fd = make_scope_guard([&] { EXPECT_EQ(0, ceph_close(cmount, fd)); });
     const std::string before_bytes(c.old_size, 's');
-    ASSERT_EQ(static_cast<int>(before_bytes.size()),
-              ceph_write(cmount, fd, before_bytes.data(), before_bytes.size(), 0));
+    if (!before_bytes.empty()) {
+      ASSERT_EQ(static_cast<int>(before_bytes.size()),
+                ceph_write(cmount, fd, before_bytes.data(), before_bytes.size(), 0));
+    }
     ASSERT_EQ(0, ceph_fsync(cmount, fd, 0));
     bool have_before = false;
     bool have_after = false;
