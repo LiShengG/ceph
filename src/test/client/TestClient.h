@@ -67,9 +67,14 @@ public:
       req->set_filepath(path);
       req->set_inode(diri.get());
       req->head.args.snapdiff.snap_other = other_snap;
-      req->head.args.snapdiff.frag = diri->dirfragtree[0];
+      req->head.args.snapdiff.frag = diri->dirfragtree[dirp->offset_high()];
       req->head.args.snapdiff.flags = CEPH_READDIR_REPLY_BITFLAGS;
       req->head.args.snapdiff.max_bytes = max_bytes;
+      if (!dirp->last_name.empty()) {
+        req->path2.set_path(dirp->last_name);
+      } else if (dirp->hash_order()) {
+        req->head.args.snapdiff.offset_hash = dirp->offset_high();
+      }
       req->dirp = dirp;
       return make_request(req, dirp->perms);
     }
