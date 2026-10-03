@@ -4717,3 +4717,106 @@ os.utime(path, ns=({mtime}, {mtime}))
     def test_cephfs_mirror_relinked_hardlink_multimds_migration(self):
         """Relinking and blockdiff must survive a swap of subtree authority."""
         self._test_cephfs_mirror_relinked_hardlink_multimds(migrate=True)
+
+    def _test_cephfs_mirror_copy_error_in_first_extent(self, operation):
+        """The first failed extent must fail its attempt before a later retry."""
+        from tasks.cephfs.mirror_boundary_faults import (
+            MirrorBoundaryFaults, tree_manifest)
+
+        self.setup_mount_b(mds_perm='rw')
+        peer_spec = 'client.mirror_remote@ceph'
+        directory = f'copy_{operation}_error'
+        with MirrorBoundaryFaults(self) as faults:
+            faults.set_config('cephfs_mirror_blockdiff_min_file_size', 1)
+            faults.set_config('client_file_blockdiff_max_concurrent_object_scans', 16)
+            faults.set_config('cephfs_mirror_max_consecutive_failures_per_directory', 1)
+            faults.set_config('cephfs_mirror_retry_failed_directories_interval', 3600)
+            self.enable_mirroring(self.primary_fs_name, self.primary_fs_id)
+            self.peer_add(self.primary_fs_name, self.primary_fs_id, peer_spec,
+                          self.secondary_fs_name)
+            self.mount_a.run_shell(['mkdir', directory])
+            filename = f'{directory}/data.bin'
+            self.mount_a.run_shell(['touch', filename])
+            self.mount_a.setfattr(filename, 'ceph.file.layout.stripe_unit', '4194304')
+            self.mount_a.setfattr(filename, 'ceph.file.layout.stripe_count', '1')
+            self.mount_a.setfattr(filename, 'ceph.file.layout.object_size', '4194304')
+            self.mount_a.run_python(f'''
+import os
+path = {os.path.join(self.mount_a.mountpoint, filename)!r}
+with open(path, 'wb') as stream:
+    stream.write(b'A' * (16 * 1024 * 1024))
+    stream.flush()
+    os.fsync(stream.fileno())
+os.utime(path, (1577836800, 1577836800))
+''')
+            self.add_directory(self.primary_fs_name, self.primary_fs_id, f'/{directory}')
+            self.mount_a.run_shell(['mkdir', f'{directory}/.snap/base'])
+            self.check_peer_status_idle(self.primary_fs_name, self.primary_fs_id,
+                                        peer_spec, f'/{directory}', 'base', 1)
+            self.assertEqual(tree_manifest(self.mount_a, f'{directory}/.snap/base'),
+                             tree_manifest(self.mount_b, f'{directory}/.snap/base'))
+
+            # Objects 0 and 2 change; unchanged object 1 separates the extents.
+            self.mount_a.run_python(f'''
+import os
+path = {os.path.join(self.mount_a.mountpoint, filename)!r}
+with open(path, 'r+b') as stream:
+    stream.write(b'B' * (4 * 1024 * 1024))
+    stream.seek(8 * 1024 * 1024)
+    stream.write(b'C' * (4 * 1024 * 1024))
+    stream.flush()
+    os.fsync(stream.fileno())
+os.utime(path, (1577836802, 1577836802))
+''')
+            faults.clear_events()
+            fault_path = (f'/{directory}/.snap/current/data.bin'
+                          if operation == 'read' else f'/{directory}/data.bin')
+            faults.arm(operation, fault_path, offset=0, action='error')
+            # A successful commit attempt is an observable boundary, rather
+            # than waiting for (or accidentally accepting) a later retry.
+            faults.arm('mksnap', f'/{directory}/.snap/current')
+            self.mount_a.run_shell(['mkdir', f'{directory}/.snap/current'])
+            peer_uuid = self.get_peer_uuid(peer_spec)
+            faults.wait_failed_or_snapshot(f'/{directory}', peer_uuid)
+            self.assertTrue(faults.hit(operation), 'the intended I/O was not injected')
+            events = faults.events()
+            self.assertTrue(any(event[0] == 'block_count' and event[2] == 2
+                                for event in events),
+                            'the two extents must be returned in one callback')
+            self.assertIn(('block', '', 0, 4194304), events)
+            self.assertIn(('block', '', 8388608, 4194304), events)
+            errors = [event for event in events
+                      if event[0] == operation + '_result' and event[3] == -errno.EIO]
+            self.assertEqual(1, len(errors), 'inject exactly one error in this attempt')
+            if faults.hit('mksnap'):
+                self.assertIn(('write_result', f'/{directory}/data.bin',
+                               8388608, 4194304), events,
+                              'confirm the later extent succeeded after the failure')
+                self.fail('mirror attempted to commit a snapshot after a failed extent')
+            self.assertNotIn('current', self.mount_b.ls(path=f'{directory}/.snap'))
+            status = self.dir_status_from_asok(self.primary_fs_name, self.primary_fs_id,
+                                              f'/{directory}', peer_uuid)
+            self.assertEqual('failed', status['state'])
+            self.assertEqual('base', status['last_synced_snap']['name'])
+            self.assertEqual(1, status['snaps_synced'])
+
+            # Retry without reinjecting and check the entire resulting file,
+            # including the gap and unchanged tail between the two extents.
+            faults.disarm('mksnap')
+            faults.restart()
+            self.wait_for_mirror_daemon_recovery(
+                self.primary_fs_name, self.primary_fs_id, f'/{directory}', peer_uuid)
+            self.check_peer_status_after_sigkill_recovery(
+                self.primary_fs_name, self.primary_fs_id, peer_spec,
+                f'/{directory}', 'current', expected_snap_count=1)
+            self.assertEqual(tree_manifest(self.mount_a, f'{directory}/.snap/current'),
+                             tree_manifest(self.mount_b, f'{directory}/.snap/current'))
+            self.remove_directory(self.primary_fs_name, self.primary_fs_id,
+                                  f'/{directory}')
+            self.disable_mirroring(self.primary_fs_name, self.primary_fs_id)
+
+    def test_cephfs_mirror_first_extent_read_error_is_not_overwritten(self):
+        self._test_cephfs_mirror_copy_error_in_first_extent('read')
+
+    def test_cephfs_mirror_first_extent_write_error_is_not_overwritten(self):
+        self._test_cephfs_mirror_copy_error_in_first_extent('write')

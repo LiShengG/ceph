@@ -1,4 +1,12 @@
 overrides:
+  install:
+    extra_packages:
+      deb:
+        - gcc
+        - libc6-dev
+      rpm:
+        - gcc
+        - glibc-devel
   ceph:
     conf:
       mgr:
