@@ -4820,3 +4820,116 @@ os.utime(path, (1577836802, 1577836802))
 
     def test_cephfs_mirror_first_extent_write_error_is_not_overwritten(self):
         self._test_cephfs_mirror_copy_error_in_first_extent('write')
+
+    def _test_cephfs_mirror_replacement_sigkill(self, replacement, phase):
+        """Replay a partially applied same-name replacement after a hard crash."""
+        from tasks.cephfs.mirror_boundary_faults import (
+            MirrorBoundaryFaults, tree_manifest)
+
+        self.setup_mount_b(mds_perm='rw')
+        peer_spec = 'client.mirror_remote@ceph'
+        directory = f'replace_{replacement}_{phase}'
+        target = f'{directory}/target'
+        incoming = f'{directory}/incoming'
+        with MirrorBoundaryFaults(self) as faults:
+            self.enable_mirroring(self.primary_fs_name, self.primary_fs_id)
+            self.peer_add(self.primary_fs_name, self.primary_fs_id, peer_spec,
+                          self.secondary_fs_name)
+            self.mount_a.run_shell(['mkdir', directory])
+            self.mount_a.write_file(f'{directory}/keep', data='root entry survives')
+            if replacement == 'file_to_directory':
+                self.mount_a.write_file(target, data='old regular file')
+            else:
+                self.mount_a.run_shell(['mkdir', '-p', f'{target}/deep'])
+                self.mount_a.write_file(f'{target}/deep/old-only', data='stale nested entry')
+                self.mount_a.write_file(f'{target}/other-old', data='another stale entry')
+
+            new_is_directory = replacement != 'directory_to_file'
+            if new_is_directory:
+                self.mount_a.run_shell(['mkdir', '-p', f'{incoming}/deep/deeper'])
+                self.mount_a.write_file(f'{incoming}/deep/deeper/untouched',
+                                        data='unchanged since the baseline snapshot')
+                self.mount_a.run_shell(['mkdir', f'{incoming}/empty'])
+                self.mount_a.run_shell(['ln', '-s', 'deep/deeper/untouched',
+                                        f'{incoming}/link'])
+                payload = f'{incoming}/payload'
+            else:
+                payload = incoming
+            # More than the 64 MiB vector-I/O buffer makes after_write(offset=0)
+            # a real partial-copy boundary, independently of filesystem speed.
+            self.mount_a.run_python(f'''
+import os
+path = {os.path.join(self.mount_a.mountpoint, payload)!r}
+with open(path, 'wb') as stream:
+    for _ in range(80):
+        stream.write(b'P' * (1024 * 1024))
+    stream.flush()
+    os.fsync(stream.fileno())
+''')
+            self.add_directory(self.primary_fs_name, self.primary_fs_id, f'/{directory}')
+            self.mount_a.run_shell(['sync'])
+            self.mount_a.run_shell(['mkdir', f'{directory}/.snap/base'])
+            self.check_peer_status_idle(self.primary_fs_name, self.primary_fs_id,
+                                        peer_spec, f'/{directory}', 'base', 1)
+            baseline = tree_manifest(self.mount_a, f'{directory}/.snap/base')
+            self.assertEqual(baseline, tree_manifest(self.mount_b, f'{directory}/.snap/base'))
+            self.mount_a.run_shell(['rm', '-rf', target])
+            self.mount_a.run_shell(['mv', incoming, target])
+            self.mount_a.run_shell(['sync'])
+
+            operation = {'purge': 'after_unlink', 'mkdir': 'after_mkdir',
+                         'copy': 'after_write'}[phase]
+            gate_path = f'/{target}'
+            if phase == 'purge':
+                gate_path += '/deep/old-only'
+            elif phase == 'copy' and new_is_directory:
+                gate_path += '/payload'
+            faults.arm(operation, gate_path, offset=0 if phase == 'copy' else -1)
+            self.mount_a.run_shell(['mkdir', f'{directory}/.snap/current'])
+            faults.wait_hit(operation)
+            self.assertNotIn('current', self.mount_b.ls(path=f'{directory}/.snap'))
+            if phase == 'purge':
+                self.assertNotIn('old-only', self.mount_b.ls(path=f'{target}/deep'))
+            elif phase == 'mkdir':
+                self.assertEqual([], self.mount_b.ls(path=target))
+            else:
+                remote_payload = f'{target}/payload' if new_is_directory else target
+                size = int(self.mount_b.run_shell(
+                    ['stat', '-c', '%s', remote_payload]).stdout.getvalue())
+                self.assertEqual(64 * 1024 * 1024, size,
+                                 'crash while the 80 MiB file is only partially copied')
+                self.assertIn(('write_result', gate_path, 0, 64 * 1024 * 1024),
+                              faults.events())
+
+            faults.restart()  # SIGKILL while the exact mutation barrier is held.
+            peer_uuid = self.get_peer_uuid(peer_spec)
+            self.wait_for_mirror_daemon_recovery(
+                self.primary_fs_name, self.primary_fs_id, f'/{directory}', peer_uuid)
+            self.check_peer_status_after_sigkill_recovery(
+                self.primary_fs_name, self.primary_fs_id, peer_spec,
+                f'/{directory}', 'current', expected_snap_count=1)
+            expected = tree_manifest(self.mount_a, f'{directory}/.snap/current')
+            self.assertEqual(expected, tree_manifest(self.mount_b, f'{directory}/.snap/current'))
+            # Also check the working tree: a correct snapshot must not hide
+            # extra stale entries left behind by interrupted deletion.
+            self.assertEqual(expected, tree_manifest(self.mount_b, directory))
+            self.assertEqual(baseline, tree_manifest(self.mount_b, f'{directory}/.snap/base'))
+            self.assertNotIn('gate_timeout', [item[0] for item in faults.events()])
+            self.remove_directory(self.primary_fs_name, self.primary_fs_id,
+                                  f'/{directory}')
+            self.disable_mirroring(self.primary_fs_name, self.primary_fs_id)
+
+    def test_cephfs_mirror_directory_replacement_sigkill_during_purge(self):
+        self._test_cephfs_mirror_replacement_sigkill('directory', 'purge')
+
+    def test_cephfs_mirror_directory_replacement_sigkill_after_mkdir(self):
+        self._test_cephfs_mirror_replacement_sigkill('directory', 'mkdir')
+
+    def test_cephfs_mirror_directory_replacement_sigkill_during_copy(self):
+        self._test_cephfs_mirror_replacement_sigkill('directory', 'copy')
+
+    def test_cephfs_mirror_file_to_directory_sigkill_after_mkdir(self):
+        self._test_cephfs_mirror_replacement_sigkill('file_to_directory', 'mkdir')
+
+    def test_cephfs_mirror_directory_to_file_sigkill_during_copy(self):
+        self._test_cephfs_mirror_replacement_sigkill('directory_to_file', 'copy')
