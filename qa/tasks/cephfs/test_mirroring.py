@@ -8,9 +8,11 @@ import random
 import signal
 import time
 import functools
+import hashlib
 
 from io import BytesIO, StringIO
 from collections import deque
+from contextlib import contextmanager
 from datetime import datetime
 
 from tasks.cephfs.cephfs_test_case import CephFSTestCase
@@ -4307,3 +4309,160 @@ class TestMirroring(CephFSTestCase):
         self.assertEqual(64 * 1024 * 1024, source_state[0])
         self.assertNotEqual(initial_state[1], source_state[1])
         self.assertEqual(source_state, destination_state)
+
+
+    @contextmanager
+    def _boundary_mirrored_directory(self, dir_name):
+        """Keep mirror registration cleanup inside the filesystem fixture."""
+        peer_spec = 'client.mirror_remote@ceph'
+        self.setup_mount_b(mds_perm='rw')
+        self.mount_a.run_shell(['mkdir', '-p', dir_name])
+        self.enable_mirroring(self.primary_fs_name, self.primary_fs_id)
+        added = False
+        try:
+            self.peer_add(self.primary_fs_name, self.primary_fs_id,
+                          peer_spec, self.secondary_fs_name)
+            self.add_directory(self.primary_fs_name, self.primary_fs_id,
+                               f'/{dir_name}')
+            added = True
+            yield peer_spec
+        finally:
+            try:
+                if added:
+                    self.remove_directory(self.primary_fs_name,
+                                          self.primary_fs_id, f'/{dir_name}')
+            finally:
+                self.disable_mirroring(self.primary_fs_name,
+                                       self.primary_fs_id)
+        # CephFSTestCase owns the source/destination filesystems and snapshots.
+
+    def _boundary_file_state(self, mount, path):
+        """Read a snapshot's bytes and the attributes Mirror must preserve."""
+        path = os.path.join(mount.hostfs_mntpt, path)
+        return json.loads(mount.run_python(f"""
+import hashlib
+import json
+import os
+import stat
+
+path = {path!r}
+s = os.stat(path)
+h = hashlib.sha256()
+with open(path, 'rb') as f:
+    for chunk in iter(lambda: f.read(1024 * 1024), b''):
+        h.update(chunk)
+print(json.dumps({{
+    'size': s.st_size, 'mtime_ns': s.st_mtime_ns,
+    'mode': stat.S_IMODE(s.st_mode), 'uid': s.st_uid, 'gid': s.st_gid,
+    'sha256': h.hexdigest(), 'ino': s.st_ino, 'ctime_ns': s.st_ctime_ns,
+}}))
+""", sudo=True, timeout=60))
+
+    def _boundary_assert_snapshot_file(self, dir_name, snap_name,
+                                       filename, peer_spec, snap_count):
+        self.check_peer_status(self.primary_fs_name, self.primary_fs_id,
+                               peer_spec, f'/{dir_name}', snap_name, snap_count)
+        path = f'{dir_name}/.snap/{snap_name}/{filename}'
+        source = self._boundary_file_state(self.mount_a, path)
+        target = self._boundary_file_state(self.mount_b, path)
+        for field in ('size', 'mtime_ns', 'mode', 'uid', 'gid', 'sha256'):
+            self.assertEqual(source[field], target[field],
+                             f'{path}: mismatched {field}')
+        return source
+
+    def test_cephfs_mirror_same_size_mtime_content_change(self):
+        """An equal-length rewrite must sync even after mtime is restored."""
+        dir_name = 'same_size_mtime'
+        with self._boundary_mirrored_directory(dir_name) as peer_spec:
+            path = os.path.join(self.mount_a.hostfs_mntpt, dir_name, 'file')
+            self.mount_a.run_python(f"""
+import os
+with open({path!r}, 'wb') as f:
+    f.write(b'A' * 65536)
+os.chmod({path!r}, 0o644)
+os.utime({path!r}, ns=(1600000000000000000, 1600000000000000000))
+""", sudo=True, timeout=60)
+            self.mount_a.run_shell(['mkdir', f'{dir_name}/.snap/before'])
+            before = self._boundary_assert_snapshot_file(
+                dir_name, 'before', 'file', peer_spec, 1)
+
+            self.mount_a.run_python(f"""
+import os
+path = {path!r}
+s = os.stat(path)
+with open(path, 'r+b') as f:
+    f.write(b'B' * 65536)
+os.utime(path, ns=(s.st_atime_ns, s.st_mtime_ns))
+""", sudo=True, timeout=60)
+            self.mount_a.run_shell(['mkdir', f'{dir_name}/.snap/after'])
+            after = self._boundary_file_state(
+                self.mount_a, f'{dir_name}/.snap/after/file')
+            self.assertEqual(before['size'], after['size'])
+            self.assertEqual(before['mtime_ns'], after['mtime_ns'])
+            self.assertEqual(hashlib.sha256(b'A' * 65536).hexdigest(),
+                             before['sha256'])
+            self.assertEqual(hashlib.sha256(b'B' * 65536).hexdigest(),
+                             after['sha256'])
+            self.assertNotEqual(before['sha256'], after['sha256'])
+            self._boundary_assert_snapshot_file(
+                dir_name, 'after', 'file', peer_spec, 2)
+            # Updating the destination must not mutate its previous snapshot.
+            previous_target = self._boundary_file_state(
+                self.mount_b, f'{dir_name}/.snap/before/file')
+            for field in ('size', 'mtime_ns', 'mode', 'uid', 'gid', 'sha256'):
+                self.assertEqual(before[field], previous_target[field], field)
+
+    def _test_cephfs_mirror_metadata_only_change(self, attribute):
+        dir_name = f'metadata_only_{attribute}'
+        with self._boundary_mirrored_directory(dir_name) as peer_spec:
+            path = os.path.join(self.mount_a.hostfs_mntpt, dir_name, 'file')
+            self.mount_a.run_python(f"""
+import os
+with open({path!r}, 'wb') as f:
+    f.write(b'unchanged data' * 4096)
+os.chmod({path!r}, 0o644)
+os.utime({path!r}, ns=(1600000000000000000, 1600000000000000000))
+""", sudo=True, timeout=60)
+            self.mount_a.run_shell(['mkdir', f'{dir_name}/.snap/before'])
+            before = self._boundary_assert_snapshot_file(
+                dir_name, 'before', 'file', peer_spec, 1)
+            if attribute == 'mode':
+                new_value = 0o600
+                change = f'os.chmod(path, {new_value})'
+            elif attribute == 'uid':
+                new_value = before['uid'] + 1
+                change = f'os.chown(path, {new_value}, -1)'
+            else:
+                self.assertEqual('gid', attribute)
+                new_value = before['gid'] + 1
+                change = f'os.chown(path, -1, {new_value})'
+            self.mount_a.run_python(f"""
+import os
+path = {path!r}
+{change}
+""", sudo=True, timeout=60)
+            self.mount_a.run_shell(['mkdir', f'{dir_name}/.snap/after'])
+            after = self._boundary_file_state(
+                self.mount_a, f'{dir_name}/.snap/after/file')
+            self.assertEqual(new_value, after[attribute])
+            self.assertNotEqual(before[attribute], after[attribute])
+            self.assertEqual(
+                hashlib.sha256(b'unchanged data' * 4096).hexdigest(),
+                after['sha256'])
+            for field in ('size', 'mtime_ns', 'sha256', 'mode', 'uid', 'gid'):
+                if field != attribute:
+                    self.assertEqual(before[field], after[field], field)
+            self._boundary_assert_snapshot_file(
+                dir_name, 'after', 'file', peer_spec, 2)
+
+    def test_cephfs_mirror_mode_only_change(self):
+        """chmod with unchanged size and mtime must reach the destination."""
+        self._test_cephfs_mirror_metadata_only_change('mode')
+
+    def test_cephfs_mirror_uid_only_change(self):
+        """chown of uid alone must not disappear from the incremental crawl."""
+        self._test_cephfs_mirror_metadata_only_change('uid')
+
+    def test_cephfs_mirror_gid_only_change(self):
+        """chown of gid alone must not disappear from the incremental crawl."""
+        self._test_cephfs_mirror_metadata_only_change('gid')
