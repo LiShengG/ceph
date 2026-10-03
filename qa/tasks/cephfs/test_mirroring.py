@@ -4543,3 +4543,177 @@ finally:
             finally:
                 writer.stdin.close()
                 run.wait([writer], timeout=30)
+                self.mount_a.background_procs.remove(writer)
+
+    def _boundary_inode_is_cached(self, inode, rank):
+        """Require an explicit cache miss; failed or empty replies are errors."""
+        proc = self.run_ceph_cmd(
+            'tell', f'mds.{self.primary_fs_id}:{rank}',
+            'dump', 'inode', hex(inode), '--format=json',
+            stdout=StringIO(), stderr=StringIO(), timeout=30)
+        output = proc.stdout.getvalue().strip()
+        diagnostic = proc.stderr.getvalue()
+        missing = 'dump inode failed, wrong inode number or the inode is not cached'
+        if missing in diagnostic:
+            self.assertIn(output, ('', '{}'))
+            return False
+        self.assertTrue(output, f'rank {rank}: empty inode dump without cache miss')
+        data = json.loads(output)
+        self.assertIsInstance(data, dict)
+        self.assertIn('path', data, f'rank {rank}: malformed inode dump')
+        return True
+
+    def _test_cephfs_mirror_relinked_hardlink_multimds(self, migrate):
+        """Exercise a remote hardlink with both historical inode versions."""
+        primary_dir = 'external_primary'
+        dir_name = 'relinked_migrate' if migrate else 'relinked_cold'
+        primary = f'{primary_dir}/file'
+        link = f'{dir_name}/link'
+        self.fs.set_max_mds(2)
+        status = self.fs.wait_for_daemons(timeout=120)
+        ranks_before = {rank: self.fs.get_rank(rank, status=status)['gid']
+                        for rank in (0, 1)}
+        # The cache-drop test isolates discovery/full copy.  Migration also
+        # exercises blockdiff against a remote inode larger than its threshold.
+        self.config_set('client.mirror', 'cephfs_mirror_blockdiff_min_file_size',
+                        0 if migrate else 128 * 1024 * 1024)
+        with self._boundary_mirrored_directory(dir_name) as peer_spec:
+            self.mount_a.run_shell(['mkdir', primary_dir])
+            self.mount_a.setfattr(primary_dir, 'ceph.dir.pin', '0')
+            self.mount_a.setfattr(dir_name, 'ceph.dir.pin', '1')
+            primary_path = os.path.join(self.mount_a.hostfs_mntpt, primary)
+            self.mount_a.run_python(f"""
+import os
+with open({primary_path!r}, 'wb') as f:
+    for _ in range(64):
+        f.write(b'A' * (1024 * 1024))
+os.utime({primary_path!r}, ns=(1600000000000000000, 1600000000000000000))
+""", sudo=True, timeout=120)
+            self.mount_a.run_shell(['ln', primary, link])
+            # Empty directories are not exported: populate both directories
+            # before waiting for their pins to establish separate authorities.
+            for path, rank in ((primary_dir, 0), (dir_name, 1)):
+                self._wait_subtrees([(f'/{path}', rank)], status=status,
+                                    rank=rank, path=f'/{path}', timeout=60)
+            inode = self.mount_a.path_to_ino(primary)
+            self.assertEqual(inode, self.mount_a.path_to_ino(link))
+            self.mount_a.run_shell(['mkdir', f'{dir_name}/.snap/before'])
+            before = self._boundary_assert_snapshot_file(
+                dir_name, 'before', 'link', peer_spec, 1)
+
+            def expected_digest(byte):
+                h = hashlib.sha256()
+                for block in range(64):
+                    h.update((byte if block == 32 else b'A') * (1024 * 1024))
+                return h.hexdigest()
+
+            self.assertEqual(expected_digest(b'A'), before['sha256'])
+            self.assertTrue(self._boundary_inode_is_cached(inode, 0),
+                            'source inode dump did not find the auth inode')
+            peer_uuid = self.get_peer_uuid(peer_spec)
+            stopped = False
+            unmounted = False
+            try:
+                # Do not let the replayer inspect the new versions until the
+                # intended cache/migration precondition has been established.
+                pid = self.get_mirror_daemon_pid()
+                self.stop_mirror_daemon()
+                stopped = True
+                self.wait_for_mirror_daemon_stop(pid)
+                self.mount_a.run_shell(['rm', link])
+                self.mount_a.run_shell(['ln', primary, link])
+                self.assertEqual(inode, self.mount_a.path_to_ino(primary))
+                self.assertEqual(inode, self.mount_a.path_to_ino(link))
+                for snap_name, byte, mtime in (
+                        ('after', b'B', 1600000002000000000),
+                        ('head_changed', b'C', 1600000004000000000)):
+                    self.mount_a.run_python(f"""
+import os
+path = {primary_path!r}
+with open(path, 'r+b') as f:
+    f.seek(32 * 1024 * 1024)
+    f.write({byte!r} * (1024 * 1024))
+os.utime(path, ns=({mtime}, {mtime}))
+""", sudo=True, timeout=120)
+                    self.mount_a.run_shell(
+                        ['mkdir', f'{dir_name}/.snap/{snap_name}'])
+                    source = self._boundary_file_state(
+                        self.mount_a, f'{dir_name}/.snap/{snap_name}/link')
+                    self.assertEqual(before['size'], source['size'])
+                    self.assertEqual(expected_digest(byte), source['sha256'])
+                    self.assertNotEqual(before['mtime_ns'], source['mtime_ns'])
+                # after is now a historical inode version, not head.
+                if migrate:
+                    # Swap the authority of both directories after snapshots:
+                    # the inode remains remote from the mirrored dentry.
+                    self.mount_a.setfattr(primary_dir, 'ceph.dir.pin', '1')
+                    self.mount_a.setfattr(dir_name, 'ceph.dir.pin', '0')
+                    for path, rank in ((primary_dir, 1), (dir_name, 0)):
+                        self._wait_subtrees([(f'/{path}', rank)], rank=rank,
+                                            path=f'/{path}', timeout=60)
+                    self.mount_a.remount()
+                else:
+                    self.mount_a.umount_wait()
+                    unmounted = True
+                    # Removing replicas may require multiple rounds.  Dumping
+                    # an inode looks only in cache and does not reload it.
+                    for attempt in range(4):
+                        for rank in (1, 0):
+                            result = self.fs.rank_tell(['cache', 'drop', '15'],
+                                                       rank=rank, timeout=120)
+                            self.assertEqual(
+                                0, result['client_recall']['return_code'])
+                            self.assertEqual(
+                                0, result['flush_journal']['return_code'])
+                        cached = [self._boundary_inode_is_cached(inode, rank)
+                                  for rank in (0, 1)]
+                        if not any(cached):
+                            break
+                    self.assertFalse(any(cached),
+                                     'hardlink inode remained cached on an MDS')
+                    self.mount_a.mount_wait(cephfs_name=self.primary_fs_name)
+                    unmounted = False
+                    # Do not touch either file on the source client before
+                    # Mirror opens the cold remote inode on its own client.
+                self.start_mirror_daemon()
+                stopped = False
+                self.wait_for_mirror_daemon_recovery(
+                    self.primary_fs_name, self.primary_fs_id,
+                    f'/{dir_name}', peer_uuid)
+                # Session counters reset on restart; two new snapshots follow
+                # the destination's persisted baseline snapshot.
+                self.check_peer_status(self.primary_fs_name, self.primary_fs_id,
+                                       peer_spec, f'/{dir_name}', 'head_changed', 2)
+                for snap_name, byte in (('before', b'A'), ('after', b'B'),
+                                       ('head_changed', b'C')):
+                    source = self._boundary_file_state(
+                        self.mount_a, f'{dir_name}/.snap/{snap_name}/link')
+                    target = self._boundary_file_state(
+                        self.mount_b, f'{dir_name}/.snap/{snap_name}/link')
+                    self.assertEqual(expected_digest(byte), source['sha256'])
+                    for field in ('size', 'mtime_ns', 'mode', 'uid', 'gid',
+                                  'sha256'):
+                        self.assertEqual(source[field], target[field],
+                                         f'{snap_name}: mismatched {field}')
+                self.assertEqual(inode, self.mount_a.path_to_ino(primary))
+                self.assertEqual(inode, self.mount_a.path_to_ino(link))
+                for rank, gid in ranks_before.items():
+                    self.assertEqual(gid, self.fs.get_rank(rank)['gid'],
+                                     f'MDS rank {rank} restarted during sync')
+                self.mount_b.run_shell(['test', '!', '-e', primary_dir])
+            finally:
+                if unmounted:
+                    self.mount_a.mount_wait(cephfs_name=self.primary_fs_name)
+                if stopped:
+                    self.start_mirror_daemon()
+                    self.wait_for_mirror_daemon_recovery(
+                        self.primary_fs_name, self.primary_fs_id,
+                        f'/{dir_name}', peer_uuid)
+
+    def test_cephfs_mirror_relinked_hardlink_multimds_cache_drop(self):
+        """Relinking must survive cold auth/replica inode caches on two MDSs."""
+        self._test_cephfs_mirror_relinked_hardlink_multimds(migrate=False)
+
+    def test_cephfs_mirror_relinked_hardlink_multimds_migration(self):
+        """Relinking and blockdiff must survive a swap of subtree authority."""
+        self._test_cephfs_mirror_relinked_hardlink_multimds(migrate=True)
