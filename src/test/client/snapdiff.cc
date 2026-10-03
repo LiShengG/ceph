@@ -93,6 +93,11 @@ TEST_F(TestClient, SnapDiffOversizedSameNameGroup) {
       ASSERT_EQ(0, client->mksnap(dir.c_str(), "empty", myperm));
     }
   }
+  // Drop the writer's caps before reading. A cached xattr version can
+  // otherwise omit the large xattr blob and let both versions fit.
+  TearDown();
+  SetUp();
+  ASSERT_TRUE(client->is_mounted());
   ASSERT_EQ(0, client->opendir((dir + "/.snap/before").c_str(), &before, myperm));
   ASSERT_EQ(0, client->opendir((dir + "/.snap/empty").c_str(), &empty, myperm));
   ASSERT_EQ(0, client->opendir((dir + "/.snap/after").c_str(), &after, myperm));
@@ -181,6 +186,13 @@ TEST_F(TestClient, SnapDiffSameNameRollbackResume) {
   ASSERT_EQ(0, client->setxattr(replacement.c_str(), "user.big", xattr.data(),
                               xattr.size(), 0, myperm));
   ASSERT_EQ(0, client->mksnap(dir.c_str(), "after", myperm));
+  ASSERT_EQ(0, client->closedir(head));
+  head = nullptr;
+  // Force both versions to carry their xattrs in the reply, independently
+  // of capabilities retained while preparing the replacement inode.
+  TearDown();
+  SetUp();
+  ASSERT_TRUE(client->is_mounted());
   ASSERT_EQ(0, client->opendir((dir + "/.snap/before").c_str(), &before, myperm));
   ASSERT_EQ(0, client->opendir((dir + "/.snap/after").c_str(), &after, myperm));
 
@@ -206,8 +218,9 @@ TEST_F(TestClient, SnapDiffSameNameRollbackResume) {
     for (const auto& entry : before->buffer)
       entries.emplace(entry.name, entry.inode->snapid);
   }
-  if (r == -ERANGE || r == -E2BIG || before->buffer.empty())
+  if (r == -ERANGE || r == -E2BIG || before->buffer.empty()) {
     EXPECT_EQ(cursor, before->last_name);
+  }
   if (r != 0 || before->buffer.empty() || before->next_offset > 2u) {
     ASSERT_EQ(0, client->read_snapdiff_page(before, after->inode->snapid, 16384));
     count += before->buffer.size();
