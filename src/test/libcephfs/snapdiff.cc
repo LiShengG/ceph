@@ -13,6 +13,7 @@
  */
 
 #include "include/interval_set.h"
+#include "include/scope_guard.h"
 #include "gtest/gtest.h"
 #include "include/cephfs/libcephfs.h"
 #include "include/stat.h"
@@ -2784,6 +2785,184 @@ TEST(LibCephFS, BlockDiffPartialTruncateThenSparseRegrow)
   ASSERT_EQ(0, test_mount.purge_dir(""));
   ASSERT_EQ(0, test_mount.rmsnap("snap1"));
   ASSERT_EQ(0, test_mount.rmsnap("snap2"));
+}
+
+TEST(LibCephFS, BlockDiffStripedTruncateRegrowBoundaries)
+{
+  TestMount test_mount("BlockDiffStripedTruncateRegrowBoundaries");
+  auto* cmount = test_mount.get_cmount();
+  constexpr auto scan_option = "client_file_blockdiff_max_concurrent_object_scans";
+  char original_scans[32];
+  ASSERT_EQ(0, ceph_conf_get(cmount, scan_option,
+                           original_scans, sizeof(original_scans)));
+  auto restore_scans = make_scope_guard([&] {
+    EXPECT_EQ(0, ceph_conf_set(cmount, scan_option, original_scans));
+  });
+  // The MDS takes the minimum of its own limit and this request limit.
+  // Both options have min: 1; no invalid zero-scan request is needed.
+  ASSERT_EQ(0, ceph_conf_set(cmount, scan_option, "1"));
+
+  constexpr uint64_t stripe_unit = 64 * 1024;
+  constexpr uint64_t stripe_count = 3;
+  constexpr uint64_t object_size = 4 * stripe_unit;
+  constexpr uint64_t stripe_set = object_size * stripe_count;
+  constexpr uint64_t full_size = 2 * stripe_set + 1;
+  const std::vector<uint64_t> boundaries = {
+    stripe_unit - 1, stripe_unit, stripe_unit + 1,
+    object_size - 1, object_size, object_size + 1,
+    stripe_set - 1, stripe_set, stripe_set + 1};
+  struct BoundaryCase {
+    uint64_t old_size;
+    uint64_t cut;
+    uint64_t new_size;
+    bool write_tail;
+  };
+  std::vector<BoundaryCase> cases = {
+    {0, 0, 0, false}, // both snapshots empty
+    {full_size, 0, 0, false}, // empty newer snapshot: no readable extents
+    {full_size, 0, full_size, false}, // truncate every object, then sparse regrow
+    {0, 0, stripe_set + 1, true}}; // no old objects, grow across a stripe set
+  for (auto boundary : boundaries) {
+    // Clear an old object tail, preserve the inode size, and split its
+    // mapped file ranges across separate one-object scan replies.
+    cases.push_back({full_size, boundary, full_size, false});
+    // Also move EOF to each boundary. Bytes after the intermediate cut
+    // become zero, including a partially retained last object.
+    cases.push_back({full_size, boundary / 2, boundary, false});
+  }
+  cases.push_back({stripe_set - 1, stripe_unit + 1, stripe_set + 1, true});
+  cases.push_back({stripe_set + 1, stripe_unit - 1, 2 * stripe_set + 1, true});
+
+  ASSERT_EQ(0, test_mount.mkdir("files"));
+  ASSERT_EQ(0, test_mount.setxattr("files", "ceph.dir.pin", "0"));
+  for (size_t case_index = 0; case_index < cases.size(); ++case_index) {
+    const auto& c = cases[case_index];
+    SCOPED_TRACE("case=" + std::to_string(case_index) +
+                 " old=" + std::to_string(c.old_size) +
+                 " cut=" + std::to_string(c.cut) +
+                 " new=" + std::to_string(c.new_size));
+    const auto relpath = "files/f" + std::to_string(case_index);
+    const auto path = test_mount.make_file_path(relpath.c_str());
+    test_mount.set_striped_layout(relpath.c_str(), stripe_unit,
+                                  stripe_count, object_size);
+    ASSERT_FALSE(HasFatalFailure());
+    if (case_index == 0)
+      ASSERT_TRUE(test_mount.wait_for_subtree_on_rank("files", "0"));
+
+    int fd = ceph_open(cmount, path.c_str(), O_WRONLY, 0);
+    ASSERT_GE(fd, 0);
+    auto close_fd = make_scope_guard([&] { EXPECT_EQ(0, ceph_close(cmount, fd)); });
+    const std::string before_bytes(c.old_size, 's');
+    ASSERT_EQ(static_cast<int>(before_bytes.size()),
+              ceph_write(cmount, fd, before_bytes.data(), before_bytes.size(), 0));
+    ASSERT_EQ(0, ceph_fsync(cmount, fd, 0));
+    bool have_before = false;
+    bool have_after = false;
+    auto remove_snaps = make_scope_guard([&] {
+      if (have_before)
+        EXPECT_EQ(0, test_mount.rmsnap("before"));
+      if (have_after)
+        EXPECT_EQ(0, test_mount.rmsnap("after"));
+    });
+    ASSERT_EQ(0, test_mount.mksnap("before"));
+    have_before = true;
+    ASSERT_EQ(0, ceph_ftruncate(cmount, fd, c.cut));
+    ASSERT_EQ(0, ceph_ftruncate(cmount, fd, c.new_size));
+    std::string after_bytes(c.new_size, '\0');
+    std::fill_n(after_bytes.begin(), std::min(c.cut, c.new_size), 's');
+    if (c.write_tail) {
+      ASSERT_GT(c.new_size, 0u);
+      ASSERT_EQ(1, ceph_write(cmount, fd, "n", 1, c.new_size - 1));
+      after_bytes.back() = 'n';
+    }
+    ASSERT_EQ(0, ceph_fsync(cmount, fd, 0));
+    ASSERT_EQ(0, test_mount.mksnap("after"));
+    have_after = true;
+
+    // Independent byte oracle: verify what was actually captured in each
+    // snapshot before comparing the diff. Old bytes beyond the new EOF
+    // require truncation, not a readable data extent.
+    std::string snapshot_bytes;
+    const auto before_path = test_mount.concat_path(
+      test_mount.make_snap_path("before"), relpath);
+    const auto after_path = test_mount.concat_path(
+      test_mount.make_snap_path("after"), relpath);
+    ASSERT_EQ(static_cast<int>(c.old_size),
+              test_mount.read_range(before_path.c_str(), 0, c.old_size, &snapshot_bytes));
+    ASSERT_TRUE(before_bytes == snapshot_bytes)
+      << "older snapshot does not match the prepared bytes";
+    ASSERT_EQ(static_cast<int>(c.new_size),
+              test_mount.read_range(after_path.c_str(), 0, c.new_size, &snapshot_bytes));
+    ASSERT_TRUE(after_bytes == snapshot_bytes)
+      << "newer snapshot does not match the truncate/regrow oracle";
+    interval_set<uint64_t> required;
+    for (uint64_t off = 0; off < c.new_size;) {
+      const auto different = [&](uint64_t at) {
+        const char old_byte = at < c.old_size ? before_bytes[at] : '\0';
+        return old_byte != after_bytes[at];
+      };
+      if (!different(off)) {
+        ++off;
+        continue;
+      }
+      const auto start = off++;
+      while (off < c.new_size && different(off))
+        ++off;
+      required.union_insert(start, off - start);
+    }
+
+    ceph_file_blockdiff_info info{};
+    const auto before_name = test_mount.make_snap_name("before");
+    const auto after_name = test_mount.make_snap_name("after");
+    const auto root = test_mount.make_file_path("");
+    ASSERT_EQ(0, ceph_file_blockdiff_init(cmount, root.c_str(), relpath.c_str(),
+                                         before_name.c_str(), after_name.c_str(), &info));
+    auto finish_diff = make_scope_guard([&] {
+      EXPECT_EQ(0, ceph_file_blockdiff_finish(&info));
+    });
+    interval_set<uint64_t> actual;
+    std::string replayed = before_bytes;
+    replayed.resize(c.new_size, '\0');
+    int r = 1;
+    unsigned calls = 0;
+    // This layout uses at most seven objects in either snapshot. Include
+    // the terminal reply, and cap requests so a stuck cursor fails finitely.
+    constexpr unsigned max_calls = 16;
+    while (r > 0 && calls < max_calls) {
+      ceph_file_blockdiff_changedblocks blocks{};
+      auto free_blocks = make_scope_guard([&] {
+        ceph_free_file_blockdiff_buffer(&blocks);
+      });
+      r = ceph_file_blockdiff(&info, &blocks);
+      ++calls;
+      ASSERT_GE(r, 0);
+      ASSERT_LE(r, 1);
+      ASSERT_TRUE(blocks.num_blocks == 0 || blocks.b != nullptr);
+      for (uint64_t i = 0; i < blocks.num_blocks; ++i) {
+        const auto& block = blocks.b[i];
+        ASSERT_GT(block.len, 0u);
+        ASSERT_LT(block.offset, c.new_size);
+        ASSERT_LE(block.len, c.new_size - block.offset)
+          << "extent exceeds the newer snapshot EOF";
+        actual.union_insert(block.offset, block.len);
+        replayed.replace(block.offset, block.len,
+                         after_bytes, block.offset, block.len);
+      }
+    }
+    ASSERT_EQ(0, r) << "blockdiff cursor did not terminate within " << max_calls << " replies";
+    if (std::min(c.old_size, c.new_size) > stripe_unit)
+      EXPECT_GT(calls, 1u) << "one-object request limit did not exercise multiple replies";
+    EXPECT_TRUE(required.subset_of(actual))
+      << "missing changed bytes; required=" << required << " actual=" << actual;
+    // Conservative unchanged extents are permitted by blockdiff's API.
+    // They must still be nonempty, stay within EOF, and replay correctly.
+    interval_set<uint64_t> readable;
+    if (c.new_size)
+      readable.insert(0, c.new_size);
+    EXPECT_TRUE(actual.subset_of(readable)) << "invalid extra extents=" << actual;
+    EXPECT_TRUE(after_bytes == replayed)
+      << "replaying the reported extents left different bytes";
+  }
 }
 
 TEST(LibCephFS, SnapDiffDeletionRecreation) {
