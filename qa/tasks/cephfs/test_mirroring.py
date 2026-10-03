@@ -4466,3 +4466,80 @@ path = {path!r}
     def test_cephfs_mirror_gid_only_change(self):
         """chown of gid alone must not disappear from the incremental crawl."""
         self._test_cephfs_mirror_metadata_only_change('gid')
+
+
+    def test_cephfs_mirror_snapshot_with_open_writer(self):
+        """Write then snapshot while the same writer retains its open fd.
+
+        There is no fsync, close, sync or mtime setattr between the rewrite
+        and snapshot creation.  Mirror reads through its independent client.
+        The source snapshot is inspected only after Mirror reports completion;
+        that read may naturally flush caps, so it must not precede the crawl.
+        """
+        dir_name = 'open_writer_snapshots'
+        with self._boundary_mirrored_directory(dir_name) as peer_spec:
+            path = os.path.join(self.mount_a.hostfs_mntpt, dir_name, 'file')
+            snapdir = os.path.join(self.mount_a.hostfs_mntpt, dir_name, '.snap')
+            self.mount_a.run_python(f"""
+with open({path!r}, 'wb') as f:
+    f.write(b'A' * 65536)
+""", sudo=True, timeout=60)
+            self.mount_a.run_shell(['mkdir', f'{dir_name}/.snap/before'])
+            before = self._boundary_assert_snapshot_file(
+                dir_name, 'before', 'file', peer_spec, 1)
+            self.assertEqual(hashlib.sha256(b'A' * 65536).hexdigest(),
+                             before['sha256'])
+
+            writer = self.mount_a._run_python(f"""
+import json
+import os
+import sys
+
+fd = os.open({path!r}, os.O_RDWR)
+print('writer-open', flush=True)
+try:
+    for command in sys.stdin:
+        snap_name, byte = json.loads(command)
+        data = byte.encode('ascii') * 65536
+        offset = 0
+        while offset < len(data):
+            n = os.pwrite(fd, data[offset:], offset)
+            assert n > 0
+            offset += n
+        os.mkdir(os.path.join({snapdir!r}, snap_name))
+        print('snapshot-ready:' + snap_name, flush=True)
+finally:
+    os.close(fd)
+""", sudo=True, timeout=2400)
+            self.mount_a.background_procs.append(writer)
+            try:
+                self.wait_until_true(
+                    lambda: 'writer-open' in writer.stdout.getvalue(),
+                    timeout=30, period=0.1)
+                previous_digest = before['sha256']
+                for count, byte in enumerate(('B', 'C', 'D'), start=2):
+                    snap_name = f'write_{count}'
+                    writer.stdin.write(json.dumps([snap_name, byte]) + '\n')
+                    writer.stdin.flush()
+                    self.wait_until_true(
+                        lambda: f'snapshot-ready:{snap_name}' in
+                        writer.stdout.getvalue(), timeout=30, period=0.1)
+                    self.assertFalse(writer.finished,
+                                     'writer closed before snapshot sync')
+                    # Wait before reading the source snapshot: do not mask a
+                    # stale mtime in the MDS with an early oracle read.
+                    source = self._boundary_assert_snapshot_file(
+                        dir_name, snap_name, 'file', peer_spec, count)
+                    expected = hashlib.sha256(
+                        byte.encode('ascii') * 65536).hexdigest()
+                    self.assertEqual(expected, source['sha256'])
+                    self.assertEqual(before['size'], source['size'])
+                    self.assertNotEqual(previous_digest, source['sha256'])
+                    self.assertFalse(writer.finished)
+                    previous_digest = source['sha256']
+                previous_target = self._boundary_file_state(
+                    self.mount_b, f'{dir_name}/.snap/before/file')
+                self.assertEqual(before['sha256'], previous_target['sha256'])
+            finally:
+                writer.stdin.close()
+                run.wait([writer], timeout=30)
