@@ -4933,3 +4933,126 @@ with open(path, 'wb') as stream:
 
     def test_cephfs_mirror_directory_to_file_sigkill_during_copy(self):
         self._test_cephfs_mirror_replacement_sigkill('directory_to_file', 'copy')
+
+    def _test_cephfs_mirror_snapshot_identity_changed_during_open(self, mutation):
+        """A selected snapshot name must not silently resolve to another ID."""
+        from tasks.cephfs.mirror_boundary_faults import (
+            MirrorBoundaryFaults, snapshot_info, tree_manifest)
+
+        self.setup_mount_b(mds_perm='rw')
+        peer_spec = 'client.mirror_remote@ceph'
+        directory = f'snapshot_identity_{mutation}'
+        with MirrorBoundaryFaults(self) as faults:
+            faults.set_config('cephfs_mirror_max_consecutive_failures_per_directory', 1)
+            faults.set_config('cephfs_mirror_retry_failed_directories_interval', 3600)
+            self.enable_mirroring(self.primary_fs_name, self.primary_fs_id)
+            self.peer_add(self.primary_fs_name, self.primary_fs_id, peer_spec,
+                          self.secondary_fs_name)
+            self.mount_a.run_shell(['mkdir', directory])
+            self.mount_a.write_file(f'{directory}/payload', data='baseline contents')
+            self.mount_a.write_file(f'{directory}/baseline-only', data='remove in current')
+            self.add_directory(self.primary_fs_name, self.primary_fs_id, f'/{directory}')
+            self.mount_a.run_shell(['sync'])
+            self.mount_a.run_shell(['mkdir', f'{directory}/.snap/base'])
+            self.check_peer_status_idle(self.primary_fs_name, self.primary_fs_id,
+                                        peer_spec, f'/{directory}', 'base', 1)
+            baseline = tree_manifest(self.mount_a, f'{directory}/.snap/base')
+            self.assertEqual(baseline, tree_manifest(self.mount_b, f'{directory}/.snap/base'))
+
+            self.mount_a.run_shell(['rm', f'{directory}/baseline-only'])
+            self.mount_a.write_file(f'{directory}/payload', data='selected snapshot contents')
+            self.mount_a.write_file(f'{directory}/selected-only', data='old selected ID')
+            self.mount_a.run_shell(['sync'])
+            # Recreate after the real open but before open_dir's snap_info ID
+            # check. Rename/delete before open, after do_sync_snaps selected ID.
+            operation = 'after_open' if mutation == 'recreate' else 'before_open'
+            current_path = f'/{directory}/.snap/current'
+            faults.arm(operation, current_path)
+            faults.arm('mksnap', current_path)
+            self.mount_a.run_shell(['mkdir', f'{directory}/.snap/current'])
+            faults.wait_hit(operation)
+            original = snapshot_info(self, self.mount_a, self.primary_fs_name,
+                                     directory, 'current')
+            original_manifest = tree_manifest(self.mount_a, f'{directory}/.snap/current')
+            self.assertNotIn('current', self.mount_b.ls(path=f'{directory}/.snap'))
+
+            if mutation == 'rename':
+                self.mount_a.run_shell(['mv', f'{directory}/.snap/current',
+                                        f'{directory}/.snap/renamed'])
+                renamed = snapshot_info(self, self.mount_a, self.primary_fs_name,
+                                        directory, 'renamed')
+                self.assertEqual(original['id'], renamed['id'])
+                self.assertEqual(original_manifest,
+                                 tree_manifest(self.mount_a, f'{directory}/.snap/renamed'))
+                expected_snapshots = ('base', 'renamed', 'successor')
+            else:
+                self.mount_a.run_shell(['rmdir', f'{directory}/.snap/current'])
+                expected_snapshots = ('base', 'successor')
+                if mutation == 'recreate':
+                    self.mount_a.run_shell(['rm', f'{directory}/selected-only'])
+                    self.mount_a.write_file(f'{directory}/payload',
+                                            data='new ID under the same snapshot name')
+                    self.mount_a.write_file(f'{directory}/recreated-only', data='new selected ID')
+                    self.mount_a.run_shell(['sync'])
+                    self.mount_a.run_shell(['mkdir', f'{directory}/.snap/current'])
+                    recreated = snapshot_info(self, self.mount_a, self.primary_fs_name,
+                                              directory, 'current')
+                    self.assertGreater(recreated['id'], original['id'])
+                    self.assertNotEqual(original_manifest,
+                                        tree_manifest(self.mount_a, f'{directory}/.snap/current'))
+                    expected_snapshots = ('base', 'current', 'successor')
+
+            # A later snapshot with distinct contents checks both convergence
+            # after the failed attempt and that no transfer accidentally reads head.
+            self.mount_a.write_file(f'{directory}/payload', data='successor snapshot contents')
+            self.mount_a.write_file(f'{directory}/successor-only', data='latest snapshot')
+            self.mount_a.run_shell(['sync'])
+            self.mount_a.run_shell(['mkdir', f'{directory}/.snap/successor'])
+            faults.release(operation)
+            peer_uuid = self.get_peer_uuid(peer_spec)
+            faults.wait_failed_or_snapshot(f'/{directory}', peer_uuid)
+            self.assertFalse(faults.hit('mksnap'),
+                             'the old selected ID must not commit after its name changed identity')
+            status = self.dir_status_from_asok(self.primary_fs_name, self.primary_fs_id,
+                                              f'/{directory}', peer_uuid)
+            self.assertEqual('failed', status['state'])
+            self.assertEqual('base', status['last_synced_snap']['name'])
+            self.assertEqual(1, status['snaps_synced'])
+            self.assertEqual(['base'], sorted(self.mount_b.ls(path=f'{directory}/.snap')))
+
+            faults.disarm('mksnap')
+            faults.restart()
+            self.wait_for_mirror_daemon_recovery(
+                self.primary_fs_name, self.primary_fs_id, f'/{directory}', peer_uuid)
+            self.check_peer_status_after_sigkill_recovery(
+                self.primary_fs_name, self.primary_fs_id, peer_spec,
+                f'/{directory}', 'successor', expected_snap_count=len(expected_snapshots) - 1)
+            self.assertEqual(sorted(expected_snapshots),
+                             sorted(self.mount_b.ls(path=f'{directory}/.snap')))
+            for name in expected_snapshots:
+                self.assertEqual(tree_manifest(self.mount_a, f'{directory}/.snap/{name}'),
+                                 tree_manifest(self.mount_b, f'{directory}/.snap/{name}'))
+                source_info = snapshot_info(self, self.mount_a, self.primary_fs_name,
+                                            directory, name)
+                remote_info = snapshot_info(self, self.mount_b, self.secondary_fs_name,
+                                            directory, name)
+                self.assertEqual(str(source_info['id']),
+                                 remote_info['metadata']['primary_snap_id'])
+            if mutation == 'recreate':
+                remote_info = snapshot_info(self, self.mount_b, self.secondary_fs_name,
+                                            directory, 'current')
+                self.assertNotEqual(str(original['id']),
+                                    remote_info['metadata']['primary_snap_id'])
+            self.assertEqual(baseline, tree_manifest(self.mount_b, f'{directory}/.snap/base'))
+            self.remove_directory(self.primary_fs_name, self.primary_fs_id,
+                                  f'/{directory}')
+            self.disable_mirroring(self.primary_fs_name, self.primary_fs_id)
+
+    def test_cephfs_mirror_snapshot_rename_between_selection_and_open(self):
+        self._test_cephfs_mirror_snapshot_identity_changed_during_open('rename')
+
+    def test_cephfs_mirror_snapshot_delete_between_selection_and_open(self):
+        self._test_cephfs_mirror_snapshot_identity_changed_during_open('delete')
+
+    def test_cephfs_mirror_snapshot_recreate_between_open_and_identity_check(self):
+        self._test_cephfs_mirror_snapshot_identity_changed_during_open('recreate')
