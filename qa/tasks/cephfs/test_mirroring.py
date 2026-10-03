@@ -4490,16 +4490,39 @@ with open({path!r}, 'wb') as f:
             self.assertEqual(hashlib.sha256(b'A' * 65536).hexdigest(),
                              before['sha256'])
 
-            writer = self.mount_a._run_python(f"""
+            control_dir = self.mount_a.run_python("""
+import tempfile
+print(tempfile.mkdtemp(prefix='cephfs-mirror-open-writer-', dir='/tmp'))
+""", sudo=True, timeout=30)
+            writer = None
+            try:
+                writer = self.mount_a._run_python(f"""
 import json
 import os
-import sys
+import time
+
+control = {control_dir!r}
+stop = os.path.join(control, 'stop')
+deadline = time.monotonic() + 2400
+
+def wait_for_file(path):
+    while not os.path.exists(path):
+        if os.path.exists(stop):
+            return False
+        if time.monotonic() >= deadline:
+            raise RuntimeError('writer control deadline expired')
+        time.sleep(0.01)
+    return True
 
 fd = os.open({path!r}, os.O_RDWR)
-print('writer-open', flush=True)
 try:
-    for command in sys.stdin:
-        snap_name, byte = json.loads(command)
+    open(os.path.join(control, 'writer-open'), 'w').close()
+    for count in range(2, 5):
+        command = os.path.join(control, 'command_' + str(count))
+        if not wait_for_file(command):
+            break
+        with open(command) as f:
+            snap_name, byte = json.load(f)
         data = byte.encode('ascii') * 65536
         offset = 0
         while offset < len(data):
@@ -4507,23 +4530,37 @@ try:
             assert n > 0
             offset += n
         os.mkdir(os.path.join({snapdir!r}, snap_name))
-        print('snapshot-ready:' + snap_name, flush=True)
+        open(os.path.join(control, 'ready_' + str(count)), 'w').close()
+    wait_for_file(stop)
 finally:
     os.close(fd)
-""", sudo=True, timeout=2400)
-            self.mount_a.background_procs.append(writer)
-            try:
-                self.wait_until_true(
-                    lambda: 'writer-open' in writer.stdout.getvalue(),
-                    timeout=30, period=0.1)
+""", sudo=True, timeout=15)
+                self.mount_a.background_procs.append(writer)
+
+                def wait_control(name):
+                    marker = os.path.join(control_dir, name)
+                    self.wait_until_true(
+                        lambda: self.mount_a.run_shell(
+                            ['sudo', 'test', '-e', marker],
+                            check_status=False, timeout=5).returncode == 0,
+                        timeout=30, period=0.1)
+
+                # Host /tmp files work with both SSH and vstart processes:
+                # neither live stdout buffering nor stdin's type is involved.
+                wait_control('writer-open')
                 previous_digest = before['sha256']
                 for count, byte in enumerate(('B', 'C', 'D'), start=2):
                     snap_name = f'write_{count}'
-                    writer.stdin.write(json.dumps([snap_name, byte]) + '\n')
-                    writer.stdin.flush()
-                    self.wait_until_true(
-                        lambda: f'snapshot-ready:{snap_name}' in
-                        writer.stdout.getvalue(), timeout=30, period=0.1)
+                    command = os.path.join(control_dir, f'command_{count}')
+                    self.mount_a.run_python(f"""
+import json
+import os
+path = {command!r}
+with open(path + '.tmp', 'w') as f:
+    json.dump([{snap_name!r}, {byte!r}], f)
+os.replace(path + '.tmp', path)
+""", sudo=True, timeout=30)
+                    wait_control(f'ready_{count}')
                     self.assertFalse(writer.finished,
                                      'writer closed before snapshot sync')
                     # Wait before reading the source snapshot: do not mask a
@@ -4541,9 +4578,20 @@ finally:
                     self.mount_b, f'{dir_name}/.snap/before/file')
                 self.assertEqual(before['sha256'], previous_target['sha256'])
             finally:
-                writer.stdin.close()
-                run.wait([writer], timeout=30)
-                self.mount_a.background_procs.remove(writer)
+                try:
+                    if writer is not None:
+                        try:
+                            self.mount_a.run_shell(
+                                ['sudo', 'touch', os.path.join(control_dir, 'stop')],
+                                timeout=30)
+                        finally:
+                            # EOF also bounds recovery if the writer stalls.
+                            writer.stdin.close()
+                            run.wait([writer], timeout=30)
+                            self.mount_a.background_procs.remove(writer)
+                finally:
+                    self.mount_a.run_shell(
+                        ['sudo', 'rm', '-rf', control_dir], timeout=30)
 
     def _boundary_inode_is_cached(self, inode, rank):
         """Require an explicit cache miss; failed or empty replies are errors."""
@@ -4563,6 +4611,22 @@ finally:
         self.assertIn('path', data, f'rank {rank}: malformed inode dump')
         return True
 
+    def _boundary_set_mirror_blockdiff_threshold(self, value):
+        section = 'client.mirror'
+        option = 'cephfs_mirror_blockdiff_min_file_size'
+        config = json.loads(self.get_ceph_cmd_stdout(
+            'config', 'dump', '--format=json'))
+        overrides = [entry for entry in config
+                     if entry['section'] == section and entry['name'] == option
+                     and not entry.get('mask')]
+        self.assertLessEqual(len(overrides), 1)
+        if overrides:
+            self.addCleanup(self.config_set, section, option,
+                            overrides[0]['value'])
+        else:
+            self.addCleanup(self.config_rm, section, option)
+        self.config_set(section, option, value)
+
     def _test_cephfs_mirror_relinked_hardlink_multimds(self, migrate):
         """Exercise a remote hardlink with both historical inode versions."""
         primary_dir = 'external_primary'
@@ -4575,8 +4639,8 @@ finally:
                         for rank in (0, 1)}
         # The cache-drop test isolates discovery/full copy.  Migration also
         # exercises blockdiff against a remote inode larger than its threshold.
-        self.config_set('client.mirror', 'cephfs_mirror_blockdiff_min_file_size',
-                        0 if migrate else 128 * 1024 * 1024)
+        self._boundary_set_mirror_blockdiff_threshold(
+            0 if migrate else 128 * 1024 * 1024)
         with self._boundary_mirrored_directory(dir_name) as peer_spec:
             self.mount_a.run_shell(['mkdir', primary_dir])
             self.mount_a.setfattr(primary_dir, 'ceph.dir.pin', '0')
@@ -4656,7 +4720,8 @@ os.utime(path, ns=({mtime}, {mtime}))
                     self.mount_a.umount_wait()
                     unmounted = True
                     # Removing replicas may require multiple rounds.  Dumping
-                    # an inode looks only in cache and does not reload it.
+                    # a head inode looks only in cache and does not reload it.
+                    # Historical snapshot versions may remain cached.
                     for attempt in range(4):
                         for rank in (1, 0):
                             result = self.fs.rank_tell(['cache', 'drop', '15'],
@@ -4670,7 +4735,7 @@ os.utime(path, ns=({mtime}, {mtime}))
                         if not any(cached):
                             break
                     self.assertFalse(any(cached),
-                                     'hardlink inode remained cached on an MDS')
+                                     'hardlink head inode remained cached on an MDS')
                     self.mount_a.mount_wait(cephfs_name=self.primary_fs_name)
                     unmounted = False
                     # Do not touch either file on the source client before
@@ -4711,7 +4776,7 @@ os.utime(path, ns=({mtime}, {mtime}))
                         f'/{dir_name}', peer_uuid)
 
     def test_cephfs_mirror_relinked_hardlink_multimds_cache_drop(self):
-        """Relinking must survive cold auth/replica inode caches on two MDSs."""
+        """Relinking must survive cold auth/replica head inodes on two MDSs."""
         self._test_cephfs_mirror_relinked_hardlink_multimds(migrate=False)
 
     def test_cephfs_mirror_relinked_hardlink_multimds_migration(self):
