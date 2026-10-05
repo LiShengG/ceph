@@ -12458,9 +12458,19 @@ void Server::_readdir_diff(
   // fragments - there is no way to identify specific snapshot for the last entry.
   // The following vars denote the potential rollback position for such a case.
   // Fixes: https://tracker.ceph.com/issues/72518
+  //
+  // Rolling back must never leave the reply empty, though: a successful
+  // reply without entries and without the end flag gives the client no
+  // cursor to resume from, so it either skips the rest of the dirfrag or
+  // requests the same position forever. Hence the group at the start of
+  // the reply is always sent completely, even if it exceeds the byte
+  // budget. Such a group holds at most one entry per snapshot, so the
+  // overshoot is bounded by two inode stats. Once that group has exceeded
+  // the budget, the reply ends at the next name.
   string last_name;
   size_t rollback_pos = 0;
   size_t rollback_num = 0;
+  bool over_budget = false;
 
   bool waiting = false;
   bool end = build_snap_diff(
@@ -12480,7 +12490,17 @@ void Server::_readdir_diff(
       // the last one for existent ones
       effective_snapid = exists ? snapid : snapid_prev;
       name.append(dn_name);
-      if ((int)(dnbl.length() + name.length() + sizeof(__u32) + sizeof(LeaseStat)) > bytes_left) {
+      // Does this entry belong to the group at the start of the reply?
+      const bool first_group =
+        numfiles == 0 || (name == last_name && rollback_num == 0);
+      if (over_budget && !first_group) {
+	dout(10) << " reply exceeds the budget, stopping at " << dnbl.length()
+		 << " > " << bytes_left << dendl;
+	return false;
+      }
+      if (first_group) {
+	// encode it regardless of the remaining budget
+      } else if ((int)(dnbl.length() + name.length() + sizeof(__u32) + sizeof(LeaseStat)) > bytes_left) {
 	dout(10) << " ran out of room for name, stopping at " << dnbl.length() << " < " << bytes_left << dendl;
         if (name == last_name) {
 	  bufferlist keep;
@@ -12506,7 +12526,9 @@ void Server::_readdir_diff(
 
       // inode
       dout(10) << "inc inode " << *in << " snap "	<< effective_snapid << dendl;
-      int r = in->encode_inodestat(dnbl, mdr->session, realm, effective_snapid, bytes_left - (int)dnbl.length());
+      // max_bytes == 0 means no limit
+      int r = in->encode_inodestat(dnbl, mdr->session, realm, effective_snapid,
+        first_group ? 0 : bytes_left - (int)dnbl.length());
       if (r < 0) {
 	// chop off dn->name, lease
 	dout(10) << " ran out of room, stopping at "
@@ -12529,6 +12551,11 @@ void Server::_readdir_diff(
         last_name = name;
         rollback_pos = start_len;
         rollback_num = numfiles;
+      }
+      if (first_group && (int)dnbl.length() > bytes_left) {
+	dout(10) << " sending " << name << " beyond the budget, "
+		 << dnbl.length() << " > " << bytes_left << dendl;
+	over_budget = true;
       }
       // touch dn
       mdcache->lru.lru_touch(dn);
