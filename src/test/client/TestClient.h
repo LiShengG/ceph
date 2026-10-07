@@ -64,6 +64,32 @@ public:
       ldout(cct, 10) << __func__ << " result=" << res << dendl;
       return res;
     }
+    // Send one readdir request (lssnap for a snapdir) from the position
+    // of @dirp, with the byte budget @max_bytes.
+    int read_dir_page(dir_result_t* dirp, unsigned max_bytes) {
+      RWRef_t mref_reader(mount_state, CLIENT_MOUNTING);
+      if (!mref_reader.is_state_satisfied()) {
+        return -ENOTCONN;
+      }
+      std::scoped_lock l(client_lock);
+      auto& diri = dirp->inode;
+      filepath path;
+      diri->make_nosnap_relative_path(path);
+      auto req = new MetaRequest(diri->snapid == CEPH_SNAPDIR ?
+                                 CEPH_MDS_OP_LSSNAP : CEPH_MDS_OP_READDIR);
+      req->set_filepath(path);
+      req->set_inode(diri.get());
+      req->head.args.readdir.frag = diri->dirfragtree[dirp->offset_high()];
+      req->head.args.readdir.flags = CEPH_READDIR_REPLY_BITFLAGS;
+      req->head.args.readdir.max_bytes = max_bytes;
+      if (!dirp->last_name.empty()) {
+        req->path2.set_path(dirp->last_name);
+      } else if (dirp->hash_order()) {
+        req->head.args.readdir.offset_hash = dirp->offset_high();
+      }
+      req->dirp = dirp;
+      return make_request(req, dirp->perms);
+    }
     int send_unknown_session_op(int op) {
       RWRef_t mref_reader(mount_state, CLIENT_MOUNTING);
       if (!mref_reader.is_state_satisfied()) {

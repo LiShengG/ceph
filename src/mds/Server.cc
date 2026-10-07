@@ -5291,7 +5291,11 @@ void Server::handle_client_readdir(const MDRequestRef& mdr)
     }
     ceph_assert(in);
 
-    if ((int)(dnbl.length() + dn->get_name().length() + sizeof(__u32) + sizeof(LeaseStat)) > bytes_left) {
+    // The first entry is sent even if it exceeds the budget: an empty
+    // reply without the end flag would leave the client nowhere to
+    // resume from. The next entry then stops the reply.
+    if (numfiles > 0 &&
+        (int)(dnbl.length() + dn->get_name().length() + sizeof(__u32) + sizeof(LeaseStat)) > bytes_left) {
       dout(10) << " ran out of room, stopping at " << dnbl.length() << " < " << bytes_left << dendl;
       break;
     }
@@ -5305,7 +5309,9 @@ void Server::handle_client_readdir(const MDRequestRef& mdr)
 
     // inode
     dout(12) << "including inode in " << *in << " snap " << snapid << dendl;
-    int r = in->encode_inodestat(dnbl, mdr->session, realm, snapid, bytes_left - (int)dnbl.length());
+    // 0: no limit
+    int r = in->encode_inodestat(dnbl, mdr->session, realm, snapid,
+                                 numfiles == 0 ? 0 : bytes_left - (int)dnbl.length());
     if (r < 0) {
       // chop off dn->name, lease
       dout(10) << " ran out of room, stopping at " << start_len << " < " << bytes_left << dendl;
@@ -11531,8 +11537,11 @@ void Server::handle_client_lssnap(const MDRequestRef& mdr)
     else
       snap_name = p->second->get_long_name();
 
+    // as in handle_client_readdir(), the first entry is sent even if it
+    // exceeds the budget
     unsigned start_len = dnbl.length();
-    if (int(start_len + snap_name.length() + sizeof(__u32) + sizeof(LeaseStat)) > max_bytes)
+    if (num > 0 &&
+        int(start_len + snap_name.length() + sizeof(__u32) + sizeof(LeaseStat)) > max_bytes)
       break;
 
     encode(snap_name, dnbl);
@@ -11543,7 +11552,8 @@ void Server::handle_client_lssnap(const MDRequestRef& mdr)
     mds->locker->encode_lease(dnbl, mdr->session->info, e);
     dout(20) << "encode_infinite_lease" << dendl;
 
-    int r = diri->encode_inodestat(dnbl, mdr->session, realm, p->first, max_bytes - (int)dnbl.length());
+    int r = diri->encode_inodestat(dnbl, mdr->session, realm, p->first,
+                                   num == 0 ? 0 : max_bytes - (int)dnbl.length());
     if (r < 0) {
       bufferlist keep;
       keep.substr_of(dnbl, 0, start_len);
