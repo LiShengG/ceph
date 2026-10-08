@@ -3346,3 +3346,94 @@ TEST(LibCephFS, SnapDiffRemoteDentryNotInCache) {
   ASSERT_EQ(0, test_mount.rmsnap("snap1"));
   ASSERT_EQ(0, test_mount.rmsnap("snap2"));
 }
+
+// cephfs-mirror reads a renamed directory's snapdiff by its new path. The
+// older snapshot lacks that path, so libcephfs opens it in the newer one and
+// takes the other snapid from the older snapshot's root; the stream must
+// still compare that directory's own entries across both snapshots.
+TEST(LibCephFS, SnapDiffRenamedDirectoryByNewPath) {
+  TestMount test_mount("snapdiff_renamed_dir");
+  SnapCleanup cleanup{test_mount, {"snap1", "snap2"}};
+  // Fixed mtimes and syncs keep unchanged files out of the diff (#74984).
+  struct timeval before_times[2] = {{1577836800, 0}, {1577836800, 0}};
+  struct timeval after_times[2] = {{1577836802, 0}, {1577836802, 0}};
+  const int nr_many = 16;
+  const string xattr_value(60000, 'x');
+
+  for (auto dir : {"A", "A/sub", "A/sub/deep", "A/many"}) {
+    ASSERT_EQ(0, test_mount.mkdir(dir));
+  }
+  for (auto file : {"A/keep", "A/mod", "A/del", "A/sub/deep/keep", "A/sub/deep/mod"}) {
+    ASSERT_LE(0, test_mount.write_full(file, file));
+    ASSERT_EQ(0, test_mount.utimes(file, before_times));
+  }
+  // large xattrs split the listing of "many" into several replies
+  for (int i = 0; i < nr_many; ++i) {
+    auto file = "A/many/f" + stringify(i);
+    ASSERT_LE(0, test_mount.write_full(file.c_str(), file));
+    ASSERT_EQ(0, test_mount.setxattr(file.c_str(), "user.big", xattr_value.c_str()));
+    ASSERT_EQ(0, test_mount.utimes(file.c_str(), before_times));
+  }
+  ASSERT_EQ(0, test_mount.sync());
+  ASSERT_EQ(0, test_mount.mksnap("snap1"));
+
+  ASSERT_EQ(0, ceph_rename(test_mount.get_cmount(),
+                           test_mount.make_file_path("A").c_str(),
+                           test_mount.make_file_path("B").c_str()));
+  for (auto file : {"B/mod", "B/sub/deep/mod"}) {
+    ASSERT_LE(0, test_mount.write_full(file, "modified after the rename"));
+    ASSERT_EQ(0, test_mount.utimes(file, after_times));
+  }
+  for (int i = 0; i < nr_many; i += 2) {
+    auto file = "B/many/f" + stringify(i);
+    ASSERT_LE(0, test_mount.write_full(file.c_str(), "modified after the rename"));
+    ASSERT_EQ(0, test_mount.utimes(file.c_str(), after_times));
+  }
+  ASSERT_EQ(0, test_mount.unlink("B/del"));
+  ASSERT_LE(0, test_mount.write_full("B/new", "created after the rename"));
+  ASSERT_EQ(0, test_mount.mkdir("B/newdir"));
+  ASSERT_EQ(0, test_mount.sync());
+  ASSERT_EQ(0, test_mount.mksnap("snap2"));
+
+  uint64_t snapid1;
+  uint64_t snapid2;
+  ASSERT_EQ(0, test_mount.get_snapid("snap1", &snapid1));
+  ASSERT_EQ(0, test_mount.get_snapid("snap2", &snapid2));
+  ASSERT_EQ(-ENOENT, test_mount.test_open(
+    (test_mount.make_snap_path("snap1") + "/B").c_str()));
+
+  // Directories may be listed as well; any other extra entry, such as an
+  // unchanged file, fails the comparison.
+  auto verify = [&](const char* relpath, vector<pair<string, uint64_t>> expected,
+                    const std::set<string>& maybe_listed) {
+    std::sort(expected.begin(), expected.end());
+    for (bool reverse : {false, true}) {
+      vector<pair<string, uint64_t>> diff;
+      ASSERT_EQ(0, test_mount.for_each_readdir_snapdiff(
+        relpath, reverse ? "snap2" : "snap1", reverse ? "snap1" : "snap2",
+        [&](const dirent* dire, uint64_t snapid) {
+          if (!maybe_listed.contains(dire->d_name)) {
+            diff.emplace_back(dire->d_name, snapid);
+          }
+          return true;
+        }));
+      std::sort(diff.begin(), diff.end());
+      EXPECT_EQ(expected, diff) << relpath << " reverse=" << reverse;
+    }
+  };
+
+  vector<pair<string, uint64_t>> many;
+  for (int i = 0; i < nr_many; i += 2) {
+    many.emplace_back("f" + stringify(i), snapid2);
+  }
+  for (bool cold : {false, true}) {
+    SCOPED_TRACE(cold ? "cold cache" : "warm cache");
+    if (cold) {
+      test_mount.remount();
+    }
+    verify("B", {{"mod", snapid2}, {"del", snapid1}, {"new", snapid2},
+                 {"newdir", snapid2}}, {"sub", "many"});
+    verify("B/sub/deep", {{"mod", snapid2}}, {});
+    verify("B/many", many, {});
+  }
+}
