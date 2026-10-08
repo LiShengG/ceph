@@ -243,6 +243,19 @@ private:
     }
   };
 
+  // directory rename reuse counters
+  struct DirRenameStat {
+    uint64_t candidates = 0;
+    uint64_t candidates_peak = 0;
+    uint64_t renamed = 0;
+    uint64_t remote_scan_retries = 0;
+    // fallback reasons
+    uint64_t ambiguous = 0;
+    uint64_t over_budget = 0;
+    uint64_t remote_mismatch = 0;
+    uint64_t rename_errors = 0;
+  };
+
   class SyncMechanism {
   public:
     explicit SyncMechanism(PeerReplayer& peer_replayer, std::string_view dir_root,
@@ -384,7 +397,7 @@ private:
   public:
     SnapDiffSync(PeerReplayer& peer_replayer, std::string_view dir_root, MountRef local,
                  MountRef remote, FHandles *fh, const Peer &peer, const Snapshot &current,
-                 boost::optional<Snapshot> prev);
+                 boost::optional<Snapshot> prev, bool allow_dir_rename);
     ~SnapDiffSync();
 
     int init_sync() override;
@@ -400,6 +413,17 @@ private:
     void finish_crawl(int ret, double crawl_duration_secs);
 
   private:
+    // deleted and created directories of a parent, paired by inode once
+    // the parent's snapdiff stream ends
+    struct DirCandidates {
+      std::map<std::string, uint64_t> deleted; // name -> prev inode
+      std::map<std::string, struct ceph_statx> created;
+      std::deque<SyncEntry> pending; // directories to descend into
+      uint64_t nr_entries = 0;
+      uint64_t nr_bytes = 0;
+      bool finalized = false;
+    };
+
     int init_directory(const std::string &epath, const std::string &prev_epath,
                        const struct ceph_statx &stx, bool pic, SyncEntry *se);
     int next_entry(SyncEntry &entry, std::string *e_name, snapid_t *snapid);
@@ -407,8 +431,22 @@ private:
     int push_directory(const SyncEntry &dir, std::string *epath, struct ceph_statx *stx);
     int remove_remote_entry(const std::string &parent, const std::string &e_name,
                             const std::function<int (const std::string&)> &purge_func);
+    bool add_candidate(DirCandidates &cand, const std::string &e_name);
+    void release_candidates(const std::string &parent);
+    int finalize_candidates(SyncEntry &entry, DirCandidates &cand,
+                            const std::function<int (const std::string&)> &purge_func);
+    int rename_remote_dir(const std::string &from, const std::string &to);
 
     std::map<std::string, std::set<std::string>> m_deleted;
+
+    bool m_allow_dir_rename;
+    bool m_rename_marked = false;
+    uint64_t m_max_candidates;
+    uint64_t m_max_candidate_bytes;
+    uint64_t m_nr_candidates = 0;
+    uint64_t m_nr_candidate_bytes = 0;
+    std::map<std::string, DirCandidates> m_dir_candidates; // keyed by parent epath
+    DirRenameStat m_rename_stat;
   };
 
   // stats sent to service daemon
@@ -455,6 +493,7 @@ private:
     double blockdiff_time_sec = 0.0; //actual sync time using SnapDiff/blockdiff counter
     boost::optional<double> datasync_queue_wait_duration; // first data_q push to first pop (final)
     boost::optional<monotime> datasync_queue_wait_start_time; // until first pop; for in-progress display
+    DirRenameStat dir_rename; // cumulative
   };
 
   enum class DirSyncState {
@@ -682,6 +721,18 @@ private:
     auto &sync_stat = m_snap_sync_stats.at(dir_root);
     sync_stat.crawl_start_time = clock::now();
   }
+  void add_dir_rename_stat(const std::string &dir_root, const DirRenameStat &stat) {
+    std::scoped_lock locker(m_lock);
+    auto &dir_rename = m_snap_sync_stats.at(dir_root).dir_rename;
+    dir_rename.candidates += stat.candidates;
+    dir_rename.candidates_peak = std::max(dir_rename.candidates_peak, stat.candidates_peak);
+    dir_rename.renamed += stat.renamed;
+    dir_rename.remote_scan_retries += stat.remote_scan_retries;
+    dir_rename.ambiguous += stat.ambiguous;
+    dir_rename.over_budget += stat.over_budget;
+    dir_rename.remote_mismatch += stat.remote_mismatch;
+    dir_rename.rename_errors += stat.rename_errors;
+  }
   void inc_total_bytes_files(const std::string &dir_root, const uint64_t& b) {
     std::scoped_lock locker(m_lock);
     auto &sync_stat = m_snap_sync_stats.at(dir_root);
@@ -825,7 +876,8 @@ private:
                                       boost::optional<Snapshot> prev, FHandles *fh);
 
   int do_synchronize(const std::string &dir_root, const Snapshot &current,
-                     boost::optional<Snapshot> prev);
+                     boost::optional<Snapshot> prev, bool allow_dir_rename = false,
+                     bool rename_marked = false);
   int do_synchronize(const std::string &dir_root, const Snapshot &current) {
     return do_synchronize(dir_root, current, boost::none);
   }

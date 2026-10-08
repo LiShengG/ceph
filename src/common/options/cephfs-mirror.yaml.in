@@ -66,6 +66,27 @@ options:
   default: 16_M
   services:
   - cephfs-mirror
+- name: cephfs_mirror_dir_rename_max_candidates
+  type: uint
+  level: advanced
+  desc: maximum number of deferred directory rename candidates per snapshot sync
+  long_desc: Incremental synchronization defers deleted and created directories until their
+    parent directory has been read, so that a directory renamed within its parent can be
+    renamed on the remote file system instead of being purged and copied again. This limits
+    the number of such directories held at a time. Directories beyond the limit are
+    synchronized without rename detection.
+  default: 65536
+  services:
+  - cephfs-mirror
+- name: cephfs_mirror_dir_rename_max_candidate_bytes
+  type: size
+  level: advanced
+  desc: maximum total name length of deferred directory rename candidates per snapshot sync
+  long_desc: Limits the total length of the names of directories deferred for rename
+    detection. Directories beyond the limit are synchronized without rename detection.
+  default: 16_M
+  services:
+  - cephfs-mirror
 - name: cephfs_mirror_action_update_interval
   type: secs
   level: advanced

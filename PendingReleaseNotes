@@ -214,6 +214,14 @@
   - CephCertificateWarning: Fires when a Ceph certificate is about to expire (warning severity).
 
 * CephFS: The `peer_add` command is deprecated in favor of the `peer_bootstrap` command.
+* CephFS Mirroring: During incremental synchronization, a directory renamed within
+  its parent directory is now renamed on the peer instead of being purged and
+  copied again. ``fs mirror peer status`` reports this in a ``dir_rename`` section,
+  and the new options ``cephfs_mirror_dir_rename_max_candidates`` and
+  ``cephfs_mirror_dir_rename_max_candidate_bytes`` bound the memory used to detect
+  such renames. Known limitation: if a synchronization is interrupted after such a
+  rename and then retried by an older cephfs-mirror daemon, entries deleted in that
+  snapshot may be left behind on the peer.
 * RGW: For `radosgw-admin account rm`, the `--purge-data` option previously applied only
   to buckets and objects, but now deletes account users, roles, groups, and oidc-providers
   too instead of failing with ENOTEMPTY.

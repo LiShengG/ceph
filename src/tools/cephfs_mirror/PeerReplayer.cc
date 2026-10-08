@@ -181,6 +181,30 @@ int opendirat(MountRef mnt, int dirfd, const std::string &relpath, int flags,
   return r;
 }
 
+// Appended to dirty_snap_id once a directory rename may have been applied
+// remotely. The MDS only allows the existing ceph.mirror.* xattr names.
+const std::string DIRTY_SNAP_ID_RENAME_SUFFIX = ":rename";
+
+int set_dirty_snap_id(MountRef mnt, int fd, uint64_t snap_id, bool renamed) {
+  auto val = stringify(snap_id);
+  if (renamed) {
+    val += DIRTY_SNAP_ID_RENAME_SUFFIX;
+  }
+  return ceph_fsetxattr(mnt, fd, "ceph.mirror.dirty_snap_id", val.c_str(),
+                        val.size(), 0);
+}
+
+// Faked inode numbers are allocated per cached inode (snapid included), so
+// they cannot identify a directory across two snapshots.
+bool inos_comparable(MountRef mnt) {
+  if (sizeof(ino_t) < 8) {
+    return false;
+  }
+  char val[16];
+  return ceph_conf_get(mnt, "client_use_faked_inos", val, sizeof(val)) == 0 &&
+         strcmp(val, "false") == 0;
+}
+
 } // anonymous namespace
 
 class PeerReplayerAdminSocketHook : public AdminSocketHook {
@@ -2484,8 +2508,13 @@ int PeerReplayer::SyncMechanism::get_changed_blocks(const std::string &epath,
 PeerReplayer::SnapDiffSync::SnapDiffSync(PeerReplayer& peer_replayer, std::string_view dir_root,
                                          MountRef local, MountRef remote, FHandles *fh,
                                          const Peer &peer, const Snapshot &current,
-                                         boost::optional<Snapshot> prev)
-  : SyncMechanism(peer_replayer, dir_root, local, remote, fh, peer, current, prev) {
+                                         boost::optional<Snapshot> prev, bool allow_dir_rename)
+  : SyncMechanism(peer_replayer, dir_root, local, remote, fh, peer, current, prev),
+    m_allow_dir_rename(allow_dir_rename),
+    m_max_candidates(g_ceph_context->_conf.get_val<uint64_t>(
+      "cephfs_mirror_dir_rename_max_candidates")),
+    m_max_candidate_bytes(g_ceph_context->_conf.get_val<Option::size_t>(
+      "cephfs_mirror_dir_rename_max_candidate_bytes")) {
 }
 
 PeerReplayer::SnapDiffSync::~SnapDiffSync() {
@@ -2615,10 +2644,16 @@ int PeerReplayer::SnapDiffSync::get_entry(std::string *epath, struct ceph_statx 
     dout(20) << ": top of stack path=" << entry.epath << dendl;
     ceph_assert(entry.is_directory());
 
-    int r;
+    // renames are only detected against a trusted remote baseline
+    const bool track = m_allow_dir_rename && entry.sync_is_snapdiff() &&
+                       !entry.is_purged_or_itype_changed();
+    auto cand_it = m_dir_candidates.find(entry.epath);
+    const bool finalized = cand_it != m_dir_candidates.end() && cand_it->second.finalized;
+
+    int r = 0;
     snapid_t snapid;
     std::string e_name;
-    while (true) {
+    while (!finalized) {
       e_name.clear();
       r = next_entry(entry, &e_name, &snapid);
       if (r < 0 || r == 0) {
@@ -2632,6 +2667,26 @@ int PeerReplayer::SnapDiffSync::get_entry(std::string *epath, struct ceph_statx 
         dout(20) << ": epath=" << _epath << dendl;
         if (snapid == (*m_prev).second) {
           dout(20) << ": epath=" << _epath << " is deleted in current snapshot " << dendl;
+          if (track) {
+            struct ceph_statx pstx;
+            r = ceph_statxat(m_fh->p_mnt, m_fh->p_fd, _prev_epath.c_str(), &pstx,
+                             CEPH_STATX_INO | CEPH_STATX_MODE,
+                             AT_STATX_DONT_SYNC | AT_SYMLINK_NOFOLLOW);
+            if (r < 0 && r != -ENOENT) {
+              derr << ": failed to stat previous entry=" << _prev_epath << ", r=" << r
+                   << dendl;
+              return r;
+            }
+            if (r == 0 && S_ISDIR(pstx.stx_mode)) {
+              auto &cand = m_dir_candidates[entry.epath];
+              if (add_candidate(cand, e_name)) {
+                dout(10) << ": deferring deleted directory=" << _epath << dendl;
+                cand.deleted.emplace(e_name, pstx.stx_ino);
+                continue;
+              }
+            }
+          }
+
           r = remove_remote_entry(entry.epath, e_name, purge_func);
           if (r < 0) {
             return r;
@@ -2651,6 +2706,18 @@ int PeerReplayer::SnapDiffSync::get_entry(std::string *epath, struct ceph_statx 
           return r;
         }
 
+        if (track) {
+          auto it = m_dir_candidates.find(entry.epath);
+          if (it != m_dir_candidates.end() && it->second.deleted.erase(e_name)) {
+            // a reused name is not a rename source: delete the old entry
+            // first, as for any other same-name replacement
+            r = remove_remote_entry(entry.epath, e_name, purge_func);
+            if (r < 0) {
+              return r;
+            }
+          }
+        }
+
         bool pic = entry.is_purged_or_itype_changed() || m_deleted[entry.epath].contains(e_name);
         if (S_ISDIR(estx.stx_mode)) {
           bool purge_remote = false;
@@ -2659,7 +2726,12 @@ int PeerReplayer::SnapDiffSync::get_entry(std::string *epath, struct ceph_statx 
             r = ceph_statxat(m_fh->p_mnt, m_fh->p_fd, _prev_epath.c_str(), &prev_stx,
                              CEPH_STATX_INO | CEPH_STATX_MODE,
                              AT_STATX_DONT_SYNC | AT_SYMLINK_NOFOLLOW);
-            if (r == -ENOENT) {
+            if (r == -ENOENT && track &&
+                add_candidate(m_dir_candidates[entry.epath], e_name)) {
+              dout(10) << ": deferring new directory=" << _epath << dendl;
+              m_dir_candidates[entry.epath].created.emplace(e_name, estx);
+              continue;
+            } else if (r == -ENOENT) {
               dout(10) << ": directory=" << _epath
                        << " is absent from the previous snapshot; using full traversal"
                        << dendl;
@@ -2727,6 +2799,25 @@ int PeerReplayer::SnapDiffSync::get_entry(std::string *epath, struct ceph_statx 
       continue;
 
     if (r == 0) {
+      cand_it = m_dir_candidates.find(entry.epath);
+      if (cand_it != m_dir_candidates.end()) {
+        auto &cand = cand_it->second;
+        if (!cand.finalized) {
+          cand.finalized = true;
+          r = finalize_candidates(entry, cand, purge_func);
+          if (r < 0) {
+            return r;
+          }
+        }
+        // descend into one directory at a time, as when streaming
+        if (!cand.pending.empty()) {
+          auto dir = std::move(cand.pending.front());
+          cand.pending.pop_front();
+          return push_directory(dir, epath, stx);
+        }
+        release_candidates(entry.epath);
+      }
+
       dout(10) << ": done for directory=" << entry.epath << dendl;
       fini_directory(entry);
       m_sync_stack.pop();
@@ -2761,6 +2852,7 @@ int PeerReplayer::SnapDiffSync::push_directory(const SyncEntry &dir, std::string
 
   m_sync_stack.emplace(se);
   dout(20) << ": Added directory to stack =" << dir.epath << dendl;
+  // EEXIST is expected for a renamed directory; its attributes are reset
   r = remote_mkdir(dir.epath, dir.stx);
   if (r < 0) {
     derr << ": mkdir failed on remote. epath=" << dir.epath << ": " << cpp_strerror(r)
@@ -2803,6 +2895,157 @@ int PeerReplayer::SnapDiffSync::remove_remote_entry(const std::string &parent,
   }
 
   m_deleted[parent].emplace(e_name);
+  return 0;
+}
+
+bool PeerReplayer::SnapDiffSync::add_candidate(DirCandidates &cand, const std::string &e_name) {
+  if (m_nr_candidates + 1 > m_max_candidates ||
+      m_nr_candidate_bytes + e_name.size() > m_max_candidate_bytes) {
+    ++m_rename_stat.over_budget;
+    return false;
+  }
+
+  ++cand.nr_entries;
+  cand.nr_bytes += e_name.size();
+  ++m_nr_candidates;
+  m_nr_candidate_bytes += e_name.size();
+  ++m_rename_stat.candidates;
+  m_rename_stat.candidates_peak = std::max(m_rename_stat.candidates_peak, m_nr_candidates);
+  return true;
+}
+
+void PeerReplayer::SnapDiffSync::release_candidates(const std::string &parent) {
+  auto it = m_dir_candidates.find(parent);
+  ceph_assert(it != m_dir_candidates.end());
+  m_nr_candidates -= it->second.nr_entries;
+  m_nr_candidate_bytes -= it->second.nr_bytes;
+  m_dir_candidates.erase(it);
+}
+
+int PeerReplayer::SnapDiffSync::finalize_candidates(SyncEntry &entry, DirCandidates &cand,
+                                                    const std::function<int (const std::string&)> &purge_func) {
+  dout(20) << ": epath=" << entry.epath << ", deleted=" << cand.deleted.size()
+           << ", created=" << cand.created.size() << dendl;
+
+  // pair by source inode; an inode seen more than once is not paired
+  std::map<uint64_t, std::string> deleted_by_ino;
+  std::map<uint64_t, std::string> created_by_ino;
+  std::set<uint64_t> ambiguous;
+  for (auto &[name, ino] : cand.deleted) {
+    if (!deleted_by_ino.emplace(ino, name).second) {
+      ambiguous.insert(ino);
+    }
+  }
+  for (auto &[name, cstx] : cand.created) {
+    if (!created_by_ino.emplace(cstx.stx_ino, name).second) {
+      ambiguous.insert(cstx.stx_ino);
+    }
+  }
+  m_rename_stat.ambiguous += ambiguous.size();
+
+  std::map<std::string, std::string> renames; // old name -> new name
+  std::set<std::string> renamed_to;
+  for (auto &[ino, name] : created_by_ino) {
+    auto it = deleted_by_ino.find(ino);
+    if (it != deleted_by_ino.end() && !ambiguous.contains(ino)) {
+      renames.emplace(it->second, name);
+      renamed_to.insert(name);
+    }
+  }
+
+  int r;
+  for (auto &[name, ino] : cand.deleted) {
+    if (!renames.contains(name)) {
+      r = remove_remote_entry(entry.epath, name, purge_func);
+      if (r < 0) {
+        return r;
+      }
+    }
+  }
+
+  for (auto &[from, to] : renames) {
+    // neither subtree has been visited yet, so no queued data sync can
+    // refer to a path below them
+    ceph_assert(!m_deleted[entry.epath].contains(from));
+    ceph_assert(!m_deleted[entry.epath].contains(to));
+    r = rename_remote_dir(entry_path(entry.epath, from), entry_path(entry.epath, to));
+    if (r < 0) {
+      return r;
+    }
+
+    SyncEntry dir(entry_path(entry.epath, to), cand.created.at(to));
+    dir.prev_epath = entry_path(entry.prev_epath, from);
+    dir.uses_renamed_base = true;
+    cand.pending.push_back(std::move(dir));
+  }
+
+  for (auto &[name, cstx] : cand.created) {
+    if (!renamed_to.contains(name)) {
+      dout(10) << ": directory=" << entry_path(entry.epath, name)
+               << " is absent from the previous snapshot; using full traversal" << dendl;
+      SyncEntry dir(entry_path(entry.epath, name), cstx);
+      dir.prev_epath = entry_path(entry.prev_epath, name);
+      dir.set_purged_or_itype_changed();
+      cand.pending.push_back(std::move(dir));
+    }
+  }
+
+  return 0;
+}
+
+int PeerReplayer::SnapDiffSync::rename_remote_dir(const std::string &from,
+                                                  const std::string &to) {
+  dout(10) << ": dir_root=" << m_dir_root << ", from=" << from << ", to=" << to << dendl;
+
+  int r;
+  // a retry after a remote rename must rescan the remote
+  if (!m_rename_marked) {
+    r = set_dirty_snap_id(m_remote, m_fh->r_fd_dir_root, m_current.second, true);
+    if (r < 0) {
+      derr << ": error marking \"ceph.mirror.dirty_snap_id\" for rename on dir_root="
+           << m_dir_root << ": " << cpp_strerror(r) << dendl;
+      return r;
+    }
+    m_rename_marked = true;
+  }
+
+  // ceph_rename() silently replaces an empty target directory
+  struct ceph_statx rstx;
+  r = ceph_statxat(m_remote, m_fh->r_fd_dir_root, from.c_str(), &rstx,
+                   CEPH_STATX_MODE, AT_SYMLINK_NOFOLLOW);
+  if (r < 0 && r != -ENOENT) {
+    derr << ": failed to stat remote directory=" << from << ": " << cpp_strerror(r)
+         << dendl;
+    return r;
+  }
+  bool matches = r == 0 && S_ISDIR(rstx.stx_mode);
+  if (matches) {
+    r = ceph_statxat(m_remote, m_fh->r_fd_dir_root, to.c_str(), &rstx,
+                     CEPH_STATX_MODE, AT_SYMLINK_NOFOLLOW);
+    if (r < 0 && r != -ENOENT) {
+      derr << ": failed to stat remote entry=" << to << ": " << cpp_strerror(r)
+           << dendl;
+      return r;
+    }
+    matches = r == -ENOENT;
+  }
+  if (!matches) {
+    derr << ": remote does not match the previous snapshot, cannot rename=" << from
+         << " to " << to << dendl;
+    ++m_rename_stat.remote_mismatch;
+    return -ESTALE;
+  }
+
+  r = ceph_rename(m_remote, entry_path(m_dir_root, from).c_str(),
+                  entry_path(m_dir_root, to).c_str());
+  if (r < 0) {
+    derr << ": failed to rename remote directory=" << from << " to " << to << ": "
+         << cpp_strerror(r) << dendl;
+    ++m_rename_stat.rename_errors;
+    return r;
+  }
+
+  ++m_rename_stat.renamed;
   return 0;
 }
 
@@ -2916,6 +3159,7 @@ void PeerReplayer::SnapDiffSync::finish_crawl(int ret, double crawl_duration_sec
     m_sync_stack.pop();
   }
 
+  m_peer_replayer.add_dir_rename_stat(m_dir_root, m_rename_stat);
   // Crawl and entry operations are done syncing here. So mark crawl finished here
   mark_crawl_finished(ret, crawl_duration_secs);
 }
@@ -3074,7 +3318,8 @@ void PeerReplayer::RemoteSync::finish_crawl(int ret, double crawl_duration_secs)
 }
 
 int PeerReplayer::do_synchronize(const std::string &dir_root, const Snapshot &current,
-                                 boost::optional<Snapshot> prev) {
+                                 boost::optional<Snapshot> prev, bool allow_dir_rename,
+                                 bool rename_marked) {
   dout(20) << ": dir_root=" << dir_root << ", current=" << current << dendl;
   FHandles fh;
   int r = pre_sync_check_and_open_handles(dir_root, current, prev, &fh);
@@ -3085,9 +3330,7 @@ int PeerReplayer::do_synchronize(const std::string &dir_root, const Snapshot &cu
 
   // record that we are going to "dirty" the data under this
   // directory root
-  auto snap_id_str{stringify(current.second)};
-  r = ceph_fsetxattr(m_remote_mount, fh.r_fd_dir_root, "ceph.mirror.dirty_snap_id",
-                     snap_id_str.c_str(), snap_id_str.size(), 0);
+  r = set_dirty_snap_id(m_remote_mount, fh.r_fd_dir_root, current.second, rename_marked);
   if (r < 0) {
     derr << ": error setting \"ceph.mirror.dirty_snap_id\" on dir_root=" << dir_root
          << ": " << cpp_strerror(r) << dendl;
@@ -3099,7 +3342,7 @@ int PeerReplayer::do_synchronize(const std::string &dir_root, const Snapshot &cu
   std::shared_ptr<SyncMechanism> syncm;
   if (fh.p_mnt == m_local_mount) {
     syncm = std::make_shared<SnapDiffSync>(*this, dir_root, m_local_mount, m_remote_mount,
-                                           &fh, m_peer, current, prev);
+                                           &fh, m_peer, current, prev, allow_dir_rename);
     set_snapdiff(dir_root, true); //for stats
   } else {
     syncm = std::make_shared<RemoteSync>(*this, dir_root, m_local_mount, m_remote_mount,
@@ -3230,15 +3473,33 @@ int PeerReplayer::synchronize(const std::string &dir_root, const Snapshot &curre
 
     val[xlen] = '\0';
     uint64_t dirty_snap_id = atoll(val);
+    // kept until a snapshot is committed, so that every retry rescans
+    const bool rename_marked = std::string_view(val).ends_with(DIRTY_SNAP_ID_RENAME_SUFFIX);
 
-    dout(20) << ": dirty_snap_id: " << dirty_snap_id << " vs (" << current.second
+    dout(20) << ": dirty_snap_id: " << dirty_snap_id << (rename_marked ? " (rename)" : "")
+             << " vs (" << current.second
              << "," << (prev ? stringify((*prev).second) : "~") << ")" << dendl;
-    if (prev && (dirty_snap_id == (*prev).second || dirty_snap_id == current.second)) {
+    if (prev && dirty_snap_id == (*prev).second) {
+      // remote holds the previous snapshot: renamed directories may reuse it
+      bool allow_dir_rename = inos_comparable(m_local_mount);
+      dout(5) << ": match -- using incremental sync with local scan, directory rename "
+              << (allow_dir_rename ? "enabled" : "disabled") << dendl;
+      r = do_synchronize(dir_root, current, prev, allow_dir_rename);
+    } else if (prev && dirty_snap_id == current.second && !rename_marked) {
       dout(5) << ": match -- using incremental sync with local scan" << dendl;
       r = do_synchronize(dir_root, current, prev);
+    } else if (prev && dirty_snap_id == current.second) {
+      // a renamed remote directory may still hold entries that are absent
+      // from the current snapshot; a local scan would not visit them
+      dout(5) << ": interrupted after a directory rename -- using incremental sync"
+              << " with remote scan" << dendl;
+      DirRenameStat stat;
+      stat.remote_scan_retries = 1;
+      add_dir_rename_stat(dir_root, stat);
+      r = do_synchronize(dir_root, current, boost::none, false, true);
     } else {
       dout(5) << ": mismatch -- using incremental sync with remote scan" << dendl;
-      r = do_synchronize(dir_root, current);
+      r = do_synchronize(dir_root, current, boost::none, false, rename_marked);
     }
   }
   // snap sync failed -- bail out!
@@ -3973,6 +4234,18 @@ void PeerReplayer::dump_sync_stat(Formatter *f, const SnapSyncStat &sync_stat) {
   f->dump_unsigned("snaps_synced", sync_stat.synced_snap_count);
   f->dump_unsigned("snaps_deleted", sync_stat.deleted_snap_count);
   f->dump_unsigned("snaps_renamed", sync_stat.renamed_snap_count);
+  f->open_object_section("dir_rename");
+  f->dump_unsigned("candidates", sync_stat.dir_rename.candidates);
+  f->dump_unsigned("candidates_peak", sync_stat.dir_rename.candidates_peak);
+  f->dump_unsigned("renamed", sync_stat.dir_rename.renamed);
+  f->dump_unsigned("remote_scan_retries", sync_stat.dir_rename.remote_scan_retries);
+  f->open_object_section("fallbacks");
+  f->dump_unsigned("ambiguous", sync_stat.dir_rename.ambiguous);
+  f->dump_unsigned("over_budget", sync_stat.dir_rename.over_budget);
+  f->dump_unsigned("remote_mismatch", sync_stat.dir_rename.remote_mismatch);
+  f->dump_unsigned("rename_errors", sync_stat.dir_rename.rename_errors);
+  f->close_section(); // fallbacks
+  f->close_section(); // dir_rename
 }
 
 void PeerReplayer::peer_status(Formatter *f) {
