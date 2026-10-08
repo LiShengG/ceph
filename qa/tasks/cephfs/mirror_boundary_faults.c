@@ -250,6 +250,35 @@ int ceph_unlinkat(struct ceph_mount_info *mount, int dirfd, const char *path, in
   return result;
 }
 
+/* "/root/./a" -> "/root/a", as resolve_path() records relative paths. */
+static void collapse_dot_components(const char *path, char *out) {
+  size_t len = 0;
+  while (*path) {
+    if (strncmp(path, "/./", 3) == 0) {
+      path += 2;
+      continue;
+    }
+    if (len + 1 >= 4096) abort();
+    out[len++] = *path++;
+  }
+  out[len] = '\0';
+}
+
+int ceph_rename(struct ceph_mount_info *mount, const char *from, const char *to) {
+  REAL(ceph_rename);
+  char path[4096];
+  collapse_dot_components(from, path);
+  int injected = boundary("before_rename", path, -1);
+  if (injected < 0) return injected;
+  int result = real(mount, from, to);
+  event("rename_result", path, -1, result);
+  if (result == 0) {
+    injected = boundary("after_rename", path, -1);
+    if (injected < 0) return injected;
+  }
+  return result;
+}
+
 int ceph_mksnap(struct ceph_mount_info *mount, const char *path, const char *name,
                 mode_t mode, struct snap_metadata *metadata, size_t count) {
   REAL(ceph_mksnap);
