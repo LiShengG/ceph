@@ -2861,6 +2861,7 @@ class TestMirroring(CephFSTestCase):
             self.verify_snapshot(dir_name, snap_name)
 
         sync_and_verify('snap0', 1)
+        renamed = self._dir_rename_stat(dir_name, peer_spec)['renamed']
 
         self.mount_a.run_shell(['mv', old_dir, new_dir])
         sync_and_verify('snap1', 2)
@@ -2868,6 +2869,11 @@ class TestMirroring(CephFSTestCase):
         self.assertNotIn('dirB', self.mount_b.ls(path=remote_snap))
         self.assertEqual(renamed_contents,
                          self.mount_b.read_file(f'{remote_snap}/dirB-renamed/{renamed_file}'))
+        # the remote directory was renamed rather than recreated
+        self.assertEqual(renamed + 1, self._dir_rename_stat(dir_name, peer_spec)['renamed'])
+        old_ino, new_ino = self._dir_rename_remote_inos(
+            [f'/{dir_name}/.snap/snap0/dirB', f'/{remote_snap}/dirB-renamed'])
+        self.assertEqual(old_ino, new_ino)
 
         self.mount_a.run_shell(['mv', cross_old, cross_new])
         sync_and_verify('snap2', 3)
@@ -2878,6 +2884,8 @@ class TestMirroring(CephFSTestCase):
         self.mount_a.run_shell(['rm', '-rf', replacement_dst])
         self.mount_a.run_shell(['mv', replacement_src, replacement_dst])
         sync_and_verify('snap3', 4)
+        # cross-parent moves and replacements are not renamed remotely
+        self.assertEqual(renamed + 1, self._dir_rename_stat(dir_name, peer_spec)['renamed'])
         remote_replacement = f'{dir_name}/.snap/snap3/replace/B'
         self.assertNotIn('old-only', self.mount_b.ls(path=remote_replacement))
         self.assertEqual(replacement_contents,
@@ -5121,3 +5129,427 @@ with open(path, 'wb') as stream:
 
     def test_cephfs_mirror_snapshot_recreate_between_open_and_identity_check(self):
         self._test_cephfs_mirror_snapshot_identity_changed_during_open('recreate')
+
+    def _dir_rename_stat(self, directory, peer_spec):
+        peer_uuid = self.get_peer_uuid(peer_spec)
+        return self.dir_status_from_asok(self.primary_fs_name, self.primary_fs_id,
+                                         f'/{directory}', peer_uuid)['dir_rename']
+
+    def _dir_rename_remote_inos(self, paths):
+        """Remote inode numbers through libcephfs, comparable across snapshots."""
+        script = f'''
+import cephfs
+import json
+client = cephfs.LibCephFS(conffile={self.mount_b.config_path!r},
+                          auth_id={self.mount_b.client_id!r})
+client.mount(filesystem_name={self.secondary_fs_name.encode()!r})
+try:
+    print(json.dumps([client.stat(path).st_ino for path in {paths!r}]))
+finally:
+    client.shutdown()
+'''
+        return json.loads(self.mount_b.run_python(script))
+
+    @contextmanager
+    def _dir_rename_mirrored(self, directory):
+        """Mirror @directory with libcephfs calls observable and interruptible."""
+        from tasks.cephfs.mirror_boundary_faults import MirrorBoundaryFaults
+
+        self.setup_mount_b(mds_perm='rw')
+        peer_spec = 'client.mirror_remote@ceph'
+        with MirrorBoundaryFaults(self) as faults:
+            self.enable_mirroring(self.primary_fs_name, self.primary_fs_id)
+            self.peer_add(self.primary_fs_name, self.primary_fs_id, peer_spec,
+                          self.secondary_fs_name)
+            self.mount_a.run_shell(['mkdir', '-p', directory])
+            self.add_directory(self.primary_fs_name, self.primary_fs_id, f'/{directory}')
+            yield faults, peer_spec
+            self.remove_directory(self.primary_fs_name, self.primary_fs_id,
+                                  f'/{directory}')
+            self.disable_mirroring(self.primary_fs_name, self.primary_fs_id)
+
+    def _dir_rename_populate(self, path, big_mib=64):
+        self.mount_a.run_shell(['mkdir', '-p', f'{path}/sub/deeper'])
+        self.mount_a.write_file(f'{path}/note', data='small file')
+        self.mount_a.write_file(f'{path}/sub/deeper/unchanged', data='nested file')
+        self.mount_a.run_shell(['ln', '-s', 'sub/deeper/unchanged', f'{path}/link'])
+        self.mount_a.run_python(f'''
+import os
+with open({os.path.join(self.mount_a.mountpoint, path, 'big')!r}, 'wb') as stream:
+    for _ in range({big_mib}):
+        stream.write(b'B' * (1024 * 1024))
+    os.fsync(stream.fileno())
+''')
+
+    def _dir_rename_snapshot(self, directory, peer_spec, snap_name, snap_count,
+                             create=True, retried=False):
+        """Snapshot, wait for the sync and compare snapshot and working trees."""
+        from tasks.cephfs.mirror_boundary_faults import tree_manifest
+
+        if create:
+            self.mount_a.run_shell(['sync'])
+            self.mount_a.run_shell(['mkdir', f'{directory}/.snap/{snap_name}'])
+        if retried:
+            self.check_peer_status_after_sigkill_recovery(
+                self.primary_fs_name, self.primary_fs_id, peer_spec, f'/{directory}',
+                snap_name, expected_snap_count=snap_count)
+        else:
+            self.check_peer_status_idle(self.primary_fs_name, self.primary_fs_id,
+                                        peer_spec, f'/{directory}', snap_name, snap_count)
+        expected = tree_manifest(self.mount_a, f'{directory}/.snap/{snap_name}')
+        self.assertEqual(expected,
+                         tree_manifest(self.mount_b, f'{directory}/.snap/{snap_name}'))
+        # a correct snapshot must not hide stale entries in the working tree
+        self.assertEqual(expected, tree_manifest(self.mount_b, directory))
+        return expected
+
+    @staticmethod
+    def _dir_rename_written(faults):
+        return {path for op, path, _, result in faults.events()
+                if op == 'write_result' and result > 0}
+
+    def _dir_rename_snap_id(self, directory, snap_name):
+        from tasks.cephfs.mirror_boundary_faults import snapshot_info
+        return snapshot_info(self, self.mount_a, self.primary_fs_name,
+                             directory, snap_name)['id']
+
+    def test_cephfs_mirror_dir_rename_reuses_remote_directory(self):
+        """A renamed directory keeps its remote inode and transfers no data."""
+        directory = 'dir_rename_reuse'
+        with self._dir_rename_mirrored(directory) as (faults, peer_spec):
+            self._dir_rename_populate(f'{directory}/P/A')
+            self._dir_rename_snapshot(directory, peer_spec, 's0', 1)
+            before = self._dir_rename_stat(directory, peer_spec)
+
+            self.mount_a.run_shell(['mv', f'{directory}/P/A', f'{directory}/P/B'])
+            faults.clear_events()
+            self._dir_rename_snapshot(directory, peer_spec, 's1', 2)
+            after = self._dir_rename_stat(directory, peer_spec)
+            self.assertEqual(before['renamed'] + 1, after['renamed'])
+            self.assertEqual(set(), self._dir_rename_written(faults))
+            inos = self._dir_rename_remote_inos([
+                f'/{directory}/.snap/s0/P/A', f'/{directory}/.snap/s1/P/B',
+                f'/{directory}/.snap/s0/P/A/big', f'/{directory}/.snap/s1/P/B/big'])
+            self.assertEqual(inos[0], inos[1])
+            self.assertEqual(inos[2], inos[3])
+            self.assertEqual(f'{self._dir_rename_snap_id(directory, "s1")}:rename',
+                             self.mount_b.getfattr(directory, 'ceph.mirror.dirty_snap_id'))
+
+            # The marker on the committed snapshot's ID is a clean baseline.
+            faults.clear_events()
+            self._dir_rename_snapshot(directory, peer_spec, 's2', 3)
+            final = self._dir_rename_stat(directory, peer_spec)
+            self.assertEqual(after['remote_scan_retries'], final['remote_scan_retries'])
+            self.assertEqual(set(), self._dir_rename_written(faults))
+            self.assertEqual(str(self._dir_rename_snap_id(directory, 's2')),
+                             self.mount_b.getfattr(directory, 'ceph.mirror.dirty_snap_id'))
+
+    def test_cephfs_mirror_dir_rename_with_changes_inside(self):
+        """Changes inside a renamed directory are applied to the reused one."""
+        directory = 'dir_rename_changes'
+        base = f'{directory}/P'
+        with self._dir_rename_mirrored(directory) as (faults, peer_spec):
+            self._dir_rename_populate(f'{base}/A')
+            self.mount_a.run_shell(['mkdir', '-p', f'{base}/A/gone/deep',
+                                    f'{base}/A/replaced'])
+            self.mount_a.write_file(f'{base}/A/gone/deep/file', data='removed subtree')
+            self.mount_a.write_file(f'{base}/A/replaced/old-only', data='stale entry')
+            self.mount_a.write_file(f'{base}/A/deleted', data='removed file')
+            self.mount_a.write_file(f'{base}/A/truncated', data='T' * 8192)
+            self._dir_rename_snapshot(directory, peer_spec, 's0', 1)
+            before = self._dir_rename_stat(directory, peer_spec)
+
+            self.mount_a.run_shell(['mv', f'{base}/A', f'{base}/B'])
+            self.mount_a.write_file(f'{base}/B/note', data='modified after the rename')
+            self.mount_a.write_file(f'{base}/B/new', data='created after the rename')
+            self.mount_a.run_shell(['mkdir', '-p', f'{base}/B/newdir/deep'])
+            self.mount_a.write_file(f'{base}/B/newdir/deep/file', data='new subtree')
+            self.mount_a.run_shell(['rm', '-rf', f'{base}/B/gone', f'{base}/B/replaced',
+                                    f'{base}/B/deleted'])
+            self.mount_a.run_shell(['mkdir', f'{base}/B/replaced'])
+            self.mount_a.write_file(f'{base}/B/replaced/new-only', data='replacement')
+            self.mount_a.run_shell(['truncate', '-s', '100', f'{base}/B/truncated'])
+            faults.clear_events()
+            self._dir_rename_snapshot(directory, peer_spec, 's1', 2)
+            self.assertEqual(before['renamed'] + 1,
+                             self._dir_rename_stat(directory, peer_spec)['renamed'])
+            written = self._dir_rename_written(faults)
+            for unchanged in ('big', 'sub/deeper/unchanged'):
+                self.assertNotIn(f'/{base}/B/{unchanged}', written)
+            self.assertIn(f'/{base}/B/note', written)
+
+    def test_cephfs_mirror_dir_rename_with_mode_change(self):
+        """A recursive mode change in a renamed directory transfers no data."""
+        from tasks.cephfs.mirror_boundary_faults import tree_manifest
+
+        directory = 'dir_rename_chmod'
+        base = f'{directory}/P'
+        with self._dir_rename_mirrored(directory) as (faults, peer_spec):
+            self._dir_rename_populate(f'{base}/A')
+            self._dir_rename_snapshot(directory, peer_spec, 's0', 1)
+            self.mount_a.run_shell(['mv', f'{base}/A', f'{base}/B'])
+            self.mount_a.run_shell(['chmod', '-R', 'g+w', f'{base}/B'])
+            self.mount_a.run_shell(['sync'])
+            faults.clear_events()
+            self.mount_a.run_shell(['mkdir', f'{directory}/.snap/s1'])
+            self.check_peer_status_idle(self.primary_fs_name, self.primary_fs_id,
+                                        peer_spec, f'/{directory}', 's1', 2)
+            self.assertEqual(set(), self._dir_rename_written(faults))
+            source = tree_manifest(self.mount_a, f'{directory}/.snap/s1')
+            target = tree_manifest(self.mount_b, f'{directory}/.snap/s1')
+            # v1 snapdiff only reports mtime changes, so only the renamed
+            # directory itself is expected to carry the new mode.
+            self.assertEqual([[path, kind, value] for path, kind, _, value in source],
+                             [[path, kind, value] for path, kind, _, value in target])
+            self.assertIn(next(entry for entry in source if entry[0] == 'P/B'), target)
+
+    def test_cephfs_mirror_dir_rename_with_mtime_only_change(self):
+        """An mtime-only change in a renamed directory is synced by a full copy."""
+        directory = 'dir_rename_mtime'
+        base = f'{directory}/P'
+        with self._dir_rename_mirrored(directory) as (faults, peer_spec):
+            self._dir_rename_populate(f'{base}/A', big_mib=8)
+            self._dir_rename_snapshot(directory, peer_spec, 's0', 1)
+            self.mount_a.run_shell(['mv', f'{base}/A', f'{base}/B'])
+            self.mount_a.run_shell(['touch', '-m', '-d', '@1600000000', f'{base}/B/big'])
+            faults.clear_events()
+            self._dir_rename_snapshot(directory, peer_spec, 's1', 2)
+            source = self._boundary_file_state(self.mount_a, f'{directory}/.snap/s1/P/B/big')
+            target = self._boundary_file_state(self.mount_b, f'{directory}/.snap/s1/P/B/big')
+            self.assertEqual(source['mtime_ns'], target['mtime_ns'])
+            log.info('mtime-only change in a renamed directory wrote: %s',
+                     sorted(self._dir_rename_written(faults)))
+
+    def _test_cephfs_mirror_dir_rename_not_reused(self, directory, mutate):
+        with self._dir_rename_mirrored(directory) as (faults, peer_spec):
+            for name in ('A', 'B'):
+                self._dir_rename_populate(f'{directory}/P/{name}', big_mib=1)
+            self._dir_rename_snapshot(directory, peer_spec, 's0', 1)
+            before = self._dir_rename_stat(directory, peer_spec)
+            mutate(f'{directory}/P')
+            self._dir_rename_snapshot(directory, peer_spec, 's1', 2)
+            self.assertEqual(before['renamed'],
+                             self._dir_rename_stat(directory, peer_spec)['renamed'])
+
+    def test_cephfs_mirror_dir_rename_then_recreate_old_name(self):
+        """Reusing the old name is a replacement, never a rename source."""
+        def recreate(parent):
+            self.mount_a.run_shell(['mv', f'{parent}/A', f'{parent}/C'])
+            self.mount_a.run_shell(['mkdir', f'{parent}/A'])
+            self.mount_a.write_file(f'{parent}/A/fresh', data='recreated directory')
+            self.mount_a.run_shell(['mv', f'{parent}/B', f'{parent}/D'])
+            self.mount_a.write_file(f'{parent}/B', data='recreated as a file')
+        self._test_cephfs_mirror_dir_rename_not_reused('dir_rename_recreate', recreate)
+
+    def test_cephfs_mirror_dir_rename_overwrite_swap_and_chain(self):
+        """Overwrites, swaps and chained renames fall back to a rebuild."""
+        def overwrite(parent):
+            self.mount_a.run_shell(['rm', '-rf', f'{parent}/B'])
+            self.mount_a.run_shell(['mv', f'{parent}/A', f'{parent}/B'])
+        def swap(parent):
+            self.mount_a.run_shell(['mv', f'{parent}/A', f'{parent}/tmp'])
+            self.mount_a.run_shell(['mv', f'{parent}/B', f'{parent}/A'])
+            self.mount_a.run_shell(['mv', f'{parent}/tmp', f'{parent}/B'])
+        def chain(parent):
+            self.mount_a.run_shell(['mv', f'{parent}/B', f'{parent}/C'])
+            self.mount_a.run_shell(['mv', f'{parent}/A', f'{parent}/B'])
+        for name, mutate in (('overwrite', overwrite), ('swap', swap), ('chain', chain)):
+            with self.subTest(name):
+                self._test_cephfs_mirror_dir_rename_not_reused(
+                    f'dir_rename_{name}', mutate)
+
+    def test_cephfs_mirror_dir_rename_nested_and_cross_parent(self):
+        """Nested renames reuse the mapped path; moves out of it are rebuilt."""
+        directory = 'dir_rename_nested'
+        base = f'{directory}/P'
+        with self._dir_rename_mirrored(directory) as (faults, peer_spec):
+            for name in ('x', 'y'):
+                self._dir_rename_populate(f'{base}/A/{name}', big_mib=1)
+            self.mount_a.run_shell(['mkdir', '-p', f'{directory}/Q'])
+            self._dir_rename_snapshot(directory, peer_spec, 's0', 1)
+            before = self._dir_rename_stat(directory, peer_spec)
+
+            self.mount_a.run_shell(['mv', f'{base}/A', f'{base}/B'])
+            self.mount_a.run_shell(['mv', f'{base}/B/y', f'{base}/B/z'])
+            self.mount_a.run_shell(['mv', f'{base}/B/x', f'{directory}/Q/x'])
+            faults.clear_events()
+            self._dir_rename_snapshot(directory, peer_spec, 's1', 2)
+            self.assertEqual(before['renamed'] + 2,
+                             self._dir_rename_stat(directory, peer_spec)['renamed'])
+            written = self._dir_rename_written(faults)
+            self.assertNotIn(f'/{base}/B/z/big', written)
+            self.assertIn(f'/{directory}/Q/x/big', written)
+
+    def test_cephfs_mirror_dir_rename_across_reply_pages(self):
+        """Pairing does not depend on reply pages or on the listing order."""
+        directory = 'dir_rename_pages'
+        base = f'{directory}/P'
+        count = 24
+        with self._dir_rename_mirrored(directory) as (faults, peer_spec):
+            xattr = 'x' * 60000
+            for i in range(count):
+                for kind in ('renamed', 'kept'):
+                    path = f'{base}/{kind}{i}'
+                    self.mount_a.run_shell(['mkdir', '-p', path])
+                    self.mount_a.write_file(f'{path}/file', data=path)
+                    self.mount_a.setfattr(path, 'user.big', xattr)
+            self._dir_rename_snapshot(directory, peer_spec, 's0', 1)
+            before = self._dir_rename_stat(directory, peer_spec)
+            for i in range(count):
+                self.mount_a.run_shell(['mv', f'{base}/renamed{i}', f'{base}/moved{i}'])
+            faults.clear_events()
+            self._dir_rename_snapshot(directory, peer_spec, 's1', 2)
+            after = self._dir_rename_stat(directory, peer_spec)
+            self.assertEqual(before['renamed'] + count, after['renamed'])
+            self.assertEqual(set(), self._dir_rename_written(faults))
+
+    def test_cephfs_mirror_dir_rename_candidate_budget(self):
+        """Candidates beyond the budget are synced without rename detection."""
+        directory = 'dir_rename_budget'
+        base = f'{directory}/P'
+        count = 4
+        with self._dir_rename_mirrored(directory) as (faults, peer_spec):
+            faults.set_config('cephfs_mirror_dir_rename_max_candidates', 2)
+            for i in range(count):
+                self._dir_rename_populate(f'{base}/A{i}', big_mib=1)
+            self._dir_rename_snapshot(directory, peer_spec, 's0', 1)
+            before = self._dir_rename_stat(directory, peer_spec)
+            for i in range(count):
+                self.mount_a.run_shell(['mv', f'{base}/A{i}', f'{base}/B{i}'])
+            self._dir_rename_snapshot(directory, peer_spec, 's1', 2)
+            after = self._dir_rename_stat(directory, peer_spec)
+            self.assertLessEqual(after['candidates_peak'], 2)
+            self.assertGreaterEqual(after['fallbacks']['over_budget'] -
+                                    before['fallbacks']['over_budget'], 2 * count - 2)
+            self.assertLessEqual(after['renamed'] - before['renamed'], 1)
+
+    def _test_cephfs_mirror_dir_rename_remote_mismatch(self, mismatch):
+        directory = f'dir_rename_remote_{mismatch}'
+        base = f'{directory}/P'
+        with self._dir_rename_mirrored(directory) as (faults, peer_spec):
+            self._dir_rename_populate(f'{base}/A', big_mib=1)
+            self._dir_rename_snapshot(directory, peer_spec, 's0', 1)
+            before = self._dir_rename_stat(directory, peer_spec)
+            if mismatch == 'target_exists':
+                self.mount_b.run_shell(['mkdir', f'{base}/B'])
+            else:
+                self.mount_b.run_shell(['rm', '-rf', f'{base}/A'])
+            self.mount_a.run_shell(['mv', f'{base}/A', f'{base}/B'])
+            faults.clear_events()
+            self._dir_rename_snapshot(directory, peer_spec, 's1', 2, retried=True)
+            after = self._dir_rename_stat(directory, peer_spec)
+            self.assertEqual(before['fallbacks']['remote_mismatch'] + 1,
+                             after['fallbacks']['remote_mismatch'])
+            self.assertLess(before['remote_scan_retries'], after['remote_scan_retries'])
+            self.assertEqual(before['renamed'], after['renamed'])
+            self.assertNotIn('rename_result', [event[0] for event in faults.events()])
+
+    def test_cephfs_mirror_dir_rename_remote_target_exists(self):
+        """An existing remote target, even an empty one, is never replaced."""
+        self._test_cephfs_mirror_dir_rename_remote_mismatch('target_exists')
+
+    def test_cephfs_mirror_dir_rename_remote_source_missing(self):
+        self._test_cephfs_mirror_dir_rename_remote_mismatch('source_missing')
+
+    def test_cephfs_mirror_dir_rename_faked_inos(self):
+        """Faked inode numbers cannot identify a directory across snapshots."""
+        directory = 'dir_rename_faked_inos'
+        with self._dir_rename_mirrored(directory) as (faults, peer_spec):
+            # no_mon_update option: pass it on the daemon command line; the
+            # faults context restores the original arguments on exit
+            args = faults.daemon.command_kwargs['args']
+            faults.daemon.command_kwargs['args'] = args + ['--client_use_faked_inos=true']
+            faults.restart()
+            peer_uuid = self.get_peer_uuid(peer_spec)
+            self.wait_for_mirror_daemon_recovery(
+                self.primary_fs_name, self.primary_fs_id, f'/{directory}', peer_uuid)
+            self._dir_rename_populate(f'{directory}/P/A', big_mib=1)
+            self._dir_rename_snapshot(directory, peer_spec, 's0', 1)
+            self.mount_a.run_shell(['mv', f'{directory}/P/A', f'{directory}/P/B'])
+            self._dir_rename_snapshot(directory, peer_spec, 's1', 2)
+            stat = self._dir_rename_stat(directory, peer_spec)
+            self.assertEqual(0, stat['candidates'])
+            self.assertEqual(0, stat['renamed'])
+
+    def _test_cephfs_mirror_dir_rename_sigkill(self, operation, gate_path, offset=-1):
+        """A retry after a directory rename rescans the remote."""
+        directory = f'dir_rename_kill_{operation}'
+        base = f'{directory}/P'
+        with self._dir_rename_mirrored(directory) as (faults, peer_spec):
+            self._dir_rename_populate(f'{base}/A', big_mib=1)
+            self.mount_a.write_file(f'{base}/A/deleted', data='removed after the rename')
+            self.mount_a.write_file(f'{base}/A/modified', data='M' * 4096)
+            self._dir_rename_snapshot(directory, peer_spec, 's0', 1)
+
+            self.mount_a.run_shell(['mv', f'{base}/A', f'{base}/B'])
+            self.mount_a.run_shell(['rm', f'{base}/B/deleted'])
+            self.mount_a.write_file(f'{base}/B/modified', data='N' * 8192)
+            self.mount_a.run_shell(['sync'])
+            faults.arm(operation, gate_path.format(directory=directory), offset=offset)
+            self.mount_a.run_shell(['mkdir', f'{directory}/.snap/s1'])
+            faults.wait_hit(operation)
+            self.assertNotIn('s1', self.mount_b.ls(path=f'{directory}/.snap'))
+            self.assertEqual(f'{self._dir_rename_snap_id(directory, "s1")}:rename',
+                             self.mount_b.getfattr(directory, 'ceph.mirror.dirty_snap_id'))
+
+            faults.restart()
+            peer_uuid = self.get_peer_uuid(peer_spec)
+            self.wait_for_mirror_daemon_recovery(
+                self.primary_fs_name, self.primary_fs_id, f'/{directory}', peer_uuid)
+            # snaps_synced restarts from zero with the daemon
+            self._dir_rename_snapshot(directory, peer_spec, 's1', 1, create=False,
+                                      retried=True)
+            stat = self._dir_rename_stat(directory, peer_spec)
+            self.assertEqual(1, stat['remote_scan_retries'])
+            self.assertEqual(0, stat['renamed'])
+            self.assertNotIn('gate_timeout', [event[0] for event in faults.events()])
+
+    def test_cephfs_mirror_dir_rename_sigkill_before_rename(self):
+        self._test_cephfs_mirror_dir_rename_sigkill('before_rename', '/{directory}/P/A')
+
+    def test_cephfs_mirror_dir_rename_sigkill_after_rename(self):
+        self._test_cephfs_mirror_dir_rename_sigkill('after_rename', '/{directory}/P/A')
+
+    def test_cephfs_mirror_dir_rename_sigkill_during_delete(self):
+        self._test_cephfs_mirror_dir_rename_sigkill('after_unlink',
+                                                    '/{directory}/P/B/deleted')
+
+    def test_cephfs_mirror_dir_rename_sigkill_during_copy(self):
+        self._test_cephfs_mirror_dir_rename_sigkill('after_write',
+                                                    '/{directory}/P/B/modified', offset=0)
+
+    def test_cephfs_mirror_dir_rename_sigkill_before_snapshot(self):
+        self._test_cephfs_mirror_dir_rename_sigkill('mksnap', '/{directory}/.snap/s1')
+
+    def test_cephfs_mirror_retry_without_rename_uses_local_scan(self):
+        """A failed sync that renamed nothing is retried with snapdiff."""
+        directory = 'dir_rename_plain_retry'
+        with self._dir_rename_mirrored(directory) as (faults, peer_spec):
+            self._dir_rename_populate(f'{directory}/P/A', big_mib=1)
+            self._dir_rename_snapshot(directory, peer_spec, 's0', 1)
+            before = self._dir_rename_stat(directory, peer_spec)
+            self.mount_a.write_file(f'{directory}/P/A/note', data='changed in place')
+            faults.arm('write', f'/{directory}/P/A/note', action='error')
+            self._dir_rename_snapshot(directory, peer_spec, 's1', 2, retried=True)
+            self.assertIn(('write', f'/{directory}/P/A/note', 0, -errno.EIO),
+                          faults.events())
+            self.assertEqual(before['remote_scan_retries'],
+                             self._dir_rename_stat(directory, peer_spec)['remote_scan_retries'])
+            self.assertEqual(str(self._dir_rename_snap_id(directory, 's1')),
+                             self.mount_b.getfattr(directory, 'ceph.mirror.dirty_snap_id'))
+            self.assert_mirror_log_lacks_pattern('interrupted after a directory rename')
+
+    def test_cephfs_mirror_crawl_error_with_full_traversal_dirs(self):
+        """A crawl error closes directories opened for full traversal."""
+        directory = 'dir_rename_crawl_error'
+        with self._dir_rename_mirrored(directory) as (faults, peer_spec):
+            self.mount_a.write_file(f'{directory}/file', data='baseline')
+            self._dir_rename_snapshot(directory, peer_spec, 's0', 1)
+            pid = self.get_mirror_daemon_pid()
+            self.mount_a.run_shell(['mkdir', '-p', f'{directory}/N/sub/deep'])
+            self.mount_a.write_file(f'{directory}/N/sub/deep/file', data='new subtree')
+            faults.arm('after_mkdir', f'/{directory}/N/sub/deep', action='error')
+            self._dir_rename_snapshot(directory, peer_spec, 's1', 2, retried=True)
+            self.assertIn(('after_mkdir', f'/{directory}/N/sub/deep', -1, -errno.EIO),
+                          faults.events())
+            self.assertEqual(pid, self.get_mirror_daemon_pid())
