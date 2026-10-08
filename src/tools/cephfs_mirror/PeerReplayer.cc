@@ -1826,14 +1826,14 @@ close_local_fd:
 
 int PeerReplayer::remote_file_op(std::shared_ptr<SyncMechanism>& syncm, const std::string &dir_root,
                                  const std::string &epath, const struct ceph_statx &stx,
-                                 bool sync_check, const FHandles &fh, bool need_data_sync, bool need_attr_sync) {
+                                 bool blockdiff_allowed, const FHandles &fh, bool need_data_sync, bool need_attr_sync) {
   dout(10) << ": dir_root=" << dir_root << ", epath=" << epath << ", need_data_sync=" << need_data_sync
            << ", need_attr_sync=" << need_attr_sync << dendl;
 
   int r;
   if (need_data_sync) {
     if (S_ISREG(stx.stx_mode)) {
-      r = syncm->get_changed_blocks(epath, stx, sync_check,
+      r = syncm->get_changed_blocks(epath, stx, blockdiff_allowed,
                                     [this, &dir_root, &epath, &stx, &fh](uint64_t num_blocks, struct cblock *b) {
                                       int ret = copy_to_remote(dir_root, epath, stx, fh, num_blocks, b);
                                       if (ret < 0) {
@@ -2026,19 +2026,24 @@ int PeerReplayer::cleanup_remote_dir(const std::string &dir_root,
   return r;
 }
 
-int PeerReplayer::should_sync_entry(const std::string &epath, const struct ceph_statx &cstx,
-                                    const FHandles &fh, bool *need_data_sync, bool *need_attr_sync) {
-  dout(10) << ": epath=" << epath << dendl;
+int PeerReplayer::should_sync_entry(const std::string &epath, const std::string &prev_epath,
+                                    const struct ceph_statx &cstx, const FHandles &fh,
+                                    bool *need_data_sync, bool *need_attr_sync) {
+  dout(10) << ": epath=" << epath << ", prev_epath=" << prev_epath << dendl;
 
   *need_data_sync = false;
   *need_attr_sync = false;
+  // paths only differ within a renamed directory, where p_fd is the local
+  // prev snapshot and inode numbers are comparable
+  const bool renamed = prev_epath != epath;
   struct ceph_statx pstx;
-  int r = ceph_statxat(fh.p_mnt, fh.p_fd, epath.c_str(), &pstx,
+  int r = ceph_statxat(fh.p_mnt, fh.p_fd, prev_epath.c_str(), &pstx,
+                       (renamed ? CEPH_STATX_INO : 0) |
                        CEPH_STATX_MODE | CEPH_STATX_UID | CEPH_STATX_GID |
                        CEPH_STATX_SIZE | CEPH_STATX_CTIME | CEPH_STATX_MTIME,
                        AT_STATX_DONT_SYNC | AT_SYMLINK_NOFOLLOW);
   if (r < 0 && r != -ENOENT && r != -ENOTDIR) {
-    derr << ": failed to stat prev entry= " << epath << ": " << cpp_strerror(r)
+    derr << ": failed to stat prev entry= " << prev_epath << ": " << cpp_strerror(r)
          << dendl;
     return r;
   }
@@ -2060,6 +2065,11 @@ int PeerReplayer::should_sync_entry(const std::string &epath, const struct ceph_
            << pstx.stx_ctime << ", mtime=" << pstx.stx_mtime << dendl;
   if ((cstx.stx_mode & S_IFMT) != (pstx.stx_mode & S_IFMT)) {
     dout(5) << ": entry=" << epath << " has mode mismatch" << dendl;
+    *need_data_sync = true;
+    *need_attr_sync = true;
+  } else if (renamed && cstx.stx_ino != pstx.stx_ino) {
+    dout(5) << ": entry=" << epath << " has inode mismatch with prev entry="
+            << prev_epath << dendl;
     *need_data_sync = true;
     *need_attr_sync = true;
   } else {
@@ -2455,7 +2465,7 @@ bool PeerReplayer::SyncMechanism::wait_for_sync() {
 }
 
 int PeerReplayer::SyncMechanism::get_changed_blocks(const std::string &epath,
-                                                    const struct ceph_statx &stx, bool sync_check,
+                                                    const struct ceph_statx &stx, bool blockdiff_allowed,
                                                     const std::function<int (uint64_t, struct cblock *)> &callback) {
   dout(20) << ": epath=" << epath << dendl;
 
@@ -2509,6 +2519,7 @@ int PeerReplayer::SnapDiffSync::init_sync() {
 }
 
 int PeerReplayer::SnapDiffSync::init_directory(const std::string &epath,
+                                               const std::string &prev_epath,
                                                const struct ceph_statx &stx, bool pic, SyncEntry *se) {
   dout(20) << ": epath=" << epath << dendl;
 
@@ -2539,6 +2550,7 @@ int PeerReplayer::SnapDiffSync::init_directory(const std::string &epath,
     *se = SyncEntry(epath, info, stx);
   }
 
+  se->prev_epath = prev_epath;
   return 0;
 }
 
@@ -2616,35 +2628,14 @@ int PeerReplayer::SnapDiffSync::get_entry(std::string *epath, struct ceph_statx 
       dout(20) << ": entry=" << e_name << ", snapid=" << snapid << dendl;
       if (e_name != "." && e_name != "..") {
         auto _epath = entry_path(entry.epath, e_name);
+        auto _prev_epath = entry_path(entry.prev_epath, e_name);
         dout(20) << ": epath=" << _epath << dendl;
         if (snapid == (*m_prev).second) {
           dout(20) << ": epath=" << _epath << " is deleted in current snapshot " << dendl;
-          // do not depend on d_type reported in struct dirent as the
-          // delete and create could have been processed and a restart
-          // of an interrupted sync would use the incorrect unlink API.
-          // N.B.: snapdiff returns the deleted entry before the newly
-          // created one.
-          struct ceph_statx pstx;
-          r = ceph_statxat(m_remote, m_fh->r_fd_dir_root, _epath.c_str(), &pstx,
-                           CEPH_STATX_MODE, AT_STATX_DONT_SYNC | AT_SYMLINK_NOFOLLOW);
-          if (r < 0 && r != -ENOENT) {
-            derr << ": failed to stat remote entry=" << _epath << ", r=" << r << dendl;
+          r = remove_remote_entry(entry.epath, e_name, purge_func);
+          if (r < 0) {
             return r;
           }
-          if (r == 0) {
-            if (!S_ISDIR(pstx.stx_mode)) {
-              r = ceph_unlinkat(m_remote, m_fh->r_fd_dir_root, _epath.c_str(), 0);
-            } else {
-              r = purge_func(_epath);
-            }
-
-            if (r < 0) {
-              derr << ": failed to propagate missing dirs r=" << r << dendl;
-              return r;
-            }
-          }
-
-          m_deleted[entry.epath].emplace(e_name);
           r = 1; //Continue with the outer loop
           break;
         }
@@ -2665,7 +2656,7 @@ int PeerReplayer::SnapDiffSync::get_entry(std::string *epath, struct ceph_statx 
           bool purge_remote = false;
           if (!pic) {
             struct ceph_statx prev_stx;
-            r = ceph_statxat(m_fh->p_mnt, m_fh->p_fd, _epath.c_str(), &prev_stx,
+            r = ceph_statxat(m_fh->p_mnt, m_fh->p_fd, _prev_epath.c_str(), &prev_stx,
                              CEPH_STATX_INO | CEPH_STATX_MODE,
                              AT_STATX_DONT_SYNC | AT_SYMLINK_NOFOLLOW);
             if (r == -ENOENT) {
@@ -2674,7 +2665,7 @@ int PeerReplayer::SnapDiffSync::get_entry(std::string *epath, struct ceph_statx 
                        << dendl;
               pic = true;
             } else if (r < 0) {
-              derr << ": failed to stat previous directory=" << _epath
+              derr << ": failed to stat previous directory=" << _prev_epath
                    << ", r=" << r << dendl;
               return r;
             } else if (!S_ISDIR(prev_stx.stx_mode)) {
@@ -2716,32 +2707,17 @@ int PeerReplayer::SnapDiffSync::get_entry(std::string *epath, struct ceph_statx 
             }
           }
 
-          SyncEntry se;
-          r = init_directory(_epath, estx, pic, &se);
-          if (r < 0) {
-            return r;
-          }
-
-          if (pic) {
-            dout(10) << ": purge or itype change (including parent) found for entry="
-                     << se.epath << dendl;
-            se.set_purged_or_itype_changed();
-          }
-
-          m_sync_stack.emplace(se);
-          dout(20) << ": Added directory to stack =" << _epath << dendl;
-          r = remote_mkdir(_epath, estx);
-          if (r < 0) {
-            derr << ": mkdir failed on remote. epath=" << _epath << ": " << cpp_strerror(r)
-               << dendl;
-            return r;
-          }
-          //Fill epath to avoid caller treat this as failure and breaking the loop early.
-          *epath = _epath;
-          *stx = estx;
-          return r; // New directory added to stack
+          SyncEntry dir(_epath, estx);
+          dir.prev_epath = _prev_epath;
+          dir.purged_or_itype_changed = pic;
+          dir.uses_renamed_base = entry.uses_renamed_base;
+          return push_directory(dir, epath, stx);
         } else {
-          push_dataq_entry(SyncEntry(_epath, estx, !pic));
+          SyncEntry se(_epath, estx, !pic);
+          se.prev_epath = _prev_epath;
+          // blockdiff compares the same path in both snapshots
+          se.blockdiff_allowed = !pic && !entry.uses_renamed_base;
+          push_dataq_entry(std::move(se));
           dout(10) << ": sync_check=" << *sync_check << " for epath=" << _epath << dendl;
 	}
       }
@@ -2766,20 +2742,84 @@ int PeerReplayer::SnapDiffSync::get_entry(std::string *epath, struct ceph_statx 
   return 0;
 }
 
+int PeerReplayer::SnapDiffSync::push_directory(const SyncEntry &dir, std::string *epath,
+                                               struct ceph_statx *stx) {
+  const bool pic = dir.is_purged_or_itype_changed();
+  SyncEntry se;
+  int r = init_directory(dir.epath, dir.prev_epath, dir.stx, pic, &se);
+  if (r < 0) {
+    return r;
+  }
+
+  if (pic) {
+    dout(10) << ": purge or itype change (including parent) found for entry="
+             << se.epath << dendl;
+    se.set_purged_or_itype_changed();
+  } else {
+    se.uses_renamed_base = dir.uses_renamed_base;
+  }
+
+  m_sync_stack.emplace(se);
+  dout(20) << ": Added directory to stack =" << dir.epath << dendl;
+  r = remote_mkdir(dir.epath, dir.stx);
+  if (r < 0) {
+    derr << ": mkdir failed on remote. epath=" << dir.epath << ": " << cpp_strerror(r)
+       << dendl;
+    return r;
+  }
+  //Fill epath to avoid caller treat this as failure and breaking the loop early.
+  *epath = dir.epath;
+  *stx = dir.stx;
+  return r; // New directory added to stack
+}
+
+int PeerReplayer::SnapDiffSync::remove_remote_entry(const std::string &parent,
+                                                    const std::string &e_name,
+                                                    const std::function<int (const std::string&)> &purge_func) {
+  auto epath = entry_path(parent, e_name);
+  // do not depend on d_type reported in struct dirent as the
+  // delete and create could have been processed and a restart
+  // of an interrupted sync would use the incorrect unlink API.
+  // N.B.: snapdiff returns the deleted entry before the newly
+  // created one.
+  struct ceph_statx pstx;
+  int r = ceph_statxat(m_remote, m_fh->r_fd_dir_root, epath.c_str(), &pstx,
+                       CEPH_STATX_MODE, AT_STATX_DONT_SYNC | AT_SYMLINK_NOFOLLOW);
+  if (r < 0 && r != -ENOENT) {
+    derr << ": failed to stat remote entry=" << epath << ", r=" << r << dendl;
+    return r;
+  }
+  if (r == 0) {
+    if (!S_ISDIR(pstx.stx_mode)) {
+      r = ceph_unlinkat(m_remote, m_fh->r_fd_dir_root, epath.c_str(), 0);
+    } else {
+      r = purge_func(epath);
+    }
+
+    if (r < 0) {
+      derr << ": failed to propagate missing dirs r=" << r << dendl;
+      return r;
+    }
+  }
+
+  m_deleted[parent].emplace(e_name);
+  return 0;
+}
+
 int PeerReplayer::SnapDiffSync::get_changed_blocks(const std::string &epath,
-                                                   const struct ceph_statx &stx, bool sync_check,
+                                                   const struct ceph_statx &stx, bool blockdiff_allowed,
                                                    const std::function<int (uint64_t, struct cblock *)> &callback) {
   dout(20) << ": dir_root=" << m_dir_root << ", epath=" << epath
-           << ", sync_check=" << sync_check << dendl;
+           << ", blockdiff_allowed=" << blockdiff_allowed << dendl;
 
   using clock = std::chrono::steady_clock;
   using seconds = std::chrono::duration<double>;
   seconds blockdiff_time{0};
   uint64_t bd_synced_bytes = 0;
 
-  if (!sync_check || stx.stx_size <= m_peer_replayer.get_blockdiff_min_file_size()) {
+  if (!blockdiff_allowed || stx.stx_size <= m_peer_replayer.get_blockdiff_min_file_size()) {
     auto bd_s = clock::now();
-    int r = SyncMechanism::get_changed_blocks(epath, stx, sync_check, callback);
+    int r = SyncMechanism::get_changed_blocks(epath, stx, blockdiff_allowed, callback);
     auto bd_e = clock::now();
     blockdiff_time = seconds(bd_e - bd_s);
     bd_synced_bytes = stx.stx_size;
@@ -2799,7 +2839,7 @@ int PeerReplayer::SnapDiffSync::get_changed_blocks(const std::string &epath,
   if (r < 0) {
     dout(20) << ": new file epath=" << epath << dendl;
     auto bd_s = clock::now();
-    int r = SyncMechanism::get_changed_blocks(epath, stx, sync_check, callback);
+    int r = SyncMechanism::get_changed_blocks(epath, stx, blockdiff_allowed, callback);
     auto bd_e = clock::now();
     blockdiff_time = seconds(bd_e - bd_s);
     bd_synced_bytes = stx.stx_size;
@@ -3630,7 +3670,7 @@ void PeerReplayer::run_datasync(SnapshotDataSyncThread *data_replayer) {
       bool need_data_sync = true;
       bool need_attr_sync = true;
       if (entry.sync_check) {
-        r = should_sync_entry(entry.epath, entry.stx, fh,
+        r = should_sync_entry(entry.epath, entry.prev_epath, entry.stx, fh,
                               &need_data_sync, &need_attr_sync);
         if (r < 0) {
           dout(5) << ": should_sync_entry failed, cannot proceed sync: " << cpp_strerror(r)
@@ -3644,7 +3684,7 @@ void PeerReplayer::run_datasync(SnapshotDataSyncThread *data_replayer) {
 	      << need_data_sync << " attr_sync=" << need_attr_sync << dendl;
       if (need_data_sync || need_attr_sync) {
         r = remote_file_op(syncm, std::string(syncm->get_m_dir_root()),
-                           entry.epath, entry.stx, entry.sync_check, fh,
+                           entry.epath, entry.stx, entry.blockdiff_allowed, fh,
                            need_data_sync, need_attr_sync);
         if (r < 0) {
           dout(5) << ": remote_file_op failed, cannot proceed sync: " << cpp_strerror(r)

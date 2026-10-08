@@ -168,6 +168,8 @@ private:
 
   struct SyncEntry {
     std::string epath;
+    // path of this entry in the previous snapshot
+    std::string prev_epath;
     ceph_dir_result *dirp; // valid for directories
     ceph_snapdiff_info info;
     struct ceph_statx stx;
@@ -179,6 +181,9 @@ private:
     bool purged_or_itype_changed = false;
     bool is_snapdiff = false;
     bool sync_check = true;
+    // remote baseline was kept by renaming the remote directory
+    bool uses_renamed_base = false;
+    bool blockdiff_allowed = true;
 
     SyncEntry() {
     }
@@ -186,12 +191,14 @@ private:
     SyncEntry(std::string_view path,
               const struct ceph_statx &stx)
       : epath(path),
+        prev_epath(path),
         stx(stx) {
     }
     SyncEntry(std::string_view path,
               const struct ceph_statx &stx,
 	      bool sync_check)
       : epath(path),
+        prev_epath(path),
         stx(stx),
 	sync_check(sync_check) {
     }
@@ -199,6 +206,7 @@ private:
               ceph_dir_result *dirp,
               const struct ceph_statx &stx)
       : epath(path),
+        prev_epath(path),
         dirp(dirp),
         stx(stx) {
     }
@@ -206,6 +214,7 @@ private:
               const ceph_snapdiff_info &info,
               const struct ceph_statx &stx)
       : epath(path),
+        prev_epath(path),
         info(info),
         stx(stx) {
       is_snapdiff = true;
@@ -249,7 +258,7 @@ private:
                           const std::function<int (const std::string&)> &purge_func) = 0;
 
     virtual int get_changed_blocks(const std::string &epath,
-                                   const struct ceph_statx &stx, bool sync_check,
+                                   const struct ceph_statx &stx, bool blockdiff_allowed,
                                    const std::function<int (uint64_t, struct cblock *)> &callback);
 
     virtual void finish_crawl(int ret, double crawl_duration_secs) = 0;
@@ -385,16 +394,19 @@ private:
                   const std::function<int (const std::string&)> &purge_func);
 
     int get_changed_blocks(const std::string &epath,
-                           const struct ceph_statx &stx, bool sync_check,
+                           const struct ceph_statx &stx, bool blockdiff_allowed,
                            const std::function<int (uint64_t, struct cblock *)> &callback);
 
     void finish_crawl(int ret, double crawl_duration_secs);
 
   private:
-    int init_directory(const std::string &epath,
+    int init_directory(const std::string &epath, const std::string &prev_epath,
                        const struct ceph_statx &stx, bool pic, SyncEntry *se);
     int next_entry(SyncEntry &entry, std::string *e_name, snapid_t *snapid);
     void fini_directory(SyncEntry &entry);
+    int push_directory(const SyncEntry &dir, std::string *epath, struct ceph_statx *stx);
+    int remove_remote_entry(const std::string &parent, const std::string &e_name,
+                            const std::function<int (const std::string&)> &purge_func);
 
     std::map<std::string, std::set<std::string>> m_deleted;
   };
@@ -804,8 +816,9 @@ private:
   int cleanup_remote_dir(const std::string &dir_root, const std::string &epath,
                          const FHandles &fh);
 
-  int should_sync_entry(const std::string &epath, const struct ceph_statx &cstx,
-                        const FHandles &fh, bool *need_data_sync, bool *need_attr_sync);
+  int should_sync_entry(const std::string &epath, const std::string &prev_epath,
+                        const struct ceph_statx &cstx, const FHandles &fh,
+                        bool *need_data_sync, bool *need_attr_sync);
 
   int open_dir(MountRef mnt, const std::string &dir_path, boost::optional<uint64_t> snap_id);
   int pre_sync_check_and_open_handles(const std::string &dir_root, const Snapshot &current,
@@ -823,7 +836,7 @@ private:
 
   int remote_file_op(std::shared_ptr<SyncMechanism>& syncm, const std::string &dir_root,
                      const std::string &epath, const struct ceph_statx &stx,
-                     bool sync_check, const FHandles &fh, bool need_data_sync, bool need_attr_sync);
+                     bool blockdiff_allowed, const FHandles &fh, bool need_data_sync, bool need_attr_sync);
   int copy_to_remote(const std::string &dir_root, const std::string &epath, const struct ceph_statx &stx,
                      const FHandles &fh, uint64_t num_blocks, struct cblock *b);
   int sync_perms(const std::string& path);
