@@ -236,32 +236,46 @@ struct dir_result_t {
 
   void reset() {
     last_name.clear();
-    next_offset = 2;
+    continuation = {};
     offset = 0;
-    ordered_count = 0;
-    cache_index = 0;
-    buffer.clear();
+    offset_pass = 0;
+    drop_buffer();
   }
 
   InodeRef inode;
   int64_t offset;        // hash order:
-			 //   (0xff << 52) | ((24 bits hash) << 28) |
-			 //   (the nth entry has hash collision);
-			 // frag+name order;
-			 //   ((frag value) << 28) | (the nth entry in frag);
+                         //   (0xff << 52) | ((24 bits hash) << 28) | ordinal;
+                         // frag order: ((frag value) << 28) | ordinal;
 
-  unsigned next_offset;  // offset of next chunk (last_name's + 1)
-  std::string last_name;      // last entry in previous chunk
+  // Pass that assigned offset's ordinal; 0 means unknown.
+  // External seek cookies retain their existing interpretation.
+  uint64_t offset_pass = 0;
+  static constexpr uint64_t SEEK_PASS = UINT64_MAX;
 
-  uint64_t release_count;
-  uint64_t ordered_count;
-  unsigned cache_index;
-  int start_shared_gen;  // dir shared_gen at start of readdir
+  struct continuation_t {
+    unsigned offset = 2;
+    uint64_t pass = 0;
+  } continuation;
+  std::string last_name; // MDS name preceding continuation
+
   // An authoritative rstat from a request sent since this sequence is fresh.
   uint64_t listing_seq = 0;
   UserPerm perms;
 
   frag_t buffer_frag;
+  continuation_t buffer_continuation;
+  uint64_t buffer_offset_pass = 0; // 0 if buffer entries mix pass orders
+
+  void drop_buffer() {
+    buffer.clear();
+    buffer_continuation = {};
+    buffer_offset_pass = 0;
+  }
+
+  void resume_after_buffer() {
+    last_name = buffer.back().name;
+    continuation = buffer_continuation;
+  }
 
   std::vector<dentry> buffer;
   struct dirent de;
@@ -314,6 +328,7 @@ public:
   friend class C_Deleg_Timeout; // Asserts on client_lock, called when a delegation is unreturned
   friend class C_Client_CacheRelease; // Asserts on client_lock
   friend class SyntheticClient;
+  friend class ClientScaffold;
   friend void intrusive_ptr_release(Inode *in);
   template <typename T> friend struct RWRefState;
   template <typename T> friend class RWRef;
@@ -2348,6 +2363,7 @@ private:
   std::unordered_set<dir_result_t*> opened_dirs;
   // Protected by client_lock; zero never denotes a started listing.
   uint64_t readdir_listing_seq = 0;
+  uint64_t readdir_pass_seq = 0;
   uint64_t fd_gen = 1;
 
   bool   mount_aborted = false;

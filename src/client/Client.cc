@@ -280,8 +280,7 @@ int Client::get_fd_inode(int fd, InodeRef *in) {
 }
 
 dir_result_t::dir_result_t(InodeRef in, const UserPerm& perms, int fd)
-  : inode(std::move(in)), offset(0), next_offset(2),
-    release_count(0), ordered_count(0), cache_index(0), start_shared_gen(0),
+  : inode(std::move(in)), offset(0),
     perms(perms), fd(fd)
   { }
 
@@ -1573,9 +1572,43 @@ void Client::clear_dir_complete_and_ordered(Inode *diri, bool complete)
 	diri->flags &= ~I_DIR_ORDERED;
       }
     }
-    if (diri->dir)
-      diri->dir->readdir_cache.clear();
   }
+  // Drop unreferenced cache entries before invalidation can free them.
+  if (diri->dir)
+    diri->dir->readdir_cache.clear();
+}
+
+// First cached dentry at or after off.
+static size_t readdir_cache_find(const Dir *dir, int64_t off)
+{
+  auto& cache = dir->readdir_cache;
+  return std::lower_bound(cache.begin(), cache.end(), off,
+			  [](const Dentry *dn, int64_t off) {
+			    return dir_result_t::fpos_cmp(dn->offset, off) < 0;
+			  }) - cache.begin();
+}
+
+static bool readdir_cache_holds(const Dir *dir, const Dentry *dn)
+{
+  size_t pos = readdir_cache_find(dir, dn->offset);
+  return pos < dir->readdir_cache.size() && dir->readdir_cache[pos] == dn;
+}
+
+// Each dentry appears at most once in the cache; compare live counts.
+static bool readdir_cache_misses_dentries(Dir *dir)
+{
+  int gen = dir->parent_inode->shared_gen;
+  auto live = [gen](const Dentry *dn) {
+    return dn->inode && dn->cap_shared_gen == gen;
+  };
+  size_t cached = std::count_if(dir->readdir_cache.begin(),
+				dir->readdir_cache.end(), live);
+  size_t held = 0;
+  for (const auto& [name, dn] : dir->dentries) {
+    if (live(dn) && ++held > cached)
+      return true;
+  }
+  return false;
 }
 
 /*
@@ -1642,7 +1675,7 @@ void Client::insert_readdir_results(MetaRequest *request, MetaSession *session,
       dirp->set_hash_order();
     }
 
-    unsigned readdir_offset = dirp->next_offset;
+    unsigned readdir_offset = dirp->continuation.offset;
     string readdir_start = dirp->last_name;
     ceph_assert(!readdir_start.empty() || readdir_offset == 2);
 
@@ -1672,13 +1705,103 @@ void Client::insert_readdir_results(MetaRequest *request, MetaSession *session,
 		   << ", last_hash " << last_hash
 		   << ", next_offset " << readdir_offset << dendl;
 
-    if (diri->snapid != CEPH_SNAPDIR &&
-	fg.is_leftmost() && readdir_offset == 2 &&
-	!(hash_order && last_hash)) {
-      dirp->release_count = diri->dir_release_count;
-      dirp->ordered_count = diri->dir_ordered_count;
-      dirp->start_shared_gen = diri->shared_gen;
-      dirp->cache_index = 0;
+    // Establish the reply's start and the provenance of its ordinals.
+    bool from_beginning = readdir_start.empty() && fg.is_leftmost() &&
+			  readdir_offset == 2 && !(hash_order && last_hash);
+    bool start_known = from_beginning || !readdir_start.empty() ||
+		       !hash_order || (flags & CEPH_READDIR_OFFSET_HASH);
+    int64_t start = 0;
+    bool from_cursor = !readdir_start.empty();
+    uint64_t cursor_pass = dirp->continuation.pass;
+    if (!from_beginning) {
+      start = hash_order ?
+	dir_result_t::make_fpos(last_hash, readdir_offset, true) :
+	dir_result_t::make_fpos(fg, readdir_offset, false);
+      if (hash_order) {
+	int64_t frag_start = dir_result_t::make_fpos(fg.value(), 2, true);
+	if (dir_result_t::fpos_cmp(start, frag_start) < 0) {
+	  // Resuming from an earlier frag starts this frag at its boundary.
+	  start = frag_start;
+	  from_cursor = false;
+	} else if (!readdir_start.empty() && readdir_offset == 2 &&
+		   fg.contains(last_hash)) {
+	  // A merge may have lost last_name's hash-collision ordinal.
+	  start_known = false;
+	  cursor_pass = 0;
+	}
+      }
+    }
+
+    auto& pass = dir->readdir_pass;
+    const bool same_generation = pass.hash_order == hash_order &&
+				 pass.release_count == diri->dir_release_count &&
+				 pass.shared_gen == diri->shared_gen;
+    bool pass_ok = pass.active && same_generation;
+    // Replies in the completed pass's order can verify the existing cache.
+    bool cache_current = diri->is_complete_and_ordered() && same_generation &&
+			 pass.ordered_count == diri->dir_ordered_count;
+    enum class ReplyMode { Ignore, Verify, Extend, Beyond };
+    ReplyMode mode = ReplyMode::Ignore;
+    if (request->head.op != CEPH_MDS_OP_READDIR) {
+      pass_ok = false;
+    } else if (from_beginning && !cache_current &&
+	       !(pass_ok && pass.ordered_count == diri->dir_ordered_count)) {
+      // Rebuild from the beginning; renumbering invalidates the old order.
+      if (diri->is_complete_and_ordered())
+	clear_dir_complete_and_ordered(diri, false);
+      ldout(cct, 10) << __func__ << " starting readdir pass on " << *diri << dendl;
+      pass.id = ++readdir_pass_seq;
+      pass.active = true;
+      pass.hash_order = hash_order;
+      pass.release_count = diri->dir_release_count;
+      pass.ordered_count = diri->dir_ordered_count;
+      pass.shared_gen = diri->shared_gen;
+      pass.end = 0;
+      pass.end_at_frag_boundary = false;
+      dir->readdir_cache.clear();
+      pass_ok = true;
+    } else if (diri->is_complete_and_ordered()) {
+      pass_ok = false;
+      if (cache_current)
+        mode = ReplyMode::Verify;
+    }
+    // Crossing a hash boundary makes an old cursor's ordinal irrelevant.
+    string dname;
+    if (numdn)
+      decode(dname, p);
+    if (from_cursor && cursor_pass != pass.id) {
+      start_known = false;
+      if (hash_order && numdn &&
+	  ceph_frag_value(diri->hash_dentry_name(dname)) > last_hash) {
+	// Skip the unknown collision ordinal, but do not bridge unseen hashes.
+	start = dir_result_t::make_fpos(last_hash + 1, 2, true);
+	start_known = true;
+	from_cursor = false;
+      }
+    }
+    const bool first_from_cursor = from_cursor;
+    // Join a completed frag by hash boundary, independent of split bits.
+    const bool joins_frag = !hash_order && pass.end_at_frag_boundary &&
+      readdir_start.empty() && readdir_offset == 2 &&
+      fg.value() == dir_result_t::fpos_high(pass.end);
+    if (!start_known) {
+      mode = ReplyMode::Ignore;
+    } else if (pass_ok) {
+      if (dir_result_t::fpos_cmp(start, pass.end) <= 0 || joins_frag)
+        mode = ReplyMode::Extend;
+      else if (pass.ordered_count == diri->dir_ordered_count)
+        mode = ReplyMode::Beyond;
+    }
+    bool ordered = mode == ReplyMode::Extend &&
+      pass.ordered_count == diri->dir_ordered_count;
+    // Unverified numbering can invalidate the cached order.
+    if (!snapdiff_req && numdn && !ordered &&
+        mode != ReplyMode::Verify && mode != ReplyMode::Beyond &&
+        (!dir->readdir_cache.empty() || diri->is_complete_and_ordered())) {
+      ldout(cct, 10) << __func__ << " reply numbers dentries of " << *diri
+                     << " outside its readdir pass, dropping readdir_cache"
+                     << dendl;
+      clear_dir_complete_and_ordered(diri, false);
     }
 
     dirp->buffer_frag = fg;
@@ -1686,10 +1809,36 @@ void Client::insert_readdir_results(MetaRequest *request, MetaSession *session,
     _readdir_drop_dirp_buffer(dirp);
     dirp->buffer.reserve(numdn);
 
-    string dname;
+    size_t verify_pos = mode == ReplyMode::Verify ?
+      readdir_cache_find(dir, start) : 0;
+    size_t seen_pos = SIZE_MAX;
+    // Null dentries have no entries in either cache reads or MDS replies.
+    auto next_cached = [&](size_t& pos) -> Dentry* {
+      while (pos < dir->readdir_cache.size() &&
+             !dir->readdir_cache[pos]->inode)
+        ++pos;
+      return pos < dir->readdir_cache.size() ? dir->readdir_cache[pos] : nullptr;
+    };
+    enum class CacheMatch { Same, Renumbered, Different };
+    auto compare_cached = [&](size_t& pos, Dentry *dn,
+                              int64_t old_offset, int64_t new_offset) {
+      if (next_cached(pos) != dn)
+        return CacheMatch::Different;
+      ++pos;
+      return old_offset == new_offset ? CacheMatch::Same : CacheMatch::Renumbered;
+    };
+    auto invalidate_cache = [&](const string& name, CacheMatch match) {
+      ldout(cct, 10) << __func__ << " reply disagrees with readdir_cache of "
+                     << *diri << " at '" << name << "', dropping "
+                     << (match == CacheMatch::Different ? "content" : "order")
+                     << dendl;
+      clear_dir_complete_and_ordered(diri, match == CacheMatch::Different);
+    };
+
     LeaseStat dlease;
     for (unsigned i=0; i<numdn; i++) {
-      decode(dname, p);
+      if (i)
+	decode(dname, p);
       dlease.decode(p, features);
       InodeStat ist(p, features);
 
@@ -1726,47 +1875,120 @@ void Client::insert_readdir_results(MetaRequest *request, MetaSession *session,
       }
 
       update_dentry_lease(dn, &dlease, request->sent_stamp, session);
+      int64_t offset;
       if (hash_order) {
 	unsigned hash = ceph_frag_value(effective_diri->hash_dentry_name(dname));
-	if (hash != last_hash)
+	if (hash != last_hash) {
 	  readdir_offset = 2;
-	last_hash = hash;
-	dn->offset = dir_result_t::make_fpos(hash, readdir_offset++, true);
-      } else {
-	dn->offset = dir_result_t::make_fpos(fg, readdir_offset++, false);
-      }
-      // add to readdir cache
-      if (!snapdiff_req &&
-          dirp->release_count == effective_diri->dir_release_count &&
-	  dirp->ordered_count == effective_diri->dir_ordered_count &&
-	  dirp->start_shared_gen == effective_diri->shared_gen) {
-	if (dirp->cache_index == effective_dir->readdir_cache.size()) {
-	  if (i == 0) {
-	    ceph_assert(!dirp->inode->is_complete_and_ordered());
-	    dir->readdir_cache.reserve(dirp->cache_index + numdn);
-	  }
-          effective_dir->readdir_cache.push_back(dn);
-	} else if (dirp->cache_index < effective_dir->readdir_cache.size()) {
-	  if (dirp->inode->is_complete_and_ordered())
-	    ceph_assert(effective_dir->readdir_cache[dirp->cache_index] == dn);
-	  else
-            effective_dir->readdir_cache[dirp->cache_index] = dn;
-	} else {
-	  ceph_abort_msg("unexpected readdir buffer idx");
+	  from_cursor = false;
 	}
-	dirp->cache_index++;
+	last_hash = hash;
+	offset = dir_result_t::make_fpos(hash, readdir_offset++, true);
+      } else {
+	offset = dir_result_t::make_fpos(fg, readdir_offset++, false);
+      }
+      if (mode == ReplyMode::Verify) {
+        auto match = compare_cached(verify_pos, dn, dn->offset, offset);
+        if (match != CacheMatch::Same) {
+          invalidate_cache(dname, match);
+          mode = ReplyMode::Ignore;
+        }
+      }
+      if (mode == ReplyMode::Beyond && readdir_cache_holds(dir, dn)) {
+        invalidate_cache(dname, CacheMatch::Renumbered);
+        mode = ReplyMode::Ignore;
+      }
+      int64_t prev_offset = dn->offset;
+      // Snapdiff cookies belong only to this reply, not the normal cache.
+      if (!snapdiff_req)
+        dn->offset = offset;
+      // add to readdir cache
+      if (mode == ReplyMode::Extend) {
+	if (dir_result_t::fpos_cmp(dn->offset, pass.end) >= 0) {
+	  if (ordered)
+	    dir->readdir_cache.push_back(dn);
+	  pass.end = dn->offset + 1;
+	  pass.end_at_frag_boundary = false;
+	} else if (ordered) {
+          // Check overlap against the dentry's offset before this reply.
+          if (seen_pos == SIZE_MAX)
+            seen_pos = readdir_cache_find(dir, offset);
+          auto match = compare_cached(seen_pos, dn, prev_offset, offset);
+          if (match != CacheMatch::Same) {
+            invalidate_cache(dname, match);
+            ordered = false;
+            if (match == CacheMatch::Different) {
+              pass.active = false;
+              mode = ReplyMode::Ignore;
+            }
+          }
+	}
       }
       // add to cached result list
-      dirp->buffer.push_back(dir_result_t::dentry(dn->offset, dname, dn->alternate_name, in));
-      ldout(cct, 15) << __func__ << "  " << hex << dn->offset << dec << ": '" << dname << "' -> " << in->ino << dendl;
+      dirp->buffer.push_back(dir_result_t::dentry(offset, dname, dn->alternate_name, in));
+      ldout(cct, 15) << __func__ << "  " << hex << offset << dec << ": '" << dname << "' -> " << in->ino << dendl;
+    }
+
+    // Hash boundaries survive changes to the fragtree.
+    auto next_frag_start = [&]() {
+      return dir_result_t::make_fpos(fg.next().value(), 2, hash_order);
+    };
+
+    if (mode == ReplyMode::Verify && end) {
+      // The cache must not contain entries beyond this frag's reply.
+      Dentry *next = next_cached(verify_pos);
+      if (next && (fg.is_rightmost() ||
+                   dir_result_t::fpos_cmp(next->offset, next_frag_start()) < 0)) {
+        invalidate_cache(next->name, CacheMatch::Different);
+        mode = ReplyMode::Ignore;
+      }
+    }
+
+    if (mode == ReplyMode::Extend && end) {
+      if (fg.is_rightmost()) {
+	if (pass.release_count == diri->dir_release_count &&
+	    pass.shared_gen == diri->shared_gen) {
+	  if (ordered && pass.ordered_count == diri->dir_ordered_count &&
+	      readdir_cache_misses_dentries(dir)) {
+	    // The MDS omitted a live cached dentry: content is stale.
+	    ldout(cct, 10) << " readdir pass on " << *diri << " left out dentries"
+			   << " the client holds, not marking it complete" << dendl;
+	    clear_dir_complete_and_ordered(diri, true);
+	  } else if (ordered && pass.ordered_count == diri->dir_ordered_count) {
+	    ldout(cct, 10) << " marking (I_COMPLETE|I_DIR_ORDERED) on " << *diri << dendl;
+	    diri->flags |= I_COMPLETE | I_DIR_ORDERED;
+	  } else {
+	    ldout(cct, 10) << " marking I_COMPLETE on " << *diri << dendl;
+	    dir->readdir_cache.clear();
+	    diri->flags |= I_COMPLETE;
+	  }
+	}
+	pass.active = false;
+      } else {
+	// Other streams may already have advanced past this frag.
+	int64_t next = next_frag_start();
+	if (dir_result_t::fpos_cmp(next, pass.end) > 0) {
+	  pass.end = next;
+	  pass.end_at_frag_boundary = true;
+	}
+      }
     }
 
     if (numdn > 0)
       dirp->last_name = dname;
     if (end)
-      dirp->next_offset = 2;
+      dirp->continuation.offset = 2;
     else
-      dirp->next_offset = readdir_offset;
+      dirp->continuation.offset = readdir_offset;
+    // A valid pass or verified cache establishes fresh ordinals.
+    uint64_t fresh_pass = (pass_ok || mode == ReplyMode::Verify) ? pass.id : 0;
+    uint64_t first_pass = first_from_cursor ? cursor_pass : fresh_pass;
+    if (!from_cursor)
+      cursor_pass = fresh_pass;
+    dirp->continuation.pass = cursor_pass;
+    dirp->buffer_continuation = dirp->continuation;
+    // A buffer spanning two ordinal orders has no single pass.
+    dirp->buffer_offset_pass = first_pass == cursor_pass ? first_pass : 0;
 
     if (dir->is_empty())
       close_dir(dir);
@@ -3887,6 +4109,9 @@ void Client::unlink(Dentry *dn, bool keepdir, bool keepdentry)
 
     // unlink from dir
     Dir *dir = dn->dir;
+    // Drop cached members before detaching. Callers handle content changes.
+    if (readdir_cache_holds(dir, dn))
+      clear_dir_complete_and_ordered(dir->parent_inode, false);
     dn->detach();
     ceph_assert(dn->dir == nullptr);   // detach() must clear it
 
@@ -9860,12 +10085,14 @@ void Client::seekdir(dir_result_t *dirp, loff_t offset)
   if (offset == dirp->offset)
     return;
 
-  if (offset > dirp->offset)
-    dirp->release_count = 0;   // bump if we do a forward seek
-  else
-    dirp->ordered_count = 0;   // disable filling readdir cache
-
-  if (dirp->hash_order()) {
+  bool in_buffer = offset != 0 && !dirp->buffer.empty() &&
+    dir_result_t::fpos_cmp(offset, dirp->buffer.front().offset) >= 0 &&
+    dir_result_t::fpos_cmp(offset, dirp->buffer.back().offset + 1) <= 0;
+  if (in_buffer) {
+    // Cache reads may have advanced the MDS cursor past this buffer.
+    dirp->resume_after_buffer();
+    dirp->offset_pass = dirp->buffer_offset_pass;
+  } else if (dirp->hash_order()) {
     if (dirp->offset > offset) {
       _readdir_drop_dirp_buffer(dirp);
       dirp->reset();
@@ -9880,6 +10107,8 @@ void Client::seekdir(dir_result_t *dirp, loff_t offset)
   }
 
   dirp->offset = offset;
+  if (!in_buffer)
+    dirp->offset_pass = dir_result_t::SEEK_PASS;  // see offset_pass
 }
 
 
@@ -9950,14 +10179,14 @@ void Client::_readdir_rechoose_frag(dir_result_t *dirp)
     ldout(cct, 10) << __func__ << " frag " << cur << " maps to " << fg << dendl;
     dirp->offset = dir_result_t::make_fpos(fg, 2, false);
     dirp->last_name.clear();
-    dirp->next_offset = 2;
+    dirp->continuation.offset = 2;
   }
 }
 
 void Client::_readdir_drop_dirp_buffer(dir_result_t *dirp)
 {
   ldout(cct, 10) << __func__ << " " << dirp << dendl;
-  dirp->buffer.clear();
+  dirp->drop_buffer();
 }
 
 int Client::_readdir_get_frag(int op, dir_result_t* dirp,
@@ -10001,70 +10230,115 @@ int Client::_readdir_get_frag(int op, dir_result_t* dirp,
   return res;
 }
 
-struct dentry_off_lt {
-  bool operator()(const Dentry* dn, int64_t off) const {
-    return dir_result_t::fpos_cmp(dn->offset, off) < 0;
-  }
-};
-
 int Client::_readdir_cache_cb(dir_result_t *dirp, add_dirent_cb_t cb, void *p,
 			      int caps, bool getref)
 {
   ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
   ldout(cct, 10) << __func__ << " " << dirp << " on " << dirp->inode->ino
-	   << " last_name " << dirp->last_name
-	   << " offset " << hex << dirp->offset << dec
+	   << " last_name " << dirp->last_name << " offset " << hex << dirp->offset << dec
 	   << dendl;
-  auto& diri = dirp->inode;
+  const bool check_rstat = cct->_conf->client_dirsize_rbytes;
+  InodeRef diri = dirp->inode;
   Dir *dir = diri->dir;
 
   if (!dir) {
-    ldout(cct, 10) << __func__ << " dir is empty" << dendl;
+    ldout(cct, 10) << " dir is empty" << dendl;
     dirp->set_end();
     return 0;
   }
 
-  vector<Dentry*>::iterator pd = std::lower_bound(dir->readdir_cache.begin(),
-						  dir->readdir_cache.end(),
-						  dirp->offset, dentry_off_lt());
+  // A rebuilt cache may assign different ordinals to an old cursor.
+  auto cursor_in_cache_order = [&]() {
+    if (dir_result_t::fpos_low(dirp->offset) <= 2 ||
+	dirp->offset_pass == dir_result_t::SEEK_PASS ||
+	dirp->offset_pass == dir->readdir_pass.id)
+      return true;
+    // Rebase a cursor immediately after last_name onto its cached offset.
+    if (dirp->last_name.empty() ||
+	dir->readdir_pass.hash_order != dirp->hash_order() ||
+	dirp->continuation.pass != dirp->offset_pass ||
+	dirp->continuation.offset != dirp->offset_low())
+      return false;
+    auto it = dir->dentries.find(dirp->last_name);
+    if (it == dir->dentries.end())
+      return false;
+    Dentry *last = it->second;
+    if (!readdir_cache_holds(dir, last) ||
+	dir_result_t::fpos_high(last->offset) != dirp->offset_high())
+      return false;
+    ldout(cct, 15) << " moving offset " << hex << dirp->offset << " after '"
+		   << last->name << "' at " << last->offset << dec
+		   << " in readdir_cache" << dendl;
+    dirp->offset = last->offset + 1;
+    dirp->continuation.offset = dirp->offset_low();
+    dirp->offset_pass = dirp->continuation.pass = dir->readdir_pass.id;
+    // The retained buffer still uses the old order.
+    _readdir_drop_dirp_buffer(dirp);
+    return true;
+  };
+  if (!cursor_in_cache_order()) {
+    ldout(cct, 10) << " offset counts in the order of pass " << dirp->offset_pass
+		   << ", not in that of readdir_cache" << dendl;
+    return -EAGAIN;
+  }
+  auto cache_is_current = [&](uint64_t pass_id) {
+#if defined(__linux__)
+    if (diri->fscrypt_key_validator && !diri->fscrypt_key_validator->is_valid()) {
+      clear_dir_complete_and_ordered(diri.get(), true);
+      return false;
+    }
+#endif
+    return dirp->inode->dir == dir && dirp->inode->is_complete_and_ordered() &&
+	   dir->readdir_pass.id == pass_id &&
+           dir->readdir_pass.release_count == diri->dir_release_count &&
+           dir->readdir_pass.ordered_count == diri->dir_ordered_count &&
+           dir->readdir_pass.shared_gen == diri->shared_gen;
+  };
+  size_t idx = readdir_cache_find(dir, dirp->offset);
 
   string dn_name;
-  for (unsigned idx = pd - dir->readdir_cache.begin();
-       idx < dir->readdir_cache.size();
-       ++idx) {
+  while (true) {
     if (!dirp->inode->is_complete_and_ordered())
       return -EAGAIN;
+    if (idx >= dir->readdir_cache.size())
+      break;
     Dentry *dn = dir->readdir_cache[idx];
     if (dn->inode == NULL) {
       ldout(cct, 15) << " skipping null '" << dn->name << "'" << dendl;
+      ++idx;
       continue;
     }
     if (dn->cap_shared_gen != dir->parent_inode->shared_gen) {
       ldout(cct, 15) << " skipping mismatch shared gen '" << dn->name << "'" << dendl;
+      ++idx;
       continue;
     }
 
-    if (dn->inode->is_dir() && cct->_conf->client_dirsize_rbytes &&
-        dn->inode->rstat_seq < dirp->listing_seq) {
-      // Refresh child directory statistics together in a READDIR reply.
+    if (dn->inode->is_dir() && check_rstat &&
+	dn->inode->rstat_seq < dirp->listing_seq) {
+      // READDIR refreshes stale child rstats in batches.
+      ldout(cct, 15) << " rstat of '" << dn->name << "' predates this listing" << dendl;
       return -EAGAIN;
     }
-    int r = _getattr(dn->inode, caps, dirp->perms);
-    if (r == -EACCES && dn->inode->is_under_quarantine()) {
+    DentryRef dnref(dn);
+    InodeRef entry_inode = dn->inode;
+    const uint64_t pass_id = dir->readdir_pass.id;
+    auto entry_is_current = [&]() {
+      return cache_is_current(pass_id) && idx < dir->readdir_cache.size() &&
+        dir->readdir_cache[idx] == dn && dn->inode == entry_inode;
+    };
+    int r = _getattr(entry_inode, caps, dirp->perms);
+    if (r == -EACCES && entry_inode->is_under_quarantine()) {
       ldout(cct, 10) << __func__ << " quarantined entry '"
 		     << dn->name << "', using cached stat" << dendl;
     } else if (r < 0) {
       return r;
     }
 
-    /* fix https://tracker.ceph.com/issues/56288 */
-    if (dirp->inode->dir == NULL) {
-      ldout(cct, 0) << " dir is closed, so we should return" << dendl;
-      return -EAGAIN;
-    }
-    
-    // the content of readdir_cache may change after _getattr()
-    if (idx >= dir->readdir_cache.size() || dir->readdir_cache[idx] != dn)
+    // _getattr() may release client_lock; revalidate before using the index.
+    if (!entry_is_current() ||
+        (entry_inode->is_dir() && check_rstat &&
+         entry_inode->rstat_seq < dirp->listing_seq))
       return -EAGAIN;
 
     struct ceph_statx stx;
@@ -10084,26 +10358,43 @@ int Client::_readdir_cache_cb(dir_result_t *dirp, add_dirent_cb_t cb, void *p,
     }
 
     dn_name = dn->name; // fill in name while we have lock
-
-    // the content of readdir_cache may change after unlocking
+    int64_t dn_offset = dn->offset;
     client_lock.unlock();
     r = cb(p, &de, &stx, next_off, in);  // _next_ offset
     client_lock.lock();
-    ldout(cct, 15) << " de " << de.d_name << " off " << hex << dn->offset << dec
+    // The references pin this entry; its cache membership may have changed.
+    ldout(cct, 15) << " de " << de.d_name << " off " << hex << dn_offset << dec
 		   << " = " << r << dendl;
     if (r < 0) {
       return r;
     }
 
-    dirp->offset = next_off;
+    const bool current = entry_is_current();
+    dirp->offset = current ? next_off : dn_offset + 1;
     if (dirp->at_end())
-      dirp->next_offset = 2;
+      dirp->continuation.offset = 2;
     else
-      dirp->next_offset = dirp->offset_low();
+      dirp->continuation.offset = dirp->offset_low();
     dirp->last_name = dn_name; // we successfully returned this one; update!
-    dirp->release_count = 0; // last_name no longer match cache index
+    dirp->offset_pass = pass_id;
+    dirp->continuation.pass = pass_id;
+    if (!current)
+      _readdir_drop_dirp_buffer(dirp);
     if (r > 0)
       return r;
+    if (dirp->at_end())
+      break;
+
+    // Keep the sequential fast path if cb() left the cache unchanged;
+    // otherwise translate the cursor into the rebuilt cache's order.
+    if (current) {
+      ++idx;
+      continue;
+    }
+    dir = dirp->inode->dir;
+    if (!dir || !diri->is_complete_and_ordered() || !cursor_in_cache_order())
+      return -EAGAIN;
+    idx = readdir_cache_find(dir, dirp->offset);
   }
 
   ldout(cct, 10) << __func__ << " " << dirp << " on " << dirp->inode->ino << " at end" << dendl;
@@ -10341,11 +10632,17 @@ int Client::_readdir_r_cb(int op,
 	return r;
 
       dirp->offset = next_off;
+      dirp->offset_pass = dirp->buffer_offset_pass;
       if (r > 0)
 	return r;
     }
 
-    if (dirp->next_offset > 2) {
+    // Resume after this buffer unless cache reads have already gone further.
+    if (!dirp->buffer.empty() &&
+	dir_result_t::fpos_cmp(dirp->offset, dirp->buffer.back().offset + 1) <= 0)
+      dirp->resume_after_buffer();
+
+    if (dirp->continuation.offset > 2) {
       ldout(cct, 10) << " fetching next chunk of this frag" << dendl;
       _readdir_drop_dirp_buffer(dirp);
       continue;  // more!
@@ -10357,22 +10654,7 @@ int Client::_readdir_r_cb(int op,
       continue;
     }
 
-    if (!bypass_cache &&
-	diri->shared_gen == dirp->start_shared_gen &&
-	diri->dir_release_count == dirp->release_count) {
-      if (diri->dir_ordered_count == dirp->ordered_count) {
-	ldout(cct, 10) << " marking (I_COMPLETE|I_DIR_ORDERED) on " << *diri << dendl;
-	if (diri->dir) {
-	  ceph_assert(diri->dir->readdir_cache.size() >= dirp->cache_index);
-	  diri->dir->readdir_cache.resize(dirp->cache_index);
-	}
-	diri->flags |= I_COMPLETE | I_DIR_ORDERED;
-      } else {
-	ldout(cct, 10) << " marking I_COMPLETE on " << *diri << dendl;
-	diri->flags |= I_COMPLETE;
-      }
-    }
-
+    // Completion belongs to the shared pass in insert_readdir_results().
     dirp->set_end();
     return 0;
   }
