@@ -48,6 +48,28 @@ struct fscrypt_env {
 class ClientScaffold : public Client {  
   fscrypt_env *fse;
 public:
+    using Client::client_lock;
+    // the dentry paths a cache trim takes, for the readdir cache tests
+    using Client::link;
+    using Client::unlink;
+    using Client::trim_dentry;
+    using Client::trim_cache;
+    using Client::lru;
+    using Client::last_tid;
+    using Client::send_request;
+    using Client::readdir_listing_seq;
+    using Client::handle_quota;
+    using Client::clear_dir_complete_and_ordered;
+    using Client::_readdir_cache_cb;
+    using Client::handle_client_reply;
+    MetaSession *install_readdir_test_session(const ConnectionRef& con,
+                                             MDSMap *saved_map);
+    void remove_readdir_test_session(mds_rank_t rank, const MDSMap& saved_map);
+    MetaRequest *find_readdir_test_request(Inode *in);
+    void cancel_readdir_test_requests(Inode *in);
+    void start_readdir_test_listing(dir_result_t *dirp) {
+      dirp->listing_seq = ++readdir_listing_seq;
+    }
     using Client::walk_dentry_result;
 
     ClientScaffold(Messenger *m, MonClient *mc, Objecter *objecter_, fscrypt_env *fse) : Client(m, mc, objecter_), fse(fse) {}
