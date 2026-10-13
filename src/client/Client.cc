@@ -1105,7 +1105,8 @@ void Client::_fragmap_remove_stopped_mds(Inode *in, mds_rank_t mds)
 
 Inode * Client::add_update_inode(InodeStat *st, utime_t from,
 				 MetaSession *session,
-				 const UserPerm& request_perms)
+				 const UserPerm& request_perms,
+				 uint64_t listing_seq)
 {
   Inode *in;
   bool was_new = false;
@@ -1206,6 +1207,7 @@ Inode * Client::add_update_inode(InodeStat *st, utime_t from,
       in->dir_layout = st->dir_layout;
       ldout(cct, 20) << " dir hash is " << (int)in->dir_layout.dl_dir_hash << dendl;
       in->rstat = st->rstat;
+      in->rstat_seq = (st->cap.flags & CEPH_CAP_FLAG_AUTH) ? listing_seq : 0;
       in->quota = st->quota;
       in->dir_pin = st->dir_pin;
     }
@@ -1251,6 +1253,7 @@ Inode * Client::add_update_inode(InodeStat *st, utime_t from,
     if (in->auth_cap && in->auth_cap->session == session) {
       in->max_size = st->max_size;
       in->rstat = st->rstat;
+      in->rstat_seq = listing_seq;
     }
 
     // setting I_COMPLETE needs to happen after adding the cap
@@ -1693,7 +1696,7 @@ void Client::insert_readdir_results(MetaRequest *request, MetaSession *session,
       ldout(cct, 15) << "" << i << ": '" << dname << "'" << dendl;
 
       Inode *in = add_update_inode(&ist, request->sent_stamp, session,
-				   request->perms);
+				   request->perms, request->sent_listing_seq);
       auto *effective_dir = dir;
       auto *effective_diri = diri;
 
@@ -1869,7 +1872,7 @@ Inode* Client::insert_trace(MetaRequest *request, MetaSession *session)
     }
 
     in = add_update_inode(&ist, request->sent_stamp, session,
-			  request->perms);
+			  request->perms, request->sent_listing_seq);
     if (ist.subvolume_id) {
       ldout(cct, 20) << __func__ << " subv_metric adding " << in->ino << "-" << ist.subvolume_id << dendl;
       subvolume_tracker->add_inode(in->ino, ist.subvolume_id);
@@ -1879,7 +1882,7 @@ Inode* Client::insert_trace(MetaRequest *request, MetaSession *session)
   Inode *diri = NULL;
   if (reply->head.is_dentry) {
     diri = add_update_inode(&dirst, request->sent_stamp, session,
-			    request->perms);
+			    request->perms, request->sent_listing_seq);
     mds_rank_t from_mds = mds_rank_t(reply->get_source().num());
     update_dir_dist(diri, &dst, from_mds);  // dir stat info is attached to ..
 
@@ -2879,6 +2882,7 @@ void Client::send_request(MetaRequest *request, MetaSession *session,
     request->sent_stamp = ceph_clock_now();
     ldout(cct, 20) << __func__ << " set sent_stamp to " << request->sent_stamp << dendl;
   }
+  request->record_listing_seq(readdir_listing_seq);
   request->mds = mds;
 
   Inode *in = request->inode();
@@ -5719,6 +5723,7 @@ void Client::handle_quota(const MConstRef<MClientQuota>& m)
     if (in) {
       in->quota = m->quota;
       in->rstat = m->rstat;
+      in->rstat_seq = 0; // unsolicited quota stats do not prove listing freshness
     }
   }
 }
@@ -9780,6 +9785,7 @@ int Client::_opendir(Inode *in, dir_result_t **dirpp, const UserPerm& perms, int
   if (!in->is_dir())
     return -ENOTDIR;
   *dirpp = new dir_result_t(in, perms, fd);
+  (*dirpp)->listing_seq = ++readdir_listing_seq;
   opened_dirs.insert(*dirpp);
   ldout(cct, 8) << __func__ << "(" << in->ino << ") = " << 0 << " (" << *dirpp << ")" << dendl;
   return 0;
@@ -9828,6 +9834,7 @@ void Client::rewinddir(dir_result_t *dirp)
   dir_result_t *d = static_cast<dir_result_t*>(dirp);
   _readdir_drop_dirp_buffer(d);
   d->reset();
+  d->listing_seq = ++readdir_listing_seq;  // a new listing
 }
  
 loff_t Client::telldir(dir_result_t *dirp)
@@ -9846,6 +9853,9 @@ void Client::seekdir(dir_result_t *dirp, loff_t offset)
     return;
 
   std::scoped_lock lock(client_lock);
+
+  if (offset == 0)
+    dirp->listing_seq = ++readdir_listing_seq;  // including seekdir(0) at offset 0
 
   if (offset == dirp->offset)
     return;
@@ -10022,7 +10032,6 @@ int Client::_readdir_cache_cb(dir_result_t *dirp, add_dirent_cb_t cb, void *p,
   for (unsigned idx = pd - dir->readdir_cache.begin();
        idx < dir->readdir_cache.size();
        ++idx) {
-    int mask = caps;
     if (!dirp->inode->is_complete_and_ordered())
       return -EAGAIN;
     Dentry *dn = dir->readdir_cache[idx];
@@ -10035,10 +10044,12 @@ int Client::_readdir_cache_cb(dir_result_t *dirp, add_dirent_cb_t cb, void *p,
       continue;
     }
 
-    if (dn->inode->is_dir() && cct->_conf->client_dirsize_rbytes) {
-      mask |= CEPH_STAT_RSTAT;
+    if (dn->inode->is_dir() && cct->_conf->client_dirsize_rbytes &&
+        dn->inode->rstat_seq < dirp->listing_seq) {
+      // Refresh child directory statistics together in a READDIR reply.
+      return -EAGAIN;
     }
-    int r = _getattr(dn->inode, mask, dirp->perms);
+    int r = _getattr(dn->inode, caps, dirp->perms);
     if (r == -EACCES && dn->inode->is_under_quarantine()) {
       ldout(cct, 10) << __func__ << " quarantined entry '"
 		     << dn->name << "', using cached stat" << dendl;
@@ -10292,9 +10303,11 @@ int Client::_readdir_r_cb(int op,
       uint64_t next_off = entry.offset + 1;
 
       int r;
-      if (check_caps) {
+      const bool stale_rstat = entry.inode->is_dir() && rstat_on_dir &&
+        entry.inode->rstat_seq < dirp->listing_seq;
+      if (check_caps || stale_rstat) {
 	int mask = caps;
-	if(entry.inode->is_dir()){
+	if (stale_rstat) {
           mask |= rstat_on_dir;
 	}
 	r = _getattr(entry.inode, mask, dirp->perms);
