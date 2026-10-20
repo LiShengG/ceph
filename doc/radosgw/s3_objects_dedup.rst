@@ -101,8 +101,9 @@ The dedup estimate process skips the following RGW objects:
   split-head which is unavailable on such pools)
 
 The full dedup process skips all of the above and additionally skips
-**user-encrypted** objects.  Server-side **compressed** objects can
-optionally be skipped by setting :confval:`rgw_dedup_skip_compressed`.
+**user-encrypted** objects and objects written with AppendObject.  Server-side
+**compressed** objects can optionally be skipped by setting
+:confval:`rgw_dedup_skip_compressed`.
 
 The minimum RGW object size to be deduplicated is controlled by the following
 configuration option:
@@ -130,7 +131,7 @@ The dedup estimate process does not access the object payload
 data, which means that processing time won't be significantly affected by the
 underlying media (SSD/HDD) storing the objects. Best practice places bucket
 index pools on fast storage: SSDs
-:ref:`are recommended <hardware-recommendations>` and they are cached heavily
+:ref:`are recommended <hardware-storage-devices>` and they are cached heavily
 in memory.
 
 Administrators can throttle the estimate process by setting a limit on the

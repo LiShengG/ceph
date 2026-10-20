@@ -79,7 +79,9 @@ Container Hosts
 
 **Table legend:**
 
-- **H**: Ceph tests its container image with this distribution as the host. The image itself is built on Rocky 10; see below.
+- **H**: Ceph tests its container image with this distribution as the host. The image is built on Rocky 10 from Umbrella onwards, and on CentOS 9 Stream before that; see Container Base Image.
+
+.. _umbrella-container-base-image:
 
 Container Base Image
 ====================
@@ -88,9 +90,17 @@ Since Umbrella the container image is built on Rocky Linux 10 (CentOS 9
 Stream before that). The host does not need to run Rocky 10; any
 distribution marked H above works.
 
+Rocky Linux 10 requires the x86-64-v3 microarchitecture level, so on the x86
+architecture the container image runs only on CPUs that support x86-64-v3,
+whatever distribution the host runs. For the first CPU generations that
+support it, see :ref:`CPU and Memory Sizing <hardware-cpu>`.
+
 .. note:: ARM architecture containers provide a limited set of daemons.
    Check that the daemons you need are available before you plan an ARM
    deployment.
+
+.. _linux-kernel:
+.. _ceph-dependencies:
 
 Kernel Version for Clients
 ==========================
@@ -107,7 +117,7 @@ Kernel Version for Clients
      - Older kernels need :ref:`CRUSH tunables <crush-map-tunables>` and
        image features disabled on the cluster.
    * - CephFS
-     - See :ref:`cephfs_which_kernel_version`
+     - See :ref:`kernel versions for CephFS <cephfs_which_kernel_version>`
      -
    * - Both
      - Use a "stable" or "long-term maintenance" series from kernel.org or
@@ -153,7 +163,7 @@ Additional Resources
 ====================
 
 - :ref:`hardware-recommendations`
-- :ref:`ceph-releases-general`
+- `Ceph Releases (general)`_
 - :ref:`cephadm_deploying_new_cluster`
 
 .. _CentOS: https://www.centos.org/cl-vs-cs/
@@ -161,3 +171,7 @@ Additional Resources
 .. _Debian_t: https://www.debian.org/releases/trixie/
 .. _Rocky: https://github.com/rocky-linux/wiki.rockylinux.org/blob/main/docs/rocky/version.md
 .. _Ubuntu: https://wiki.ubuntu.com/Releases
+
+.. Needs to be an external link because doc/releases/general.rst is not in
+   stable branches and we want to always use the main branch version
+.. _Ceph Releases (general): https://docs.ceph.com/en/latest/releases/general/

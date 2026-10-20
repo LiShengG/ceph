@@ -470,7 +470,7 @@ as follows:
 :command:`role list`
   List the roles with specified path prefix.
 
-:command:`role modify`
+:command:`role-trust-policy modify`
   Modify the assume role policy of an existing role.
 
 :command:`role-policy put`
@@ -1033,14 +1033,6 @@ Bucket Notifications/PubSub Options
 .. option:: --topic                   
 
    The bucket notifications/pubsub topic name.
-
-.. option:: --subscription
-
-   The pubsub subscription name.
-
-.. option:: --event-id
-
-   The event id in a pubsub subscription.
 
 
 Examples

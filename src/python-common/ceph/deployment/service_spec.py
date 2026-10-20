@@ -878,6 +878,7 @@ class ServiceSpec(object):
         'osd',
         'prometheus',
         'promtail',
+        'pushgateway',
         'alloy',
         'rbd-mirror',
         'rgw',
@@ -919,6 +920,7 @@ class ServiceSpec(object):
         'alertmanager': {'user_cert_allowed': False, 'scope': 'host', 'requires_ca_cert': False},
         'ceph-exporter': {'user_cert_allowed': False, 'scope': 'host', 'requires_ca_cert': False},
         'node-exporter': {'user_cert_allowed': False, 'scope': 'host', 'requires_ca_cert': False},
+        'pushgateway': {'user_cert_allowed': False, 'scope': 'host', 'requires_ca_cert': False},
         'node-proxy': {'user_cert_allowed': False, 'scope': 'host', 'requires_ca_cert': False},
         # 'loki'        : {'user_cert_allowed': False, 'scope': 'host'},
         # 'promtail'    : {'user_cert_allowed': False, 'scope': 'host'},
@@ -953,6 +955,7 @@ class ServiceSpec(object):
             'loki': MonitoringSpec,
             'promtail': MonitoringSpec,
             'alloy': MonitoringSpec,
+            'pushgateway': MonitoringSpec,
             'snmp-gateway': SNMPGatewaySpec,
             'elasticsearch': TracingSpec,
             'jaeger-agent': TracingSpec,
@@ -1429,12 +1432,14 @@ class NFSServiceSpec(ServiceSpec):
                  tls_ciphers: Optional[str] = None,
                  colocation_ports: Optional[List[Dict[str, int]]] = None,
                  enable_nfsv3: bool = False,
+                 enable_nfs_metrics: bool = False,
                  enable_client_object_cache: bool = False,
                  client_object_cache_size: Optional[Union[str, int]] = None,
                  client_object_cache_max_dirty: Optional[Union[str, int]] = None,
                  enable_cephfs_client_log: bool = False,
                  cephfs_client_log_level: Optional[int] = None,
                  cephfs_client_log_dir: Optional[str] = None,
+                 mem_stats_disable: bool = False,
                  ):
         assert service_type == 'nfs'
         super(NFSServiceSpec, self).__init__(
@@ -1464,6 +1469,7 @@ class NFSServiceSpec(ServiceSpec):
         self.cluster_qos_config = cluster_qos_config
         self.cluster_qos_port = cluster_qos_port
         self.enable_nfsv3 = enable_nfsv3
+        self.enable_nfs_metrics = enable_nfs_metrics
 
         # Ceph client object cache settings written to ganesha.conf CEPH block.
         # Disabled by default; enabling it increases Ganesha memory use.
@@ -1475,6 +1481,9 @@ class NFSServiceSpec(ServiceSpec):
         self.enable_cephfs_client_log = enable_cephfs_client_log
         self.cephfs_client_log_level = cephfs_client_log_level
         self.cephfs_client_log_dir = cephfs_client_log_dir
+        # Disables per-component memory-statistics capture in NFS_CORE_PARAM.
+        # Applied at daemon startup only; requires daemon restart to take effect.
+        self.mem_stats_disable = mem_stats_disable
 
         # colocation_ports is a list of port dicts for ADDITIONAL colocated daemons
         # The first daemon always uses port and monitoring_port from the spec
@@ -1567,6 +1576,7 @@ class NFSServiceSpec(ServiceSpec):
                                       f"{'ip_addrs' if self.ip_addrs else 'networks'} fields")
 
         verify_boolean(self.enable_client_object_cache, "enable_client_object_cache")
+        verify_boolean(self.mem_stats_disable, "mem_stats_disable")
         cache_size = verify_size_with_units(
             self.client_object_cache_size, "client_object_cache_size"
         )
@@ -1957,6 +1967,7 @@ class NvmeofServiceSpec(ServiceSpec):
                  verify_nqns: Optional[bool] = True,
                  verify_keys: Optional[bool] = True,
                  verify_listener_ip: Optional[bool] = True,
+                 listener_network_masks: Optional[List[str]] = None,
                  allowed_consecutive_spdk_ping_failures: Optional[int] = 1,
                  spdk_ping_interval_in_seconds: Optional[float] = 2.0,
                  ping_spdk_under_lock: Optional[bool] = False,
@@ -1975,6 +1986,8 @@ class NvmeofServiceSpec(ServiceSpec):
                  fail_io_for_degraded_namespace: Optional[bool] = True,
                  resize_degraded_namespace: Optional[bool] = True,
                  verify_image_encryption_settings: Optional[bool] = True,
+                 verify_pool_applications: Optional[bool] = True,
+                 allowed_pool_applications: Optional[List[str]] = [],
                  server_key: Optional[str] = None,
                  server_cert: Optional[str] = None,
                  client_key: Optional[str] = None,
@@ -2105,6 +2118,8 @@ class NvmeofServiceSpec(ServiceSpec):
         self.verify_keys = verify_keys
         #: ``verify_listener_ip`` enables verification of listener IP address
         self.verify_listener_ip = verify_listener_ip
+        #: ``listener_network_masks`` subnets for subsystems using use_conf_listener_network_masks
+        self.listener_network_masks = listener_network_masks
         #: ``abort_on_errors`` abort gateway in case of errors
         self.abort_on_errors = abort_on_errors
         #: ``abort_on_update_error`` abort gateway in case of an error during update
@@ -2153,6 +2168,10 @@ class NvmeofServiceSpec(ServiceSpec):
         self.resize_degraded_namespace = resize_degraded_namespace
         #: ``verify_image_encryption_settings`` verify encryption setting of ns before calling SPDK
         self.verify_image_encryption_settings = verify_image_encryption_settings
+        #: ``verify_pool_applications`` verify pool only has allowed applications enabled
+        self.verify_pool_applications = verify_pool_applications
+        #: ``allowed_pool_applications`` allowed applications on pool
+        self.allowed_pool_applications = allowed_pool_applications
         #: ``allowed_consecutive_spdk_ping_failures`` # of ping failures before aborting gateway
         self.allowed_consecutive_spdk_ping_failures = allowed_consecutive_spdk_ping_failures
         #: ``spdk_ping_interval_in_seconds`` sleep interval in seconds between SPDK pings
@@ -2441,6 +2460,7 @@ class NvmeofServiceSpec(ServiceSpec):
                        "Resize degraded namespaces to accommodate for encryption tables")
         verify_boolean(self.verify_image_encryption_settings,
                        "Verify namespace encryption settings in the gateway")
+        verify_boolean(self.verify_pool_applications, "Verify pool applications")
         verify_non_negative_number(self.monitor_timeout, "Monitor timeout")
         verify_non_negative_int(self.port, "Port")
         verify_non_negative_int(self.discovery_port, "Discovery port")
@@ -2461,6 +2481,12 @@ class NvmeofServiceSpec(ServiceSpec):
         verify_boolean(self.verify_nqns, "Verify NQNs")
         verify_boolean(self.verify_keys, "Verify Keys")
         verify_boolean(self.verify_listener_ip, "Verify listener IP address")
+        for subnet in (self.listener_network_masks or []):
+            try:
+                ip_network(subnet, strict=False)
+            except ValueError:
+                raise SpecValidationError(
+                    f'Invalid listener_network_masks: "{subnet}"')
         verify_boolean(self.log_files_enabled, "Log files enabled")
         verify_boolean(self.log_files_rotation_enabled, "Log files rotation enabled")
         verify_boolean(self.verbose_log_messages, "Verbose log messages")
@@ -2600,6 +2626,8 @@ class IngressSpec(ServiceSpec):
                  monitor_ip_addrs: Optional[Dict[str, str]] = None,
                  use_tcp_mode_over_rgw: bool = False,
                  haproxy_peer_communication_port: Optional[int] = None,
+                 haproxy_log_target: Optional[str] = 'journald',
+                 haproxy_log_level: Optional[str] = 'info',
                  ):
         assert service_type == 'ingress'
 
@@ -2646,6 +2674,20 @@ class IngressSpec(ServiceSpec):
         self.monitor_ip_addrs = monitor_ip_addrs
         self.use_tcp_mode_over_rgw = use_tcp_mode_over_rgw
         self.haproxy_peer_communication_port = haproxy_peer_communication_port
+        self.haproxy_log_target = self._normalize_log_option(
+            haproxy_log_target, 'journald', 'haproxy_log_target')
+        self.haproxy_log_level = self._normalize_log_option(
+            haproxy_log_level, 'info', 'haproxy_log_level')
+
+    @staticmethod
+    def _normalize_log_option(value: Any, default: str, field_name: str) -> str:
+        # Apply the default only when the value is unset (None, or an empty or
+        # whitespace-only string). A non-string value is a user error.
+        if value is None:
+            return default
+        if not isinstance(value, str):
+            raise SpecValidationError(f'{field_name} must be a string')
+        return value.strip().lower() or default
 
     def get_port_start(self) -> List[int]:
         ports = []
@@ -2716,6 +2758,10 @@ class IngressSpec(ServiceSpec):
                     'To enable monitor_ssl, both monitor_ssl_cert and monitor_ssl_key '
                     'must be provided.'
                 )
+
+        verify_enum(self.haproxy_log_target, 'haproxy_log_target', ['journald', 'none'])
+        verify_enum(self.haproxy_log_level, 'haproxy_log_level',
+                    ['debug', 'info', 'notice', 'warning', 'err'])
 
 
 yaml.add_representer(IngressSpec, ServiceSpec.yaml_representer)
@@ -3258,7 +3304,7 @@ class MonitoringSpec(ServiceSpec):
                  custom_configs: Optional[List[CustomConfig]] = None,
                  ):
         assert service_type in ['grafana', 'node-exporter', 'prometheus', 'alertmanager',
-                                'loki', 'alloy', 'promtail']
+                                'loki', 'alloy', 'promtail', 'pushgateway']
 
         super(MonitoringSpec, self).__init__(
             service_type, service_id,
@@ -3287,7 +3333,8 @@ class MonitoringSpec(ServiceSpec):
                     'grafana': 3000,
                     'loki': 3100,
                     'alloy': 9080,
-                    'promtail': 9080}[self.service_type]
+                    'promtail': 9080,
+                    'pushgateway': 9091}[self.service_type]
 
 
 yaml.add_representer(MonitoringSpec, ServiceSpec.yaml_representer)

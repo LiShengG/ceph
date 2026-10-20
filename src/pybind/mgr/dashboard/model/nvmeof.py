@@ -104,6 +104,7 @@ class Subsystem(NamedTuple):
     allow_any_host: bool
     created_without_key: bool = False
     network_mask: Annotated[List[str], CliFieldTransformer(lambda v: "\n".join(v))] = []
+    use_group_config_network_masks: Annotated[bool, CliFlags.DROP] = False
 
 
 class SubsystemList(NamedTuple):
@@ -183,6 +184,20 @@ class ConnectionIOStatistics(NamedTuple):
     host_nqn: str
     total_num_ios: int
     buckets: Annotated[List[BucketInfo], CliFlags.EXCLUSIVE_LIST]
+
+
+class StatisticsEntry(NamedTuple):
+    subsystem_nqn: str
+    host_nqn: str
+    total_num_ios: int
+    buckets: Annotated[List[BucketInfo], CliFlags.EXCLUSIVE_LIST]
+
+
+class ConnectionExtendedIOStatistics(NamedTuple):
+    status: int
+    error_message: str
+    category: str
+    statistics_entries: Annotated[List[StatisticsEntry], CliFlags.EXCLUSIVE_LIST]
 
 
 class NamespaceCreation(NamedTuple):
@@ -394,7 +409,7 @@ class RequestStatus(NamedTuple):
     error_message: str
 
 
-class GwRefreshNetworkStatus(NamedTuple):
+class NetworkMaskUpdateStatus(NamedTuple):
     status: int
     error_message: str
     added: List[str]

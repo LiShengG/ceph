@@ -51,8 +51,8 @@ RGW_USER_SCHEMA = {
 }
 
 
-def _get_owner(owner):
-    accounts = RgwAccounts().get_accounts()
+def _get_owner(owner, daemon_name=None):
+    accounts = RgwAccounts().get_accounts(daemon_name)
 
     # if the owner is present in the accounts list,
     # then the bucket is owned by an account.
@@ -607,7 +607,7 @@ class RgwBucket(RgwRESTController):
         owner_ids = {bucket['owner'] for bucket in result}
 
         # Get available account IDs
-        valid_accounts = set(RgwAccounts().get_accounts())
+        valid_accounts = set(RgwAccounts().get_accounts(daemon_name))
 
         # Determine which owner IDs are valid and need querying
         query_ids = owner_ids & valid_accounts
@@ -649,7 +649,7 @@ class RgwBucket(RgwRESTController):
         bucket_name = RgwBucket.get_s3_bucket_name(result['bucket'],
                                                    result['tenant'])
 
-        owner = _get_owner(result['owner'])
+        owner = _get_owner(result['owner'], daemon_name)
         # Append the versioning configuration.
         versioning = self._get_versioning(owner, daemon_name, bucket_name)
         encryption = self._get_encryption(bucket_name, daemon_name, owner)
@@ -731,7 +731,7 @@ class RgwBucket(RgwRESTController):
                 'bucket-id': bucket_id,
             }
 
-            accounts = RgwAccounts().get_accounts()
+            accounts = RgwAccounts().get_accounts(daemon_name)
             if uid in accounts:
                 # If the bucket is owned by an account, we need to use the account-id
                 # instead of uid.
@@ -745,7 +745,7 @@ class RgwBucket(RgwRESTController):
 
         uid_tenant = uid[:uid.find('$')] if uid.find('$') >= 0 else None
         bucket_name = RgwBucket.get_s3_bucket_name(bucket, uid_tenant)
-        uid = _get_owner(uid)
+        uid = _get_owner(uid, daemon_name)
 
         locking = self._get_locking(uid, daemon_name, bucket_name)
         if versioning_state:
@@ -911,27 +911,41 @@ class RgwBucketUi(RgwBucket):
     def buckets_and_users_count(self, daemon_name=None):
         buckets_count = 0
         users_count = 0
+        objects_count = 0
+        objects_size = 0
         daemon_object = RgwDaemon()
         daemons = json.loads(daemon_object.list())
         unique_realms = set()
+
+        def _accumulate(daemon_id):
+            nonlocal buckets_count, users_count, objects_count, objects_size
+            # Use proxy directly to avoid owner-mapping overhead when only
+            # aggregating counts/stats for the UI.
+            buckets = self.proxy(daemon_id, 'GET', 'bucket?stats=true')
+            users = json.loads(RgwUser.list(self, daemon_name=daemon_id))
+            buckets_count += len(buckets)
+            users_count += len(users)
+            for bucket in buckets:
+                usage = bucket.get('usage', {}).get('rgw.main', {})
+                objects_count += usage.get('num_objects', 0) or 0
+                objects_size += usage.get('size_actual', 0) or 0
+
         for daemon in daemons:
             realm_name = daemon.get('realm_name', None)
             if realm_name:
                 if realm_name not in unique_realms:
                     unique_realms.add(realm_name)
-                    buckets = json.loads(RgwBucket.list(self, daemon_name=daemon['id']))
-                    users = json.loads(RgwUser.list(self, daemon_name=daemon['id']))
-                    users_count += len(users)
-                    buckets_count += len(buckets)
+                    _accumulate(daemon['id'])
             else:
-                buckets = json.loads(RgwBucket.list(self, daemon_name=daemon['id']))
-                users = json.loads(RgwUser.list(self, daemon_name=daemon['id']))
-                users_count = len(users)
-                buckets_count = len(buckets)
+                # Single-site: all daemons share the same metadata — overwrite.
+                buckets_count = users_count = objects_count = objects_size = 0
+                _accumulate(daemon['id'])
 
         return {
             'buckets_count': buckets_count,
-            'users_count': users_count
+            'users_count': users_count,
+            'objects_count': objects_count,
+            'objects_size': objects_size,
         }
 
 

@@ -439,6 +439,11 @@ void MDSDaemon::set_up_admin_socket()
                                      asok_hook,
                                      "dump metadata loads");
   ceph_assert(r == 0);
+  r = admin_socket->register_command("dump phase times",
+                                     asok_hook,
+                                     "dump time spent in each upkeep phase, "
+                                     "and mds_lock utilization");
+  ceph_assert(r == 0);
   r = admin_socket->register_command("dump snaps name=server,type=CephChoices,strings=--server,req=false",
                                      asok_hook,
                                      "dump snapshots");
@@ -564,6 +569,16 @@ void MDSDaemon::set_up_admin_socket()
                                      "name=cancel,type=CephBool,req=false",
       asok_hook,
       "submit queries to the local QuiesceDbManager");
+  ceph_assert(r == 0);
+  r = admin_socket->register_command("quarantine enable "
+                                     "name=path,type=CephString,req=true",
+                                     asok_hook,
+                                     "submit queries to the QuarantineManager");
+  ceph_assert(r == 0);
+  r = admin_socket->register_command("quarantine disable "
+                                     "name=path,type=CephString,req=true",
+                                     asok_hook,
+                                     "submit queries to the QuarantineManager");
   ceph_assert(r == 0);
   r = admin_socket->register_command(
     "heap " \
@@ -761,7 +776,19 @@ void MDSDaemon::handle_command(const cref_t<MCommand> &m)
 {
   auto priv = m->get_connection()->get_priv();
   auto session = static_cast<Session *>(priv.get());
-  ceph_assert(session != NULL);
+  if (!session) {
+    // A closed tell session is cleared by ms_handle_reset() when the
+    // socket faults. That reset is dispatched ahead of an MCommand
+    // already queued on the connection, so priv is gone by the time
+    // we run. The connection is already marked down, so a reply could
+    // not be delivered anyway: drop the command. Clients abort one-shot
+    // commands on the reset (-EPIPE); others have to time out.
+    dout(1) << __func__ << " no session on "
+            << m->get_connection()->get_peer_socket_addr()
+            << ", dropping command tid " << m->get_tid()
+            << " after connection reset" << dendl;
+    return;
+  }
 
   int r = 0;
   cmdmap_t cmdmap;
